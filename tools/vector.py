@@ -21,11 +21,10 @@ RETURN
     node.plot AS text,
     score,
     {
-        title: node.title,
-        directors: [ (person)-[:DIRECTED]->(node) | person.name ],
-        actors: [ (person)-[r:ACTED_IN]->(node) | [person.name, r.role] ],
-        tmdbId: node.tmdbId,
-        source: 'https://www.themoviedb.org/movie/'+ node.tmdbId
+        title: node.name,
+        Book: [ (Book)-[:iswrittenBy]->(node) | Book.name],
+        BookEdition: [ (BookEdition)-[:isOriginalOf]->(node) | [BookEdition.name],
+        Person: [ (node)-[:isWrittenBy]->(Person) | Person.name],
     } AS metadata
 """
 )
