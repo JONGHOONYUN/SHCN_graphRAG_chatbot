@@ -7,7 +7,6 @@ from langchain_core.tools import Tool
 from langchain_neo4j import Neo4jChatMessageHistory
 from langchain_classic.agents import create_react_agent, AgentExecutor
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain import hub
 from utils import get_session_id
 
 from tools.vector import get_poetry_plot

@@ -3,8 +3,8 @@ from llm import llm, embeddings
 from graph import graph
 
 from langchain_neo4j import Neo4jVector
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_classic.chains import create_retrieval_chain
 
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -23,8 +23,8 @@ RETURN
     {
         title: node.name,
         Book: [ (Book)-[:iswrittenBy]->(node) | Book.name],
-        BookEdition: [ (BookEdition)-[:isOriginalOf]->(node) | [BookEdition.name],
-        Person: [ (node)-[:isWrittenBy]->(Person) | Person.name],
+        BookEdition: [ (BookEdition)-[:isOriginalOf]->(node) | BookEdition.name],
+        Person: [ (node)-[:isWrittenBy]->(Person) | Person.name]
     } AS metadata
 """
 )
@@ -50,5 +50,5 @@ plot_retriever = create_retrieval_chain(
     question_answer_chain
 )
 
-def get_movie_plot(input):
+def get_poetry_plot(input):
     return plot_retriever.invoke({"input": input})
