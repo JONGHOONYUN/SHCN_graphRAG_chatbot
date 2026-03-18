@@ -6,6 +6,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 llm = ChatGoogleGenerativeAI(
     google_api_key=st.secrets["GOOGLE_API_KEY"],
     model=st.secrets["GOOGLE_MODEL"],
+    temperature=0, #할루시네이션 최소화
+    convert_system_message_to_human=True #Gemini 모델은 system 메시지를 이해하지 못하므로, system 메시지를 human 메시지로 변환하여 전달하도록 설정
 )
 
 
