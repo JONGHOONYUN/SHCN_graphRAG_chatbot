@@ -19,6 +19,14 @@ Fine Tuning:
 
 Search using both the chiname and the korname for the Person name.
 Search using both the chiname and the korname for the Book name.
+Search using both chiname and korname properties for Person and Book nodes.
+Respond in Korean.
+Do not generate CREATE, UPDATE, DELETE queries.
+
+Few-shot examples:
+Question: 이백의 시 목록을 알려줘
+Cypher: MATCH (p:Person)-[:isWrittenBy]-(poem:poem)
+        WHERE p.korname CONTAINS '이백' OR p.chiname CONTAINS '李白'
 
 Schema:
 {schema}

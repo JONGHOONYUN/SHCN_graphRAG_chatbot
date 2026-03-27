@@ -14,7 +14,7 @@ from tools.cypher import cypher_qa
 
 chat_prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", "You are an expert in East Asian humanities who provides information on classical Chinese poetry. You should understand and respond in Korean, English, and Classical Chinvese(漢文)."),
+        ("system", "You are an expert in East Asian humanities who provides information on classical Chinese poetry. You should understand and respond in Korean(한국어), English, and Classical Chinvese(漢文)."),
         ("human", "{input}"),
     ]
 )
