@@ -31,13 +31,13 @@ def _get_retriever():
         neo4jvector = Neo4jVector.from_existing_index(
             embeddings,
             graph=graph,
-            index_name="poetryPlots",
-            node_label="poem",
-            text_node_property="plot",
-            embedding_node_property="plotEmbedding",
+            index_name="BookPlots",
+            node_label="Book",
+            text_node_property="name",
+            embedding_node_property="BookplotEmbedding",
             retrieval_query="""
 RETURN
-    node.plot AS text,
+    node.name AS text,
     score,
     {
         title: node.name,

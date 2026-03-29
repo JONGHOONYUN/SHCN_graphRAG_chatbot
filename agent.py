@@ -28,7 +28,7 @@ tools = [
         func=poetry_chat.invoke,
     ), 
     Tool.from_function(
-        name="poetry plot Search",  
+        name="Bookplot Search",  
         description="For when you need to find information about poetry based on a East Asian humanities and classical Chinese poetry dataset. Use this tool to find information about poems, poets, and literary analysis. Always use this tool when the user is asking for specific information about a poem, poet, or literary analysis. If the user is asking for general information about poetry or is asking a question that is not covered by the other tools, use the General Chat tool.",
         func=get_poetry_plot, 
     ),
@@ -45,7 +45,7 @@ def get_memory(session_id):
 agent_prompt = PromptTemplate.from_template("""
 You are an expert in East Asian humanities providing information on classical Chinese poetry.
 Aim to be as helpful as possible and provide as much information as you can.
-Do not answer questions unrelated to humanities, classical Chinese literature, or classical Chinese poetry.
+
 
 Do not use pre-learned knowledge to answer questions. Use only the information provided in the context.
 
