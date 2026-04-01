@@ -21,8 +21,13 @@ llm = ChatGoogleGenerativeAI(
 # 두 SDK를 우회하여 Google REST API v1 엔드포인트를 직접 호출하는 커스텀 클래스 사용.
 # ──────────────────────────────────────────────
 import requests
+import time
 from langchain_core.embeddings import Embeddings  # LangChain 표준 임베딩 인터페이스
 from typing import List
+
+# 429 발생 시 재시도 설정
+MAX_RETRIES = 3        # 최대 재시도 횟수
+RETRY_DELAY = 60       # 429 응답 시 대기 시간(초) — Free tier 분당 제한 초기화 대기
 
 # 모델 우선순위 목록: 앞에서부터 순서대로 시도하여 최초 성공한 모델을 사용
 # Google이 모델을 폐기하더라도 다음 모델로 자동 전환
@@ -75,45 +80,60 @@ class GoogleEmbeddings(Embeddings):
         """
         단일 텍스트를 벡터로 변환.
         사용자 질문을 Neo4j 벡터 인덱스 검색에 사용할 수 있는 형태로 변환.
-        반환값: float 리스트 (예: 768차원 벡터)
+        429(요청 초과) 발생 시 RETRY_DELAY초 대기 후 MAX_RETRIES회 재시도.
+        반환값: float 리스트 (예: 3072차원 벡터)
         """
-        response = requests.post(
-            self.embed_url,
-            params={"key": self.api_key},
-            json={
-                "model": self.model,
-                "content": {"parts": [{"text": text}]}
-            },
-            timeout=30
-        )
-        response.raise_for_status()
-        return response.json()["embedding"]["values"]
+        for attempt in range(MAX_RETRIES):
+            response = requests.post(
+                self.embed_url,
+                params={"key": self.api_key},
+                json={
+                    "model": self.model,
+                    "content": {"parts": [{"text": text}]}
+                },
+                timeout=30
+            )
+            if response.status_code == 429:
+                # API 분당 요청 제한 초과 — 대기 후 재시도
+                # 마지막 시도에서도 429면 아래에서 raise_for_status()로 오류 발생
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                    continue
+            response.raise_for_status()
+            return response.json()["embedding"]["values"]
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """
         다수의 텍스트를 한 번의 API 호출로 일괄 임베딩.
         batchEmbedContents 엔드포인트 사용으로 순차 호출 대비 속도 대폭 향상.
+        429(요청 초과) 발생 시 RETRY_DELAY초 대기 후 MAX_RETRIES회 재시도.
         Neo4j 벡터 인덱스 생성 또는 갱신 시 사용됨.
         반환값: float 리스트의 리스트 (각 텍스트에 대한 벡터)
         """
-        response = requests.post(
-            self.batch_url,
-            params={"key": self.api_key},
-            json={
-                # 각 텍스트를 독립 요청으로 구성하여 배열로 전송
-                "requests": [
-                    {
-                        "model": self.model,
-                        "content": {"parts": [{"text": text}]}
-                    }
-                    for text in texts
-                ]
-            },
-            timeout=60  # 대량 문서 처리 시 여유 있는 타임아웃 설정
-        )
-        response.raise_for_status()
-        # 응답에서 각 텍스트의 임베딩 벡터만 추출하여 반환
-        return [item["values"] for item in response.json()["embeddings"]]
+        for attempt in range(MAX_RETRIES):
+            response = requests.post(
+                self.batch_url,
+                params={"key": self.api_key},
+                json={
+                    # 각 텍스트를 독립 요청으로 구성하여 배열로 전송
+                    "requests": [
+                        {
+                            "model": self.model,
+                            "content": {"parts": [{"text": text}]}
+                        }
+                        for text in texts
+                    ]
+                },
+                timeout=60  # 대량 문서 처리 시 여유 있는 타임아웃 설정
+            )
+            if response.status_code == 429:
+                # API 분당 요청 제한 초과 — 대기 후 재시도
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                    continue
+            response.raise_for_status()
+            # 응답에서 각 텍스트의 임베딩 벡터만 추출하여 반환
+            return [item["values"] for item in response.json()["embeddings"]]
 
 
 # 앱 전역에서 사용할 임베딩 인스턴스 생성
