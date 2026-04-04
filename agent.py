@@ -29,12 +29,12 @@ tools = [
     ), 
     Tool.from_function(
         name="Bookplot Search",  
-        description="For when you need to find information about poetry based on a East Asian humanities and classical Chinese poetry dataset. Use this tool to find information about poems, poets, and literary analysis. Always use this tool when the user is asking for specific information about a poem, poet, or literary analysis. If the user is asking for general information about poetry or is asking a question that is not covered by the other tools, use the General Chat tool.",
+        description="Use this tool ONLY when searching for Book titles or Book content by meaning or theme. Do NOT use for person attributes like birthyear. For example, if the user asks 'What is the plot of Journey to the West?' or 'Can you summarize the story of Water Margin?', use this tool to provide a detailed summary of the book's plot and themes. Always prioritize this tool for any questions related to book content or thematic searches to ensure comprehensive and relevant information retrieval.",
         func=get_poetry_plot, 
     ),
     Tool.from_function(
         name="poetry information",
-        description="Provide information about poetry questions using Cypher",
+        description="Use this tool FIRST for specific queries about person attributes(birthyear, deathyear, name), relationships between nodes, or any structured data lookup in the database. For example, if the user asks 'What is the birth year of Li Bai?' or 'Who are the poets that influenced Du Fu?', use this tool to query the database and provide a precise answer. Always prioritize this tool for any questions that can be answered with a specific Cypher query to ensure accurate and relevant information retrieval.",
         func = cypher_qa
     )
 ]
