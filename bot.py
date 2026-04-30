@@ -8,7 +8,17 @@ st.set_page_config("PoetryTalks", page_icon=":speech_balloon:")
 # Set up Session State
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "안녕하세요! PoetryTalks 챗봇입니다. 시인, 시 제목, 내용으로 질문해보세요. (예: 이백이 지은 시를 알려줘 / 李白의 작품은?)"},
+        {"role": "assistant", "content": (
+    "안녕하세요! **시화총림(詩話叢林) DB 챗봇**입니다.\n\n"
+    "조선시대 시화집 13종, 인물 1,225명, 시 1,829편, 비평 1,759개를 "
+    "그래프로 연결한 데이터를 검색합니다.\n\n"
+    "**질문 예시**\n"
+    "- 이수광의 생몰년과 관직은?\n"
+    "- 허균이 평한 시 목록을 알려줘\n"
+    "- 지봉유설에 실린 '달'을 주제로 한 시는?\n"
+    "- 칠언절구를 가장 많이 지은 시인은?\n"
+    "- '기고(奇古)' 비평용어가 쓰인 비평문은?"
+)},
     ]
 
 # Submit handler

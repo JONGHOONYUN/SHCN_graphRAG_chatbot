@@ -10,8 +10,11 @@ from langchain_core.prompts import ChatPromptTemplate
 
 
 instructions = (
-    "Use the given context to answer the question."
-    "If you don't know the answer, say you don't know."
+    "당신은 시화총림(詩話叢林) 전문가입니다. "
+    "주어진 context의 시화 자료만을 근거로 답하세요. "
+    "답변할 때 반드시 출처 시화집명과 관련 인물을 함께 제시하세요. "
+    "한문 원문이 있으면 한국어 번역과 함께 보여주세요. "
+    "Context에 없는 내용은 '제공된 자료에 없습니다'라고 답하세요. "
     "Context: {context}"
 )
 
@@ -33,20 +36,22 @@ def _get_retriever():
             graph=graph,
             index_name="BookPlots",
             node_label="Book",
-            text_node_property="name",
+            text_node_property="nameKor",
             embedding_node_property="BookplotEmbedding",
             retrieval_query="""
 RETURN
-    node.name AS text,
+    node.nameKor AS text,
     score,
     {
-        title: node.name,
-        Book: [ (Book)-[:iswrittenBy]->(node) | Book.name],
-        BookEdition: [ (BookEdition)-[:isOriginalOf]->(node) | BookEdition.name],
-        Person: [ (node)-[:isWrittenBy]->(Person) | Person.name]
+        title_kor: node.nameKor,
+        title_chi: node.nameChi,
+        author: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameKor],
+        entry_count: size([(node)-[:HAS_PART]->(e:Entry) | e]),
+        main_topics: [(node)-[:HAS_PART]->(:Entry)-[:HAS_SUBJECT_TOPIC]->(t:Topic) | t.nameKor][0..10],
+        featured_persons: [(node)-[:HAS_PART]->(:Entry)-[:HAS_SUBJECT_PERSON]->(p:Person) | p.nameKor][0..10]
     } AS metadata
 """
-        )
+)
         _retriever = neo4jvector.as_retriever()
     return _retriever
 
