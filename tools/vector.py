@@ -34,24 +34,27 @@ def _get_retriever():
         neo4jvector = Neo4jVector.from_existing_index(
             embeddings,
             graph=graph,
-            index_name="BookPlots",
-            node_label="Book",
-            text_node_property="nameKor",
-            embedding_node_property="BookplotEmbedding",
+            index_name="EntryTexts",                    # ← 새 인덱스명
+            node_label="Entry",                         # ← Book → Entry
+            text_node_property="textKor",               # ← Entry의 한국어 본문
+            embedding_node_property="textEmbedding",    # ← 새 임베딩 속성
             retrieval_query="""
 RETURN
-    node.nameKor AS text,
+    node.textKor AS text,
     score,
     {
-        title_kor: node.nameKor,
-        title_chi: node.nameChi,
-        author: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameKor],
-        entry_count: size([(node)-[:HAS_PART]->(e:Entry) | e]),
-        main_topics: [(node)-[:HAS_PART]->(:Entry)-[:HAS_SUBJECT_TOPIC]->(t:Topic) | t.nameKor][0..10],
-        featured_persons: [(node)-[:HAS_PART]->(:Entry)-[:HAS_SUBJECT_PERSON]->(p:Person) | p.nameKor][0..10]
+        entry_id: node.ID,
+        original_chinese: node.textChi,
+        source_book: [(b:Book)-[:HAS_PART]->(node) | b.nameKor][0],
+        author: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameKor][0],
+        mentioned_persons: [(node)-[:HAS_SUBJECT_PERSON]->(p:Person) | p.nameKor][0..5],
+        topics: [(node)-[:HAS_SUBJECT_TOPIC]->(t:Topic) | t.nameKor][0..5],
+        places: [(node)-[:HAS_SUBJECT_PLACE]->(pl:Place) | pl.nameKor][0..3],
+        critical_terms: [(node)-[:HAS_SUBJECT_CRITICAL_TERM]->(ct:CriticalTerm) | ct.nameKor][0..5],
+        contained_poems: [(node)-[:HAS_PART]->(p:Poem) | p.textKor][0..2]
     } AS metadata
 """
-)
+        )
         _retriever = neo4jvector.as_retriever()
     return _retriever
 

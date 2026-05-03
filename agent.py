@@ -24,6 +24,7 @@ chat_prompt = ChatPromptTemplate.from_messages(
 
 poetry_chat = chat_prompt | llm | StrOutputParser()
 
+# 1. tools 정의
 tools = [
     Tool.from_function(
         name="General Chat",
@@ -49,18 +50,46 @@ tools = [
                 "예: '이수광의 생몰년은?', '허균이 평한 시는?', "
                 "'호곡시화에 실린 칠언절구는?', '한강이 등장하는 시는?'",
         func = cypher_qa
-    )
+    ),
+    Tool.from_function(
+    name="Combined Sihwa Search",
+    description=(
+        "벡터 검색과 그래프 쿼리를 모두 사용해야 하는 복합 질문에 사용. "
+        "예: '주제 + 인물 + 시화집' 세 조건이 모두 명시된 경우."
+    ),
+    func=lambda q: f"{cypher_qa(q)}\n\n[보완 정보]\n{get_poetry_plot(q)}"
+)
 ]
 
 def get_memory(session_id):
     return Neo4jChatMessageHistory(session_id=session_id, graph=graph)
 
+# 2. agent_prompt 정의
 agent_prompt = PromptTemplate.from_template("""
-You are an expert in East Asian humanities providing information on classical Chinese poetry.
-Aim to be as helpful as possible and provide as much information as you can.
+You are an expert in East Asian humanities providing information on Korean Sihwa literature.
 
+# Decision Tree (도구 선택 절차)
+질문을 받으면 다음 순서로 판단하세요:
+1단계: 질문이 인사말/잡담인가? → General Chat
+2단계: 질문에 고유명사 + 속성/관계가 명확히 있는가? → Sihwa Graph Query
+3단계: 질문이 추상적·주제적·내용 검색인가? → Sihwa Content Search
+4단계: Graph Query 결과가 비어있다면 → Sihwa Content Search로 재시도
 
-Do not use pre-learned knowledge to answer questions. Use only the information provided in the context.
+CRITICAL FORMAT RULES:
+- 모든 응답은 반드시 "Thought:"로 시작합니다.
+- 도구를 사용할 때는 "Action:", "Action Input:" 형식을 정확히 따릅니다.
+- 최종 답변을 줄 때는 반드시 "Final Answer:" 라벨로 시작해야 합니다.
+- "Final Answer:" 없이 바로 답변 내용을 쓰면 안 됩니다.
+
+# Multi-step Reasoning
+복잡한 질문은 한 번에 답하지 말고 여러 단계로 나누세요:
+예) "지봉유설에 실린 달 주제 시의 작자는 어느 시대 사람인가?"
+1) Sihwa Content Search → '달' 주제 시 검색
+2) 발견된 작자명 추출
+3) Sihwa Graph Query → 그 작자의 yearBirth, HAS_ERA 조회
+4) 결과 종합
+
+Do not use pre-learned knowledge to answer questions. Use only the information provided in the context. If the question cannot be answered with the given context, respond with "제공된 자료에 없습니다".
 
 
 TOOLS:
@@ -95,12 +124,17 @@ New input: {input}
 {agent_scratchpad}
 """)
 
+# 3. agent 생성
 agent = create_react_agent(llm, tools, agent_prompt)
+
+# 4. agent_executor 생성
 agent_executor = AgentExecutor(
     agent=agent,
     tools=tools,
-    verbose=True
-    )
+    verbose=True,
+    handle_parsing_errors="형식 오류가 발생했습니다. 'Final Answer:'로 시작하는 답변 형식을 사용해주세요.",
+    max_iterations=5,
+)
 
 chat_agent = RunnableWithMessageHistory(
     agent_executor,
