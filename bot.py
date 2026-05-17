@@ -5,6 +5,36 @@ from agent import generate_response
 # Page Config
 st.set_page_config("PoetryTalks", page_icon=":speech_balloon:")
 
+# ──────────────────────────────────────────────
+# 접근 인증 (테스터 공유 비밀번호)
+# secrets.toml 의 APP_PASSWORD 값과 일치해야 통과.
+# 인증 실패 시 st.stop()으로 이하 챗봇 로직 실행을 차단하여
+# 미인증 사용자가 LLM/DB 호출을 트리거하지 못하게 함.
+# ──────────────────────────────────────────────
+def check_password() -> bool:
+    """비밀번호 일치 시 True, 아니면 입력창을 표시하고 False."""
+    def _on_submit():
+        if st.session_state.get("password") == st.secrets["APP_PASSWORD"]:
+            st.session_state["auth_ok"] = True
+            del st.session_state["password"]      # 입력값을 세션에서 즉시 제거
+        else:
+            st.session_state["auth_ok"] = False
+
+    if st.session_state.get("auth_ok"):
+        return True
+
+    st.markdown("## 🔒 시화총림 챗봇 — 접근 인증")
+    st.caption("테스터 권한 비밀번호를 입력해주세요.")
+    st.text_input("비밀번호", type="password", on_change=_on_submit, key="password")
+
+    if st.session_state.get("auth_ok") is False:
+        st.error("비밀번호가 올바르지 않습니다.")
+    return False
+
+
+if not check_password():
+    st.stop()
+
 # Set up Session State
 if "messages" not in st.session_state:
     st.session_state.messages = [
