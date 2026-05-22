@@ -45,7 +45,7 @@ instructions = (
 
 prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", instructions),
+        ("system", instructions + "\n\n참고할 시화 자료(context):\n{context}"),
         ("human", "{input}"),
     ]
 )
