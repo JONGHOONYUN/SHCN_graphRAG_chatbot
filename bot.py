@@ -1,6 +1,23 @@
+import re
 import streamlit as st
 from utils import write_message
 from agent import generate_response
+
+
+# ──────────────────────────────────────────────
+# 응답 언어 락 (Locked-language)
+# 사용자의 첫 질문 언어를 감지해 세션 동안 답변 언어를 고정.
+# 한글 → ko, 한자만 → zh, 라틴 문자 → en, 기타는 ko로 폴백.
+# (한글에는 한자가 섞일 수 있으므로 한글 판정을 한자보다 먼저 수행)
+# ──────────────────────────────────────────────
+def detect_language(text: str) -> str:
+    if re.search(r"[가-힣]", text):
+        return "ko"
+    if re.search(r"[一-鿿]", text):
+        return "zh"
+    if re.search(r"[A-Za-z]", text):
+        return "en"
+    return "ko"
 
 # Page Config
 st.set_page_config("PoetryTalks", page_icon=":speech_balloon:")
@@ -73,7 +90,11 @@ for message in st.session_state.messages:
     write_message(message['role'], message['content'], save=False)
 
 # Handle any user input
-if prompt := st.chat_input("영어, 한국어, 한문으로 질문해보세요"):
+if prompt := st.chat_input("한국어, 영어, 중국어(한문)로 질문해보세요"):
+    # 첫 질문에서만 답변 언어 결정 → 세션 내내 유지
+    if "user_language" not in st.session_state:
+        st.session_state["user_language"] = detect_language(prompt)
+
     # Display user message in chat message container
     write_message('user', prompt)
 

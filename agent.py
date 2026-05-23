@@ -1,3 +1,4 @@
+import streamlit as st
 from llm import llm
 from graph import graph
 from langchain_core.prompts import ChatPromptTemplate
@@ -8,6 +9,27 @@ from langchain_neo4j import Neo4jChatMessageHistory
 from langchain_classic.agents import create_react_agent, AgentExecutor
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from utils import get_session_id
+
+
+LANGUAGE_LABEL = {
+    "ko": "Korean (한국어)",
+    "en": "English",
+    "zh": "Chinese (中文)",
+}
+
+
+def _build_language_directive(user_language: str) -> str:
+    label = LANGUAGE_LABEL.get(user_language, LANGUAGE_LABEL["ko"])
+    return (
+        "# Locked Response Language\n"
+        f"This session has been locked to: {label}.\n"
+        f"You MUST write every response in {label} for the entire session, "
+        "regardless of the language of later user messages, tool outputs, "
+        "or source documents. Do NOT switch languages mid-session.\n"
+        "Exception: source text fields (textChi, textKor, textEng, descEng) "
+        "must still be quoted verbatim in their original characters. Only "
+        f"your own commentary, explanations, and tool-routing notes follow the {label} rule.\n"
+    )
 
 from tools.vector import get_poetry_plot
 from tools.cypher import cypher_qa
@@ -114,11 +136,13 @@ def get_memory(session_id):
 
 # 2. agent_prompt 정의
 agent_prompt = PromptTemplate.from_template("""
+{language_directive}
+
 You are an expert in East Asian humanities, specialising in Korean classical
 poetry criticism (sihwa / 시화). You have deep knowledge of the Sihwa
 Ch'ongnim (詩話叢林) compendium, its authors, poems, critiques, and the
 literary-critical tradition it represents.
-You respond in the same language the user writes in.
+You respond ONLY in the locked session language declared above.
 
 
 # Tool selection decision tree
@@ -271,8 +295,13 @@ def generate_response(user_input):
     and returns a response to be rendered in the UI
     """
 
+    # 첫 질문에서 bot.py가 락한 언어를 읽어 prompt에 주입.
+    # session_state가 없으면(직접 호출 등) 한국어로 폴백.
+    user_language = st.session_state.get("user_language", "ko")
+    language_directive = _build_language_directive(user_language)
+
     response = chat_agent.invoke(
-        {"input": user_input},
+        {"input": user_input, "language_directive": language_directive},
         {"configurable": {"session_id": get_session_id()}},)
 
     return response['output']

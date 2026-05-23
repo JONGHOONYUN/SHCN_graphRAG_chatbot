@@ -43,12 +43,28 @@ instructions = (
     "일본어 등 한자 사용 언어 사용자에게는 nameChi를 우선 사용하세요."
 )
 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", instructions + "\n\n참고할 시화 자료(context):\n{context}"),
-        ("human", "{input}"),
-    ]
-)
+_LANGUAGE_LABEL = {
+    "ko": "Korean (한국어)",
+    "en": "English",
+    "zh": "Chinese (中文)",
+}
+
+
+def _build_prompt():
+    """매 호출 시 세션 락 언어를 반영한 prompt를 새로 생성."""
+    user_language = st.session_state.get("user_language", "ko")
+    label = _LANGUAGE_LABEL.get(user_language, _LANGUAGE_LABEL["ko"])
+    language_clause = (
+        f"이 세션의 답변 언어는 {label}로 고정되어 있습니다. "
+        f"반드시 {label}로만 답변하세요. "
+        "단, textChi/textKor/textEng/descEng의 인용은 원문 그대로 유지하세요. "
+    )
+    return ChatPromptTemplate.from_messages(
+        [
+            ("system", language_clause + instructions + "\n\n참고할 시화 자료(context):\n{context}"),
+            ("human", "{input}"),
+        ]
+    )
 
 # 모듈 import 시점이 아닌 실제 호출 시점에 초기화 (Lazy Initialization)
 _retriever = None
@@ -109,6 +125,6 @@ RETURN
 
 def get_poetry_plot(input):
     retriever = _get_retriever()
-    question_answer_chain = create_stuff_documents_chain(llm, prompt)
+    question_answer_chain = create_stuff_documents_chain(llm, _build_prompt())
     plot_retriever = create_retrieval_chain(retriever, question_answer_chain)
     return plot_retriever.invoke({"input": input})
