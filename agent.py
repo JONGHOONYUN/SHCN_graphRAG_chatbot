@@ -298,8 +298,17 @@ agent_executor = AgentExecutor(
     agent=agent,
     tools=tools,
     verbose=True,
-    handle_parsing_errors="형식 오류가 발생했습니다. 'Final Answer:'로 시작하는 답변 형식을 사용해주세요.",
-    max_iterations=5,
+    # 다국어/중립 안내. 한국어 고정 문구는 영어/중국어 세션에서 모델을 혼란시켜
+    # 추가 parsing 실패를 유발하므로 영문 중립 문구 사용.
+    handle_parsing_errors=(
+        "Output format error. Respond using either an Action block "
+        "(Thought/Action/Action Input) or a Final Answer block "
+        "(Thought/Final Answer)."
+    ),
+    max_iterations=10,
+    # iteration/time limit 도달 시 placeholder 대신 LLM이 그때까지의 정보로
+    # 최종 답변을 직접 생성하여 사용자 경험을 보장.
+    early_stopping_method="generate",
 )
 
 chat_agent = RunnableWithMessageHistory(
