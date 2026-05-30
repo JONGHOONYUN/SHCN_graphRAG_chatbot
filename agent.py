@@ -31,14 +31,13 @@ ITERATION_LIMIT_FALLBACK = {
 def _build_language_directive(user_language: str) -> str:
     label = LANGUAGE_LABEL.get(user_language, LANGUAGE_LABEL["ko"])
     return (
-        "# Locked Response Language\n"
-        f"This session has been locked to: {label}.\n"
-        f"You MUST write every response in {label} for the entire session, "
-        "regardless of the language of later user messages, tool outputs, "
-        "or source documents. Do NOT switch languages mid-session.\n"
-        "Exception: source text fields (textChi, textKor, textEng, descEng) "
-        "must still be quoted verbatim in their original characters. Only "
-        f"your own commentary, explanations, and tool-routing notes follow the {label} rule.\n"
+        "# Response Language For This Turn\n"
+        f"The response for THIS turn MUST be written in: {label}.\n"
+        f"You MUST write the entire 'Final Answer:' in {label}, regardless of the "
+        "language of tool outputs, source documents, or earlier turns in the chat history.\n"
+        "Exception: source text fields (textChi, textKor, textEng, descEng) must still "
+        "be quoted verbatim in their original characters. Only your own commentary, "
+        f"explanations, section labels, and tool-routing notes follow the {label} rule.\n"
     )
 
 from tools.vector import get_poetry_plot
@@ -272,7 +271,7 @@ You have access to the following tools:
 
 {tools}
 
-To use a tool, please use the following format:
+To use a tool, you MUST use this EXACT format. Each label (`Thought:`, `Action:`, `Action Input:`) MUST start on its OWN NEW LINE. Never concatenate them on the same line.
 
 ```
 Thought: Do I need to use a tool? Yes
@@ -281,11 +280,27 @@ Action Input: the input to the action
 Observation: the result of the action
 ```
 
-When you have a response to say to the Human, or if you do not need to use a tool, you MUST use the format:
+When you have a response to say to the Human, or if you do not need to use a tool, you MUST use this format. `Thought:` and `Final Answer:` MUST start on separate new lines:
 
 ```
 Thought: Do I need to use a tool? No
 Final Answer: [your response here]
+```
+
+FORMAT RULES (mandatory):
+- `Thought:`, `Action:`, `Action Input:`, `Final Answer:` each begin a NEW LINE.
+- Never write `Thought: ... Action: ...` on a single line.
+- After `Action:` there MUST be an `Action Input:` line.
+- Never mix `Action:` and `Final Answer:` in the same step — choose one or the other per step.
+
+WRONG (will fail parsing):
+`Thought: I should search. Action: Sihwa Content Search`
+
+CORRECT:
+```
+Thought: I should search the content.
+Action: Sihwa Content Search
+Action Input: poems about food
 ```
 
 REMINDER (do not skip): {language_directive}
@@ -303,18 +318,33 @@ New input: {input}
 # 3. agent 생성
 agent = create_react_agent(llm, tools, agent_prompt)
 
+def _parse_error_handler(error) -> str:
+    """ReAct format 위반 시 구체적인 자기수정 안내를 Observation으로 반환.
+    Gemini가 Thought/Action/Action Input을 한 줄에 합치거나 Action Input을
+    누락하는 사례가 잦아 다음 iteration에서 실수를 바로잡도록 명시한다."""
+    return (
+        "Your last output could not be parsed. Most likely causes:\n"
+        "- `Thought:` and `Action:` were on the same line (they MUST be on SEPARATE new lines).\n"
+        "- Missing `Action Input:` line after `Action:`.\n"
+        "- Mixing `Action:` and `Final Answer:` in the same step.\n\n"
+        "Re-output using this EXACT format. Each label starts on its OWN new line:\n\n"
+        "Thought: <your reasoning>\n"
+        "Action: <one tool name>\n"
+        "Action Input: <input string>\n\n"
+        "OR, to finish:\n\n"
+        "Thought: <your reasoning>\n"
+        "Final Answer: <your answer>\n"
+    )
+
+
 # 4. agent_executor 생성
 agent_executor = AgentExecutor(
     agent=agent,
     tools=tools,
     verbose=True,
-    # 다국어/중립 안내. 한국어 고정 문구는 영어/중국어 세션에서 모델을 혼란시켜
-    # 추가 parsing 실패를 유발하므로 영문 중립 문구 사용.
-    handle_parsing_errors=(
-        "Output format error. Respond using either an Action block "
-        "(Thought/Action/Action Input) or a Final Answer block "
-        "(Thought/Final Answer)."
-    ),
+    # callable로 지정하여 매 parsing 실패마다 구체적인 자기수정 instruction을
+    # Observation으로 전달. 단순 문자열보다 Gemini의 회복 성공률이 높음.
+    handle_parsing_errors=_parse_error_handler,
     max_iterations=15,
     # early_stopping_method는 기본값("force") 사용.
     # create_react_agent가 만드는 RunnableAgent는 "generate"를 지원하지 않아
@@ -334,9 +364,11 @@ def generate_response(user_input):
     and returns a response to be rendered in the UI
     """
 
-    # 첫 질문에서 bot.py가 락한 언어를 읽어 prompt에 주입.
+    # bot.py가 매 턴 결정한 적용 언어(effective_language)를 읽어 prompt에 주입.
+    # - 사용자가 명시적 락 요청을 한 적이 있으면 그 락 언어
+    # - 그렇지 않으면 이번 질문의 자동 감지 언어
     # session_state가 없으면(직접 호출 등) 한국어로 폴백.
-    user_language = st.session_state.get("user_language", "ko")
+    user_language = st.session_state.get("effective_language", "ko")
     language_directive = _build_language_directive(user_language)
 
     response = chat_agent.invoke(

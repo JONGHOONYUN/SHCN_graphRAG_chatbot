@@ -51,12 +51,12 @@ _LANGUAGE_LABEL = {
 
 
 def _build_prompt():
-    """매 호출 시 세션 락 언어를 반영한 prompt를 새로 생성."""
-    user_language = st.session_state.get("user_language", "ko")
+    """매 호출 시 이번 턴 적용 언어(effective_language)를 반영한 prompt를 새로 생성.
+    bot.py가 매 턴 'effective_language'를 갱신하므로 그 값을 그대로 사용."""
+    user_language = st.session_state.get("effective_language", "ko")
     label = _LANGUAGE_LABEL.get(user_language, _LANGUAGE_LABEL["ko"])
     language_clause = (
-        f"이 세션의 답변 언어는 {label}로 고정되어 있습니다. "
-        f"반드시 {label}로만 답변하세요. "
+        f"이번 답변은 반드시 {label}로 작성하세요. "
         "단, textChi/textKor/textEng/descEng의 인용은 원문 그대로 유지하세요. "
     )
     return ChatPromptTemplate.from_messages(
