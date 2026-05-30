@@ -67,6 +67,36 @@ chat_prompt = ChatPromptTemplate.from_messages(
 
 poetry_chat = chat_prompt | llm | StrOutputParser()
 
+
+# General Chat tool은 별도 LLM 호출이라 agent_prompt의 language_directive를 모름.
+# 매 호출 시 session_state의 effective_language를 읽어 강한 언어 지시를 prepend한
+# 동적 prompt로 chain을 다시 만들어 실행. 이렇게 해야 agent가 입력을 다른 언어로
+# 번역해 넣었더라도 tool 출력은 사용자 언어로 강제됨.
+def general_chat(input_text: str) -> str:
+    user_language = st.session_state.get("effective_language", "ko")
+    label = LANGUAGE_LABEL.get(user_language, LANGUAGE_LABEL["ko"])
+    dyn_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                f"You MUST answer entirely in {label}, regardless of the language "
+                "of the input text passed in {input}. "
+                "당신은 한국 고전시화 전문가입니다. "
+                "시화총림(詩話叢林)을 비롯한 조선시대 시화집(지봉유설, 성수시화, 호곡시화 등)의 "
+                "인물·시·비평·주제·장소·시대 정보를 바탕으로 답변합니다. "
+                "시화총림 데이터베이스와 직접 관련 없는 질문(일반 잡담, 현대 주제 등)에는 "
+                "정중히 범위를 벗어난다고 안내하세요. "
+                "확실하지 않은 내용은 추측하지 말고 'needs verification' 또는 그에 상당하는 "
+                f"{label} 표현으로 답하세요. "
+                "출처 텍스트(textChi, textKor, textEng)는 절대 번역·요약·변형하지 마세요."
+            ),
+            ("human", "{input}"),
+        ]
+    )
+    chain = dyn_prompt | llm | StrOutputParser()
+    return chain.invoke({"input": input_text})
+
+
 # 1. tools 정의
 tools = [
     Tool.from_function(
@@ -76,8 +106,8 @@ tools = [
         "Examples: 'Hello', 'What is sihwa?', 'Tell me about the Joseon dynasty'. "
         "Do NOT use for any query that asks about specific persons, poems, "
         "critiques, books, topics, places, or eras in the database."),
-        func=poetry_chat.invoke,
-    ), 
+        func=general_chat,
+    ),
     Tool.from_function(
         name="Sihwa Content Search",  
         description= (
@@ -292,6 +322,14 @@ FORMAT RULES (mandatory):
 - Never write `Thought: ... Action: ...` on a single line.
 - After `Action:` there MUST be an `Action Input:` line.
 - Never mix `Action:` and `Final Answer:` in the same step — choose one or the other per step.
+
+ACTION INPUT LANGUAGE RULE (mandatory):
+- `Action Input:` MUST contain the user's question (or a faithful paraphrase) in
+  the user's ORIGINAL language. Do NOT translate the user's input into another
+  language before passing it to a tool. Example: if the user wrote in English,
+  the Action Input is in English; if in Chinese, in Chinese.
+- Translation/rewriting into the locked response language is done ONLY at the
+  `Final Answer:` stage, never at `Action Input:` stage.
 
 WRONG (will fail parsing):
 `Thought: I should search. Action: Sihwa Content Search`
