@@ -17,6 +17,16 @@ LANGUAGE_LABEL = {
     "zh": "Chinese (中文)",
 }
 
+# iteration/time limit 도달 시 AgentExecutor가 반환하는 placeholder를
+# 세션 언어에 맞는 친화 안내로 교체. 사용자에게 의미 없는 영문 placeholder
+# 노출을 방지.
+ITERATION_LIMIT_PLACEHOLDER = "Agent stopped due to iteration limit or time limit."
+ITERATION_LIMIT_FALLBACK = {
+    "ko": "질문이 복잡하거나 적합한 자료를 찾지 못했습니다. 더 구체적인 키워드(인물명·서명·시기 등)로 다시 질문해 주세요.",
+    "en": "I couldn't reach a clear answer within the search limit. Please try a more specific question (names, book titles, time period).",
+    "zh": "在搜索范围内未能得出明确答案。请尝试更具体的问题（人物、书名、时期等）。",
+}
+
 
 def _build_language_directive(user_language: str) -> str:
     label = LANGUAGE_LABEL.get(user_language, LANGUAGE_LABEL["ko"])
@@ -32,7 +42,7 @@ def _build_language_directive(user_language: str) -> str:
     )
 
 from tools.vector import get_poetry_plot
-from tools.cypher import cypher_qa
+from tools.cypher import cypher_qa_safe
 
 chat_prompt = ChatPromptTemplate.from_messages(
     [
@@ -109,7 +119,7 @@ tools = [
         "'최치원에게 쓰인 비평어는?' "
         "If Graph Query returns no results, fall back to Sihwa Content Search."
     ),
-        func = cypher_qa
+        func = cypher_qa_safe
     ),
     Tool.from_function(
     name="Combined Sihwa Search",
@@ -127,7 +137,7 @@ tools = [
         "If graph returns fewer than 3 results, also run a parallel global "
         "vector search and merge the results, noting which came from each source."
     ),
-    func=lambda q: f"{cypher_qa(q)}\n\n[보완 정보]\n{get_poetry_plot(q)}"
+    func=lambda q: f"{cypher_qa_safe(q)}\n\n[보완 정보]\n{get_poetry_plot(q)}"
 )
 ]
 
@@ -305,10 +315,10 @@ agent_executor = AgentExecutor(
         "(Thought/Action/Action Input) or a Final Answer block "
         "(Thought/Final Answer)."
     ),
-    max_iterations=10,
-    # iteration/time limit 도달 시 placeholder 대신 LLM이 그때까지의 정보로
-    # 최종 답변을 직접 생성하여 사용자 경험을 보장.
-    early_stopping_method="generate",
+    max_iterations=15,
+    # early_stopping_method는 기본값("force") 사용.
+    # create_react_agent가 만드는 RunnableAgent는 "generate"를 지원하지 않아
+    # ValueError를 raise하므로 명시하지 않음. placeholder 출력은 generate_response에서 후처리.
 )
 
 chat_agent = RunnableWithMessageHistory(
@@ -333,4 +343,8 @@ def generate_response(user_input):
         {"input": user_input, "language_directive": language_directive},
         {"configurable": {"session_id": get_session_id()}},)
 
-    return response['output']
+    output = response['output']
+    # iteration limit placeholder를 세션 언어 친화 안내로 교체
+    if ITERATION_LIMIT_PLACEHOLDER in output:
+        return ITERATION_LIMIT_FALLBACK.get(user_language, ITERATION_LIMIT_FALLBACK["ko"])
+    return output

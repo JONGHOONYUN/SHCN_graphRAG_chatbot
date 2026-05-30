@@ -5,6 +5,7 @@ from graph import graph
 from langchain_neo4j import GraphCypherQAChain
 #프롬프트 템플릿 클래스
 from langchain_core.prompts import PromptTemplate
+from neo4j.exceptions import CypherSyntaxError, ClientError
 
 CYPHER_GENERATION_TEMPLATE = """
 You are a research assistant for Sihwa ch'ongnim (詩話叢林 / 시화총림), a classical Korean poetry compendium. You help users explore its poems, critiques, persons, places, and critical vocabulary by querying a Neo4j graph database and retrieving relevant texts. You answer in the same language the user writes in.
@@ -382,4 +383,33 @@ cypher_qa = GraphCypherQAChain.from_llm(
     cypher_prompt=cypher_prompt,
     allow_dangerous_requests=True
 )
+
+
+# ──────────────────────────────────────────────
+# Safe wrapper
+# LLM이 생성한 Cypher가 syntax/runtime 오류로 Neo4j에서 거부되면 전체 요청이
+# 중단되어 사용자가 에러 페이지를 보게 됨. wrapper로 예외를 잡아 agent가
+# 다음 iteration에서 vector search 등 다른 tool로 fallback 가능하게 함.
+# ──────────────────────────────────────────────
+def cypher_qa_safe(question: str) -> str:
+    try:
+        result = cypher_qa.invoke({"query": question})
+        if isinstance(result, dict):
+            return result.get("result") or "No graph results."
+        return str(result)
+    except CypherSyntaxError:
+        return (
+            "Graph query failed (Cypher syntax error). "
+            "Try rephrasing the question, or fall back to Sihwa Content Search."
+        )
+    except ClientError as e:
+        return (
+            f"Graph query failed ({type(e).__name__}: {e.code}). "
+            "Try rephrasing, or fall back to Sihwa Content Search."
+        )
+    except Exception as e:
+        return (
+            f"Graph query failed ({type(e).__name__}). "
+            "Try rephrasing, or fall back to Sihwa Content Search."
+        )
 
