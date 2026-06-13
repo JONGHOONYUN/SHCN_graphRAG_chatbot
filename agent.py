@@ -409,9 +409,17 @@ def generate_response(user_input):
     user_language = st.session_state.get("effective_language", "ko")
     language_directive = _build_language_directive(user_language)
 
-    response = chat_agent.invoke(
-        {"input": user_input, "language_directive": language_directive},
-        {"configurable": {"session_id": get_session_id()}},)
+    try:
+        response = chat_agent.invoke(
+            {"input": user_input, "language_directive": language_directive},
+            {"configurable": {"session_id": get_session_id()}},)
+    except ValueError as e:
+        # Gemini가 빈 스트림을 반환한 경우 ("No generation chunks were returned").
+        # 원인 후보: safety filter false positive, 일시적 API 오류, 누적 prompt 혼란.
+        # 사용자에게 빨간 에러 페이지 대신 락 언어로 안내 메시지 반환.
+        if "No generation chunks were returned" in str(e):
+            return ITERATION_LIMIT_FALLBACK.get(user_language, ITERATION_LIMIT_FALLBACK["ko"])
+        raise
 
     output = response['output']
     # iteration limit placeholder를 세션 언어 친화 안내로 교체
