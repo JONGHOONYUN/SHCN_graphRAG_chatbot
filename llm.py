@@ -6,28 +6,15 @@ import streamlit as st
 # ──────────────────────────────────────────────
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-# Gemini safety filter false positive 대응.
-# 고전 시화의 표절·비방·풍자 비평 등 학술 텍스트가 HARASSMENT/DANGEROUS 카테고리에
-# 우연히 매치되어 "No generation chunks were returned"로 크래시하는 사례가 있음.
-# 학술/연구용 챗봇이므로 모든 카테고리를 BLOCK_NONE으로 설정해 차단 최소화.
-# google.generativeai 미설치/구버전 환경에서도 import 실패 시 None으로 폴백.
-try:
-    from google.generativeai.types import HarmCategory, HarmBlockThreshold
-    _SAFETY_SETTINGS = {
-        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-    }
-except ImportError:
-    _SAFETY_SETTINGS = None
-
+# 참고: safety_settings 파라미터는 langchain-google-genai 버전마다 enum 타입과
+# 형식이 달라 호환성 이슈가 있다. 학술 텍스트의 safety filter false positive로 인한
+# "No generation chunks were returned" 에러는 agent.py의 generate_response에서
+# try/except로 잡아 사용자 친화 안내문으로 변환하는 방식으로 우회한다.
 llm = ChatGoogleGenerativeAI(
     google_api_key=st.secrets["GOOGLE_API_KEY"],  # Google AI Studio API 키
     model=st.secrets["GOOGLE_MODEL"],              # 사용할 Gemini 모델명 (secrets.toml에서 관리)
     temperature=0,                                 # 0: 가장 결정론적 응답 → 할루시네이션 최소화
     convert_system_message_to_human=True,          # Gemini는 system role 미지원 → human role로 자동 변환
-    safety_settings=_SAFETY_SETTINGS,              # 학술 텍스트의 safety filter false positive 차단
 )
 
 
