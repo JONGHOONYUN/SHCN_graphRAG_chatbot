@@ -66,28 +66,44 @@ def _build_prompt():
         ]
     )
 
-# 모듈 import 시점이 아닌 실제 호출 시점에 초기화 (Lazy Initialization)
-_retriever = None
+# ──────────────────────────────────────────────
+# 다국어 벡터 인덱스 라우팅
+# Entry.textKor / textChi / textEng 각각에 대해 별도 임베딩과 vector index를
+# 생성해 두었으므로(EntryTextsKor / EntryTextsChi / EntryTextsEng), 사용자 질문
+# 언어(effective_language)에 맞는 in-language 인덱스로 매칭하여 검색 정확도를 높임.
+# ──────────────────────────────────────────────
+INDEX_BY_LANG = {
+    "ko": {
+        "index_name": "EntryTextsKor",
+        "text_property": "textKor",
+        "embedding_property": "textEmbedding_Kor",
+    },
+    "en": {
+        "index_name": "EntryTextsEng",
+        "text_property": "textEng",
+        "embedding_property": "textEmbedding_Eng",
+    },
+    "zh": {
+        "index_name": "EntryTextsChi",
+        "text_property": "textChi",
+        "embedding_property": "textEmbedding_Chi",
+    },
+}
 
-def _get_retriever():
-    global _retriever
-    if _retriever is None:
-        neo4jvector = Neo4jVector.from_existing_index(
-            embeddings,
-            graph=graph,
-            index_name="EntryTexts",                    # ← 새 인덱스명
-            node_label="Entry",                         # ← Book → Entry
-            text_node_property="textKor",               # ← Entry의 한국어 본문
-            embedding_node_property="textEmbedding",    # ← 새 임베딩 속성
-            retrieval_query="""
+
+def _build_retrieval_query(text_property: str) -> str:
+    """언어별 retrieval_query를 생성. 'text' 필드만 해당 언어 속성으로 바꾸고
+    metadata는 동일하게 세 언어의 본문·인물·주제 등 풍부한 컨텍스트를 모두 포함."""
+    return f"""
 RETURN
- node.textKor AS text,
+    node.{text_property} AS text,
     score,
-    {
+    {{
         entry_id: node.id,
         entry_position: node.position,
         original_chinese: node.textChi,
         english_translation: node.textEng,
+        korean_translation: node.textKor,
         source_book_kor: [(b:Book)-[:HAS_PART]->(node) | b.nameKor][0],
         source_book_eng: [(b:Book)-[:HAS_PART]->(node) | b.nameEng][0],
         source_book_id: [(b:Book)-[:HAS_PART]->(node) | b.id][0],
@@ -99,32 +115,53 @@ RETURN
         creator_year_birth: [(node)-[:HAS_CREATOR]->(p:Person) | p.yearBirth][0],
         creator_year_death: [(node)-[:HAS_CREATOR]->(p:Person) | p.yearDeath][0],
         creator_era: [(node)-[:HAS_CREATOR]->(p:Person)-[:HAS_ERA]->(e:Era) |
-            {nameKor: e.nameKor, nameEng: e.nameEng,
-             yearStart: e.yearStart, yearEnd: e.yearEnd}][0],
+            {{nameKor: e.nameKor, nameEng: e.nameEng,
+             yearStart: e.yearStart, yearEnd: e.yearEnd}}][0],
         mentioned_persons: [(node)-[:HAS_SUBJECT_PERSON]->(p:Person) |
-            {nameKor: p.nameKor, nameEng: p.nameEng, id: p.id}][0..5],
+            {{nameKor: p.nameKor, nameEng: p.nameEng, id: p.id}}][0..5],
         topics: [(node)-[:HAS_SUBJECT_TOPIC]->(t:Topic) |
-            {nameKor: t.nameKor, nameEng: t.nameEng}][0..5],
+            {{nameKor: t.nameKor, nameEng: t.nameEng}}][0..5],
         places: [(node)-[:HAS_SUBJECT_PLACE]->(pl:Place) |
-            {nameKor: pl.nameKor, nameEng: pl.nameEng, id: pl.id}][0..3],
+            {{nameKor: pl.nameKor, nameEng: pl.nameEng, id: pl.id}}][0..3],
         critical_terms: [(node)-[:HAS_SUBJECT_CRITICALTERM]->(ct:CriticalTerm) |
-            {nameKor: ct.nameKor, nameEng: ct.nameEng}][0..5],
+            {{nameKor: ct.nameKor, nameEng: ct.nameEng}}][0..5],
         era: [(node)-[:HAS_SUBJECT_ERA]->(e:Era) | e.nameKor][0],
         contained_poems: [(node)-[:HAS_PART]->(pm:Poem) |
-            {id: pm.id, position: pm.position,
-             textKor: pm.textKor, textChi: pm.textChi, textEng: pm.textEng}][0..3],
+            {{id: pm.id, position: pm.position,
+             textKor: pm.textKor, textChi: pm.textChi, textEng: pm.textEng}}][0..3],
         contained_critiques: [(node)-[:HAS_PART]->(c:Critique) |
-            {id: c.id, position: c.position,
-             textKor: c.textKor, textEng: c.textEng}][0..3]
-    } AS metadata
-
+            {{id: c.id, position: c.position,
+             textKor: c.textKor, textEng: c.textEng}}][0..3]
+    }} AS metadata
 """
+
+
+# 언어별 retriever를 lazy init 후 캐싱. 한 세션 안에서 같은 언어로 여러 번 질문해도
+# Neo4jVector 인스턴스는 한 번만 만든다.
+_retrievers: dict = {}
+
+
+def _get_retriever_for_lang(lang: str):
+    cfg = INDEX_BY_LANG.get(lang, INDEX_BY_LANG["ko"])
+    if lang not in _retrievers:
+        neo4jvector = Neo4jVector.from_existing_index(
+            embeddings,
+            graph=graph,
+            index_name=cfg["index_name"],
+            node_label="Entry",
+            text_node_property=cfg["text_property"],
+            embedding_node_property=cfg["embedding_property"],
+            retrieval_query=_build_retrieval_query(cfg["text_property"]),
         )
-        _retriever = neo4jvector.as_retriever()
-    return _retriever
+        _retrievers[lang] = neo4jvector.as_retriever()
+    return _retrievers[lang]
+
 
 def get_poetry_plot(input):
-    retriever = _get_retriever()
+    # 매 호출 시 세션의 effective_language를 읽어 그에 맞는 in-language 인덱스로 라우팅.
+    # bot.py가 매 턴 갱신하는 키이며, 없으면 ko로 폴백.
+    user_language = st.session_state.get("effective_language", "ko")
+    retriever = _get_retriever_for_lang(user_language)
     question_answer_chain = create_stuff_documents_chain(llm, _build_prompt())
     plot_retriever = create_retrieval_chain(retriever, question_answer_chain)
     return plot_retriever.invoke({"input": input})
