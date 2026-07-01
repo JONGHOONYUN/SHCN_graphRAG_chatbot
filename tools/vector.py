@@ -10,7 +10,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 
 instructions = (
-  "당신은 시화총림(詩話叢林) 전문가입니다."
+    "당신은 시화총림(詩話叢林) 전문가입니다. "
     "주어진 context의 시화 자료만을 근거로 답하세요. "
     "context에 없는 내용은 '제공된 자료에 없습니다'라고 답하세요. "
 
@@ -19,12 +19,10 @@ instructions = (
     "절대로 번역·요약·변형하지 마세요. 원문 그대로 제시하고, "
     "별도로 해설이나 맥락을 덧붙이세요. "
 
-    # Provenance
+    # Provenance — Work label (not Book)
     "답변할 때 반드시 출처를 명시하세요: "
-    "시화집명(Book.nameKor), 항목 번호(Entry.position), 항목 ID(Entry.id). "
-    "예: 파한집(B001) 제3항목(E003). "
-    "시(Poem)나 비평(Critique)을 인용할 때는 전체 출처 경로를 제시하세요: "
-    "예: 파한집(B001) > 제3항목(E003) > 제2시(M012). "
+    "시화집명(Work.nameKor / Work.nameEng), 항목 번호(Entry.position), 항목 ID(Entry.id). "
+    
 
     # Entity links
     "언급된 모든 개체에 Poetry Talks 링크를 포함하세요: "
@@ -32,15 +30,34 @@ instructions = (
     "사용자 언어에 맞는 uselang 파라미터를 추가하세요 "
     "(en / ko / zh / fr). "
 
-    # External data
-    "idAKSdigerati 또는 idAKSency가 있는 개체는 외부 API 데이터를 "
-    "조회하여 답변에 포함하고 해당 링크도 제공하세요. "
+    # External authority IDs — Person nodes carry up to 15 different external IDs
+    "Person·Place 노드는 여러 외부 authority ID를 보유합니다. context에 존재하는 "
+    "ID가 있으면 답변에 링크·정보를 함께 인용하세요. 사용자 언어·문화권에 따라 "
+    "우선순위를 조정하세요:\n"
+    "  · 한국어 사용자: idAKSdigerati, idAKSency, idAKSsillok, idAKSkdp, idNLK 우선\n"
+    "  · 중국어/일본어 사용자: idCBDB, idAcademiaSinica, idEncyChina 우선\n"
+    "  · 영어/유럽 사용자: idWikidata, idLOC, idBritannica, idBNF, idOpenLibrary, "
+    "idBritishMuseum, idYaleLux 우선\n"
+    "  · idWikidata는 모든 언어에서 유용한 크로스링구얼 authority이므로 "
+    "존재하면 항상 함께 인용 권장. "
+    "외부 링크 base URL: "
+    "https://www.wikidata.org/wiki/{id} (Wikidata), "
+    "https://encykorea.aks.ac.kr/Article/{id} (AKS 한국민족문화대백과), "
+    "https://digerati.aks.ac.kr:85/api/IdValues/{id} (AKS Digerati Person), "
+    "https://sillok.history.go.kr/{id} (조선왕조실록). "
+
+    # Place geographic data (gis 문자열, 예: '37° 56\\' 17.50\" N, 126° 35\\' 16.06\" E')
+    "Place 노드에 gis 좌표가 있으면 지리 정보로 활용하세요. "
+    "image 필드가 있으면 이미지 URL로 활용 가능. "
+    "Place는 idAKSdigerati / idAKSmap / idAKSency의 세 가지 authority가 "
+    "각각 다른 하위 집합에 채워져 있으니 존재하는 것을 우선 인용하세요. "
 
     # Language
     "사용자가 쓰는 언어로 답변하세요. "
-    "인물명은 데이터베이스에 저장된 nameEng, nameMR, namePY를 그대로 사용하고 "
-    "재로마자화하지 마세요. "
-    "일본어 등 한자 사용 언어 사용자에게는 nameChi를 우선 사용하세요."
+    "인물명은 데이터베이스에 저장된 nameEng, nameMR, namePY, nameRR를 그대로 사용하고 "
+    "다시 로마자화하지 마세요. "
+    "일본어 등 한자 사용 언어 사용자에게는 nameChi를 우선 사용하세요. "
+    "프랑스어 사용자에게 Topic은 nameFra가 있으면 우선 사용하세요."
 )
 
 _LANGUAGE_LABEL = {
@@ -93,7 +110,15 @@ INDEX_BY_LANG = {
 
 def _build_retrieval_query(text_property: str) -> str:
     """언어별 retrieval_query를 생성. 'text' 필드만 해당 언어 속성으로 바꾸고
-    metadata는 동일하게 세 언어의 본문·인물·주제 등 풍부한 컨텍스트를 모두 포함."""
+    metadata는 동일하게 세 언어의 본문·인물·주제·외부 authority ID까지 포함.
+
+    실제 스키마 반영:
+    - Work 라벨(구 :Book 오류 수정), HAS_SUBJECT_CRITICAL_TERM(언더스코어) 수정
+    - Person은 idAKSdigerati 외 idWikidata, idCBDB, idAKSsillok 등 15종 authority ID 보유
+    - Place는 latitude/longitude/gis 지리 정보 보유
+    - Work/Topic은 descEng·descChi(Work) 설명 보유
+    - Entry는 nameKor/Chi/Eng 이름 속성도 보유
+    """
     return f"""
 RETURN
     node.{text_property} AS text,
@@ -101,37 +126,78 @@ RETURN
     {{
         entry_id: node.id,
         entry_position: node.position,
+        entry_name_kor: node.nameKor,
+        entry_name_chi: node.nameChi,
+        entry_name_eng: node.nameEng,
         original_chinese: node.textChi,
         english_translation: node.textEng,
         korean_translation: node.textKor,
-        source_book_kor: [(b:Book)-[:HAS_PART]->(node) | b.nameKor][0],
-        source_book_eng: [(b:Book)-[:HAS_PART]->(node) | b.nameEng][0],
-        source_book_id: [(b:Book)-[:HAS_PART]->(node) | b.id][0],
         poetrytalks_link: 'https://poetrytalks.org/' + node.id,
+        source_work_kor: [(w:Work)-[:HAS_PART]->(node) | w.nameKor][0],
+        source_work_eng: [(w:Work)-[:HAS_PART]->(node) | w.nameEng][0],
+        source_work_chi: [(w:Work)-[:HAS_PART]->(node) | w.nameChi][0],
+        source_work_id: [(w:Work)-[:HAS_PART]->(node) | w.id][0],
+        source_work_desc: [(w:Work)-[:HAS_PART]->(node) | w.descEng][0],
         creator: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameKor][0],
         creator_eng: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameEng][0],
+        creator_chi: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameChi][0],
+        creator_mr: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameMR][0],
+        creator_py: [(node)-[:HAS_CREATOR]->(p:Person) | p.namePY][0],
+        creator_rr: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameRR][0],
         creator_id: [(node)-[:HAS_CREATOR]->(p:Person) | p.id][0],
-        creator_aks_id: [(node)-[:HAS_CREATOR]->(p:Person) | p.idAKSdigerati][0],
         creator_year_birth: [(node)-[:HAS_CREATOR]->(p:Person) | p.yearBirth][0],
         creator_year_death: [(node)-[:HAS_CREATOR]->(p:Person) | p.yearDeath][0],
+        creator_image: [(node)-[:HAS_CREATOR]->(p:Person) | p.image][0],
+        creator_desc: [(node)-[:HAS_CREATOR]->(p:Person) | p.descEng][0],
+        creator_external_ids: [(node)-[:HAS_CREATOR]->(p:Person) |
+            {{aks_digerati: p.idAKSdigerati, aks_ency: p.idAKSency,
+              aks_sillok: p.idAKSsillok, aks_kdp: p.idAKSkdp,
+              cbdb: p.idCBDB, academia_sinica: p.idAcademiaSinica,
+              wikidata: p.idWikidata, ency_china: p.idEncyChina,
+              nlk: p.idNLK, loc: p.idLOC, bnf: p.idBNF,
+              britannica: p.idBritannica, british_museum: p.idBritishMuseum,
+              open_library: p.idOpenLibrary, world_history: p.idWorldHistory,
+              yale_lux: p.idYaleLux}}][0],
         creator_era: [(node)-[:HAS_CREATOR]->(p:Person)-[:HAS_ERA]->(e:Era) |
             {{nameKor: e.nameKor, nameEng: e.nameEng,
              yearStart: e.yearStart, yearEnd: e.yearEnd}}][0],
+        creator_gender: [(node)-[:HAS_CREATOR]->(p:Person)-[:HAS_GENDER]->(g:Topic) |
+            g.nameEng][0],
+        creator_office: [(node)-[:HAS_CREATOR]->(p:Person)-[:HAS_OFFICE]->(o:Topic) |
+            {{nameKor: o.nameKor, nameEng: o.nameEng}}][0..3],
+        creator_clan: [(node)-[:HAS_CREATOR]->(p:Person)-[:HAS_CLAN]->(cl:Topic) |
+            {{nameKor: cl.nameKor, nameEng: cl.nameEng}}][0],
         mentioned_persons: [(node)-[:HAS_SUBJECT_PERSON]->(p:Person) |
-            {{nameKor: p.nameKor, nameEng: p.nameEng, id: p.id}}][0..5],
+            {{nameKor: p.nameKor, nameEng: p.nameEng, nameChi: p.nameChi,
+              nameMR: p.nameMR, namePY: p.namePY, nameRR: p.nameRR,
+              id: p.id, wikidata: p.idWikidata,
+              aks_digerati: p.idAKSdigerati}}][0..5],
+        audiences: [(node)-[:HAS_PART]->(pm:Poem)-[:HAS_AUDIENCE]->(a:Person) |
+            {{nameKor: a.nameKor, nameEng: a.nameEng, nameChi: a.nameChi,
+              id: a.id, wikidata: a.idWikidata}}][0..3],
         topics: [(node)-[:HAS_SUBJECT_TOPIC]->(t:Topic) |
-            {{nameKor: t.nameKor, nameEng: t.nameEng}}][0..5],
+            {{nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi,
+              nameFra: t.nameFra, descEng: t.descEng}}][0..5],
+        forms_types: [(node)-[:HAS_TYPE]->(t:Topic) |
+            {{nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi}}][0..3],
         places: [(node)-[:HAS_SUBJECT_PLACE]->(pl:Place) |
-            {{nameKor: pl.nameKor, nameEng: pl.nameEng, id: pl.id}}][0..3],
-        critical_terms: [(node)-[:HAS_SUBJECT_CRITICALTERM]->(ct:CriticalTerm) |
-            {{nameKor: ct.nameKor, nameEng: ct.nameEng}}][0..5],
-        era: [(node)-[:HAS_SUBJECT_ERA]->(e:Era) | e.nameKor][0],
+            {{nameKor: pl.nameKor, nameEng: pl.nameEng, nameChi: pl.nameChi,
+              id: pl.id, gis: pl.gis, image: pl.image,
+              aks_digerati: pl.idAKSdigerati, aks_map: pl.idAKSmap,
+              aks_ency: pl.idAKSency}}][0..3],
+        critical_terms: [(node)-[:HAS_SUBJECT_CRITICAL_TERM]->(ct:CriticalTerm) |
+            {{nameKor: ct.nameKor, nameEng: ct.nameEng, nameChi: ct.nameChi,
+              descEng: ct.descEng}}][0..5],
+        era: [(node)-[:HAS_SUBJECT_ERA]->(e:Era) |
+            {{nameKor: e.nameKor, nameEng: e.nameEng,
+              yearStart: e.yearStart, yearEnd: e.yearEnd}}][0],
         contained_poems: [(node)-[:HAS_PART]->(pm:Poem) |
             {{id: pm.id, position: pm.position,
-             textKor: pm.textKor, textChi: pm.textChi, textEng: pm.textEng}}][0..3],
+              nameKor: pm.nameKor, nameChi: pm.nameChi, nameEng: pm.nameEng,
+              textKor: pm.textKor, textChi: pm.textChi, textEng: pm.textEng}}][0..3],
         contained_critiques: [(node)-[:HAS_PART]->(c:Critique) |
             {{id: c.id, position: c.position,
-             textKor: c.textKor, textEng: c.textEng}}][0..3]
+              textKor: c.textKor, textChi: c.textChi, textEng: c.textEng}}][0..3]
     }} AS metadata
 """
 

@@ -22,18 +22,18 @@ The database captures a literary tradition in which scholars (sihwaga) composed 
 The data is organized in a strict part-whole hierarchy:
 
     Series (the full compendium)
-      └─ HAS_PART ─> Book
+      └─ HAS_PART ─> Work
            └─ HAS_PART ─> Entry
                 └─ HAS_PART ─> Poem
                 └─ HAS_PART ─> Critique
 
 - Series: the full Sihwa ch'ongnim compendium, compiled by Hong Man-jong.
-- Book: an individual sihwa book within the compendium, typically attributed to one author (e.g. Jibong yusol, Seongseo sihwa, Hogok sihwa).
-- Entry: a discrete prose unit within a Book. Each Entry contains narrative text that introduces and contextualizes the poems and critiques embedded within it. An Entry may contain multiple Poems, multiple Critiques, or both.
+- Work: an individual sihwa book within the compendium, typically attributed to one author (e.g. Jibong yusol, Seongseo sihwa, Hogok sihwa). Node label is :Work (NOT :Book — there is no :Book label in this database).
+- Entry: a discrete prose unit within a Work. Each Entry contains narrative text that introduces and contextualizes the poems and critiques embedded within it. An Entry may contain multiple Poems, multiple Critiques, or both.
 - Poem: the text of a classical poem, extracted from its Entry.
 - Critique: the text of a critical evaluation, extracted from its Entry. A Critique is written BY one person (its creator) ABOUT another person or their poem (its subject). These are distinct roles and must never be confused.
 
-NOTE: Three Entries (prefaces/postfaces) connect directly to the Series Work rather than to a Book. This is an exception to the standard hierarchy.
+NOTE: Three Entries (prefaces/postfaces) connect directly to the Series rather than to a Work. This is an exception to the standard hierarchy.
 
 NOTE: Edition nodes exist in the database but must be ignored for all queries.
 
@@ -53,7 +53,7 @@ DO NOT GUESS OR INVENT PROPERTY NAMES.
 
 
 ## Name Properties
-Available on: Series, Book, Person, Place, Era, Topic, CriticalTerm
+Available on: Series, Work, Person, Place, Era, Topic, CriticalTerm
 
     nameKor   Korean name (han'gul)
     nameChi   Sinitic name (hanja/hanzi)
@@ -84,10 +84,10 @@ NOTE: descKor and descChi are not currently in use. Do not reference them.
 
 
 ## Structural Properties
-  position  (Series, Book, Entry, Poem, Critique)
+  position  (Series, Work, Entry, Poem, Critique)
               Integer; order of the node within its parent container.
     id        (all node types) Internal database ID. The prefix indicates type:
-                B### = Book
+                B### = Work (the "B" prefix is a legacy of the sihwa "Book" concept — the actual node label is :Work)
                 E### = Entry
                 M### = Poem
                 C### = Critique
@@ -103,17 +103,17 @@ NOTE: descKor and descChi are not currently in use. Do not reference them.
     yearDeath        (Person) Year of death
     yearStart        (Era)    First year of the era
     yearEnd          (Era)    Last year of the era
-    yearPublication  (Book)   Year of publication [NOT YET POPULATED]
+    yearPublication  (Work)   Year of publication [NOT YET POPULATED]
 
 NOTE: Do not use yearExam — it has been removed from the data.
 
 
 ## External Identifier Properties
 
-    idAKSdigerati  (Person primarily; also Book, Place)
+    idAKSdigerati  (Person primarily; also Work, Place)
                    ID for the AKS Digerati API. Currently populated mainly
                    for Person nodes.
-    idAKSency      (Place, Book)
+    idAKSency      (Place, Work)
                    ID for the AKS Encyclopedia of Korean Culture.
 
 External link URL patterns (use these exact base URLs):
@@ -121,7 +121,7 @@ External link URL patterns (use these exact base URLs):
       https://encykorea.aks.ac.kr/Article/ + idAKSency
   AKS Digerati — Person (port 85):
       https://digerati.aks.ac.kr:85/api/IdValues/ + idAKSdigerati
-  AKS Digerati — Book (port 86):
+  AKS Digerati — Work (port 86):
       https://digerati.aks.ac.kr:86/api/IdValues/ + idAKSdigerati
   AKS Digerati — Place (port 88):
       https://digerati.aks.ac.kr:88/api/IdValues/ + idAKSdigerati
@@ -142,7 +142,23 @@ When a node has an external ID, retrieve the external data and incorporate it in
 
 ##Relationship Type Rules
 
-DO NOT use HAS_TYPE generically. Always use the specific relationship subtype:
+HAS_TYPE usage rule (IMPORTANT — the previous "do not use HAS_TYPE" rule was wrong):
+- HAS_TYPE IS a valid, populated relationship (~3,520 instances). Use it for
+  FORM / TYPOLOGICAL classification pointing to a Topic node:
+      (Poem)-[:HAS_TYPE]->(Topic)   e.g. Topic {nameKor: '칠언절구'}  (1,754 instances)
+      (Entry)-[:HAS_TYPE]->(Topic)                                    (918 instances)
+      (Place)-[:HAS_TYPE]->(Topic)  e.g. Topic {nameKor: '산'}          (435 instances)
+      (Person)-[:HAS_TYPE]->(Topic) e.g. Topic {nameKor: '문신'}        (391 instances)
+- Do NOT use HAS_TYPE for a Person's gender, official post, or clan/family
+  origin. Those have dedicated relationships:
+      HAS_GENDER   Person's gender -> Topic
+      HAS_OFFICE   Person's office/post -> Topic
+      HAS_CLAN     Person's clan/family origin -> Topic
+- If uncertain whether to use HAS_TYPE vs. a specific HAS_* relationship,
+  prefer the specific one when the concept is gender/office/clan; use
+  HAS_TYPE for form (verse form, prose form, work typology, etc.).
+
+Full list of relationship types:
 
     HAS_CREATOR               Author of a poem or book
     HAS_AUDIENCE              Recipient/addressee of a poem (188 instances)
@@ -154,14 +170,14 @@ DO NOT use HAS_TYPE generically. Always use the specific relationship subtype:
     HAS_SUBJECT_TEXT          Subject text discussed in a text [1,694 instances]
     HAS_SUBJECT_TOPIC         Topic/theme of a text
     HAS_SUBJECT_ERA           Era discussed as subject in a text
-    HAS_SUBJECT_CRITICALTERM  Critical term used in a text [689 terms total]
+    HAS_SUBJECT_CRITICAL_TERM  Critical term used in a text [689 terms total]
     HAS_OFFICE                Person's office or post -> Topic
     HAS_CLAN                  Person's clan/family origin -> Topic
     HAS_GENDER                Person's gender -> Topic
     HAS_SOCIAL_STATUS         Person's social status -> Topic
                               [sparsely populated — do not use as primary filter]
     HAS_ERA                   Era of a person or work -> Era node
-    HAS_PART                  Parts within a whole (Series->Book->Entry->Poem/Critique)
+    HAS_PART                  Parts within a whole (Series->Work->Entry->Poem/Critique)
 
 
 ##Named Query Patterns
@@ -174,7 +190,7 @@ Use these path patterns for common query types:
 ### "How was person X critiqued / what critical terms describe person X"
     Critique -[:HAS_SUBJECT_PERSON]-> Person (X)
     Critique -[:HAS_CREATOR]-> Person (the critic)
-    Critique -[:HAS_SUBJECT_CRITICALTERM]-> CriticalTerm
+    Critique -[:HAS_SUBJECT_CRITICAL_TERM]-> CriticalTerm
     IMPORTANT: HAS_CREATOR = who wrote the critique.
                HAS_SUBJECT_PERSON = who is being evaluated.
                These are always different people. Never confuse them.
@@ -188,13 +204,13 @@ Use these path patterns for common query types:
     Creator Person -[:HAS_ERA]-> Era
     Aggregate and group by Era.nameKor or Era.yearStart for chronological order.
 
-### "What is in Book X / browse a book"
-    Book -[:HAS_PART]-> Entry -[:HAS_PART]-> Poem or Critique
+### "What is in Work X / browse a sihwa book"
+    Work -[:HAS_PART]-> Entry -[:HAS_PART]-> Poem or Critique
     Order by Entry.position, then Poem/Critique.position within each Entry.
 
 ### "Which texts reference poem/work X"
     Critique or Entry -[:HAS_SUBJECT_TEXT]-> Poem (X)
-    Critique or Entry -[:HAS_SUBJECT_WORK]-> Book (X)
+    Critique or Entry -[:HAS_SUBJECT_WORK]-> Work (X)
 
 ### "Who is a poem addressed to"
     Poem -[:HAS_CREATOR]-> Person (author)
@@ -255,12 +271,12 @@ Use these path patterns for common query types:
   in "No. X" always derives from the position property — never invented.
 
     For an Entry:
-      Entry No. [Entry.position] ([Entry.id]), of [Book.nameEng] ([Book.id])
+      Entry No. [Entry.position] ([Entry.id]), of [Work.nameEng] ([Work.id])
       e.g.  Entry No. 3 (E003), of Jottings of Pagun (B001)
 
     For a Poem or Critique, include the full chain:
       Poem No. [Poem.position] ([Poem.id]), from Entry No. [Entry.position]
-      ([Entry.id]), of [Book.nameEng] ([Book.id])
+      ([Entry.id]), of [Work.nameEng] ([Work.id])
       e.g.  Poem No. 2 (M012), from Entry No. 3 (E003),
             of Jottings of Pagun (B001)
 
@@ -300,7 +316,7 @@ Cypher: MATCH (p:Person)-[:HAS_CREATOR]-(c:Critique)-[:HAS_SUBJECT_TEXT]->(poem:
         RETURN poem.textKor, poem.textChi LIMIT 20
 
 Q: 지봉유설에 실린 시 중 '달'을 주제로 한 것은?
-Cypher: MATCH (b:Book)-[:HAS_PART]->(e:Entry)-[:HAS_PART]->(poem:Poem),
+Cypher: MATCH (b:Work)-[:HAS_PART]->(e:Entry)-[:HAS_PART]->(poem:Poem),
               (e)-[:HAS_SUBJECT_TOPIC]->(t:Topic)
         WHERE b.nameKor CONTAINS '지봉유설' AND t.nameKor = '달'
         RETURN poem.textKor, poem.textChi
@@ -318,7 +334,7 @@ Cypher: MATCH (poem:Poem)-[:HAS_TYPE]->(t:Topic),
         RETURN p.nameKor, count(poem) AS n ORDER BY n DESC LIMIT 10
 
 Q: '기고(奇古)' 비평용어가 쓰인 비평문을 알려줘
-Cypher: MATCH (c:Critique)-[:HAS_SUBJECT_CRITICALTERM]->(ct:CriticalTerm)
+Cypher: MATCH (c:Critique)-[:HAS_SUBJECT_CRITICAL_TERM]->(ct:CriticalTerm)
         WHERE ct.nameKor CONTAINS '기고' OR ct.nameChi CONTAINS '奇古'
         RETURN c.textKor, c.textChi LIMIT 10
 
@@ -337,7 +353,7 @@ Cypher: MATCH (p:Person)-[:HAS_GENDER]->(g:Topic),
 
 Q: 최치원은 어떤 비평어로 평가받았나?
 Cypher: MATCH (subject:Person)<-[:HAS_SUBJECT_PERSON]-(c:Critique)
-              -[:HAS_SUBJECT_CRITICALTERM]->(ct:CriticalTerm),
+              -[:HAS_SUBJECT_CRITICAL_TERM]->(ct:CriticalTerm),
               (c)-[:HAS_CREATOR]->(critic:Person)
         WHERE subject.nameKor CONTAINS '최치원' OR subject.nameChi CONTAINS '崔致遠'
         RETURN ct.nameKor, ct.nameChi, ct.nameEng,
@@ -352,7 +368,7 @@ Cypher: MATCH (p:Person)-[:HAS_ERA]->(e:Era),
         ORDER BY n DESC LIMIT 20
 
 Q: 시화총림에서 두보를 언급하는 항목은?
-Cypher: MATCH (b:Book)-[:HAS_PART]->(e:Entry)-[:HAS_SUBJECT_PERSON]->(p:Person)
+Cypher: MATCH (b:Work)-[:HAS_PART]->(e:Entry)-[:HAS_SUBJECT_PERSON]->(p:Person)
         WHERE p.nameChi CONTAINS '杜甫' OR p.nameKor CONTAINS '두보'
         RETURN b.nameKor, b.nameEng, e.id, e.position,
                e.textKor, e.textChi LIMIT 20
