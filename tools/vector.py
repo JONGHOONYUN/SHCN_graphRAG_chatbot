@@ -58,6 +58,81 @@ instructions = (
     "다시 로마자화하지 마세요. "
     "일본어 등 한자 사용 언어 사용자에게는 nameChi를 우선 사용하세요. "
     "프랑스어 사용자에게 Topic은 nameFra가 있으면 우선 사용하세요."
+
+    # ────────────────────────────────────────────────────────────
+    # Graph reasoning enhancements (added below — how to interpret the retrieved context)
+    # ────────────────────────────────────────────────────────────
+
+    # A. Metadata dict — 필드별 밀도와 해석 (실측 스키마 기반)
+    "\n\n[Retrieved context metadata 해석 가이드]\n"
+    "매 검색 결과는 Entry 노드 하나와 metadata dict로 구성됩니다. 필드별로 밀도가 "
+    "다르니 존재 여부부터 확인한 뒤 인용하세요:\n"
+    "  · entry_id / entry_position / source_work_* : 거의 항상 존재. 인용 필수.\n"
+    "  · korean_translation / original_chinese / english_translation : 대부분 존재.\n"
+    "    (수사·기교 해설은 원문 옆에 별도로 붙이고, 원문 자체는 변형 금지.)\n"
+    "  · creator·creator_eng·creator_chi : Entry 작성자(=서술의 저자). "
+    "    Poem/Critique의 저자와 혼동하지 마세요 (아래 B 참조).\n"
+    "  · creator_year_birth/year_death : 부분 존재. 없으면 creator_era 사용 폴백.\n"
+    "  · creator_era : 대부분 존재 (Person 591건). nameEng + yearStart~yearEnd로 표기.\n"
+    "  · creator_external_ids : 15종 authority ID 사전. 값이 있는 것만 골라 인용.\n"
+    "  · mentioned_persons / audiences / topics / forms_types / places / "
+    "critical_terms / era : 태그 밀도가 다양. 없으면 '기록되지 않음'으로 처리.\n"
+    "  · contained_poems / contained_critiques : Entry에 속한 시/비평. 정문 인용용.\n"
+    "  · places.gis : 좌표 문자열(예: 37° 56' 17.50\" N, 126° 35' 16.06\" E) — "
+    "값이 있는 경우 지리 정보로 활용, 없으면 조용히 생략.\n"
+
+    # B. Entry 하나에 등장할 수 있는 세 가지 Person 역할
+    "\n[한 Entry에 등장하는 Person의 세 가지 역할 — 절대 혼동 금지]\n"
+    "  1) AUTHOR (creator/creator_eng/creator_chi): Entry 서술을 지은 사람. "
+    "     보통 시화집의 저자와 동일. HAS_CREATOR 관계.\n"
+    "  2) SUBJECTS (mentioned_persons): 서술 안에서 평가·언급되는 대상. "
+    "     비평의 대상이 될 수 있음. HAS_SUBJECT_PERSON 관계.\n"
+    "  3) ADDRESSEES (audiences): 시가 헌정·수신된 인물. HAS_AUDIENCE 관계는 "
+    "     Poem에만 존재하므로 audiences는 contained_poems를 경유한 결과.\n"
+    "예) 홍만종(AUTHOR)이 '허균(SUBJECT)이 이백(TEXT SUBJECT)의 시를 논하며 "
+    "    권필(AUDIENCE)에게 보낸 편지'를 서술 → 네 사람의 역할이 다름.\n"
+
+    # C. Work의 두 종류 (실측 116개 중 두 유형)
+    "\n[Work 두 종류 구분 — 인용 방식이 다름]\n"
+    "  · 시화 원전 (B001~B025 대: position 있음, descEng 상세): 이 챗봇의 "
+    "    1차 사료. 파한집(B001), 지봉유설(B016), 성수시화(B018), 호곡시화(B023) 등. "
+    "    전체 출처 경로(Work → Entry → Poem/Critique)로 인용.\n"
+    "  · 외부 참조 서적 (B026~B131: position 없거나 descEng 없음): 시화 안에서 "
+    "    인용·언급되는 다른 문헌. 예: 당서예문지(B028), 시경(B035), 논어(B067), "
+    "    태평광기(B077). 답변에서는 배경·컨텍스트로만 언급, 1차 인용 대상 아님.\n"
+
+    # D. 시대 정보 우선순위 (Era 계층)
+    "\n[시대(Era) 정보 해석 우선순위]\n"
+    "  1) creator_year_birth / creator_year_death — 정확한 연도 우선.\n"
+    "  2) creator_era.yearStart / yearEnd — 시대 범위로 폴백.\n"
+    "  3) creator_era.nameKor / nameEng — 시대명만 표기.\n"
+    "  Era는 계층 구조(예: 조선 → 조선 후기)를 가지므로 하위 시대가 태그된 "
+    "  경우가 있음. 상위 시대 질의라면 하위 시대 결과도 그 상위에 속함.\n"
+
+    # E. Multi-hop 종합 추론 워크플로우
+    "\n[복합 질문을 만났을 때 종합 추론 순서]\n"
+    "  Step 1: Entry 본문(text)에서 핵심 사실 확인.\n"
+    "  Step 2: metadata.mentioned_persons / topics / places / critical_terms 로 "
+    "          질문의 엔티티가 실제로 태그되었는지 검증.\n"
+    "  Step 3: contained_poems / contained_critiques 에서 인용 가능한 원문 발췌.\n"
+    "  Step 4: creator_era + creator_external_ids로 작자를 학술 authority에 링크.\n"
+    "  Step 5: source_work_* 로 시화집 출처를 명시.\n"
+    "  Step 6: 답변은 락 언어로, 원문·인용문은 원어 그대로.\n"
+
+    # F. 빈 필드 처리
+    "\n[비어 있는 metadata 필드 처리 원칙]\n"
+    "  · null/빈 값은 절대 지어내지 마세요. 학술 챗봇의 신뢰성이 우선.\n"
+    "  · '기록되지 않음' / 'not recorded in the database' 로 명시하거나 언급 생략.\n"
+    "  · 특히 external ID가 없으면 링크를 지어내지 말고 poetrytalks.org 링크만 제공.\n"
+    "  · creator_year_birth/death가 없으면 creator_era의 yearStart~yearEnd로 폴백.\n"
+
+    # G. Authority linking 활용
+    "\n[Cross-lingual authority linking — 답변 신뢰성 강화]\n"
+    "  · creator_external_ids.wikidata가 있으면 언제나 함께 링크 (교차 검색 가능).\n"
+    "  · 한국 인물: aks_digerati / aks_ency / aks_sillok 우선.\n"
+    "  · 중국 인물: cbdb / academia_sinica / ency_china 우선.\n"
+    "  · 서구 도서관 참조가 필요한 경우: loc / bnf / britannica / open_library.\n"
+    "  · authority ID 값이 아예 없는 경우 이 섹션은 통째로 건너뛰기.\n"
 )
 
 _LANGUAGE_LABEL = {

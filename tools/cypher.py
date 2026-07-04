@@ -180,6 +180,122 @@ Full list of relationship types:
     HAS_PART                  Parts within a whole (Series->Work->Entry->Poem/Critique)
 
 
+## Nodes and Relationships to IGNORE (chat runtime, not sihwa data)
+The LangChain chat history layer creates the following at runtime — they are
+NOT part of the sihwa dataset and must NEVER appear in your MATCH patterns
+or RETURN clauses:
+    Node labels : :Message, :Session
+    Relations   : [:NEXT], [:LAST_MESSAGE]
+If a query involves greetings, chat log, sessions, or user messages, refuse
+politely — this database is a sihwa knowledge graph, not a chat store.
+Also continue to ignore :Edition nodes (legacy, not in current data).
+
+
+# Empirical Graph Structure (Directed edge cardinalities — measured on the actual DB)
+
+Use these cardinalities to (a) choose the correct DIRECTION for each edge,
+(b) decide whether a pattern is worth trying (very sparse edges will often
+return empty), and (c) plan fallbacks.
+
+## Part-whole hierarchy (HAS_PART, 5,492 total)
+      (Work)     -[:HAS_PART]-> (Entry)    ×  921    ← every Entry has a parent Work
+      (Entry)    -[:HAS_PART]-> (Poem)     × 1,711
+      (Entry)    -[:HAS_PART]-> (Critique) × 1,740
+      (Topic)    -[:HAS_PART]-> (Topic)    × 1,048   ← Topic hierarchy — see section below
+      (Era)      -[:HAS_PART]-> (Era)      ×    46   ← Era hierarchy — see section below
+      (Work)     -[:HAS_PART]-> (Work)     ×    25   ← rare compound Works
+
+## Authorship (HAS_CREATOR, 4,459 total)
+      (Poem)     -[:HAS_CREATOR]-> (Person) × 1,761
+      (Critique) -[:HAS_CREATOR]-> (Person) × 1,750
+      (Entry)    -[:HAS_CREATOR]-> (Person) ×   922
+      (Work)     -[:HAS_CREATOR]-> (Person) ×    26
+
+## Subject-of edges (what a text is ABOUT)
+      HAS_SUBJECT_TOPIC          : Entry(7,354) > Poem(4,821) > Critique(1,852)  [DENSE]
+      HAS_SUBJECT_PERSON         : Entry(2,888) > Critique(1,896) > Poem(600)
+      HAS_SUBJECT_CRITICAL_TERM  : Entry(1,430) > Critique(959)   [Poem has only 1]
+      HAS_SUBJECT_PLACE          : Entry(972)   > Poem(539)       > Critique(144)
+      HAS_SUBJECT_TEXT           : Critique(1,516) > Poem(108)    [intertextual reference]
+      HAS_SUBJECT_WORK           : Critique(304)  > Poem(229)     > Entry(112)
+      HAS_SUBJECT_ERA            : Entry(172)  > Critique(76)     > Poem(59)
+
+## Person attributes
+      (Person)-[:HAS_GENDER]->(Topic)   × 1,082   [target = female|male Topic]
+      (Person)-[:HAS_OFFICE]->(Topic)   ×   751
+      (Person)-[:HAS_CLAN]->(Topic)     ×   670
+      (Person)-[:HAS_ERA]->(Era)        ×   591   [chronological anchor]
+      (Person)-[:HAS_TYPE]->(Topic)     ×   391   [profession/status typology]
+      NO HAS_SOCIAL_STATUS in the data — do not query it.
+
+## HAS_TYPE (typology; 3,520 total)
+      (Poem)-[:HAS_TYPE]->(Topic)      × 1,754   [verse forms — 칠언절구, 오언절구, etc.]
+      (Entry)-[:HAS_TYPE]->(Topic)     ×   918
+      (Place)-[:HAS_TYPE]->(Topic)     ×   435   [geographic types — 산, 강, etc.]
+      (Person)-[:HAS_TYPE]->(Topic)    ×   391   [profession/status types]
+      (Work)-[:HAS_TYPE]->(Topic)      ×    22
+
+## Poem-only edges
+      (Poem)-[:HAS_AUDIENCE]->(Person)     × 179   [recipient — Poem ONLY, not Entry/Critique]
+      (Poem)-[:HAS_CONTRIBUTOR]->(Person)  ×  16   [very sparse — do not filter primarily]
+
+## Direction rules — always use the ARROW SHOWN
+    ✓ (poem)-[:HAS_CREATOR]->(person)   ✗ (person)-[:HAS_CREATOR]->(poem)  ← WRONG
+    ✓ (critique)-[:HAS_SUBJECT_PERSON]->(person)
+    ✓ (work)-[:HAS_PART]->(entry)
+
+
+# Topic and Era Hierarchies
+
+Both :Topic and :Era form parent/child hierarchies via HAS_PART:
+- Topic hierarchy (1,048 edges): parent Topic contains child Topics.
+  Example: a "gender" Topic contains "female" and "male" as parts;
+  "verse form" contains 칠언절구, 오언절구, etc.;
+  "poetic imagery" contains 달, 강, 별 etc.
+  → For broad thematic queries, first find parent Topic, then traverse
+    -[:HAS_PART]-> to gather child Topics, then match texts that reference any child.
+- Era hierarchy (46 edges): a super-Era contains sub-Eras.
+  Example: 조선 → (Early Joseon, Mid Joseon, Late Joseon)
+  → For chronological queries spanning a super-Era, expand via
+    -[:HAS_PART*1..3]-> to include sub-Eras.
+
+
+# Multi-Hop Reasoning Patterns
+
+Use these composed patterns when a question needs traversal of 2+ edges.
+
+## "Poets whom X critiqued"
+    (X:Person)<-[:HAS_CREATOR]-(c:Critique)-[:HAS_SUBJECT_PERSON]->(target:Person)
+    RETURN DISTINCT target.nameKor, target.nameChi
+
+## "Critical terms used in critiques of poet X"
+    (c:Critique)-[:HAS_SUBJECT_PERSON]->(x:Person),
+    (c)-[:HAS_SUBJECT_CRITICAL_TERM]->(ct:CriticalTerm),
+    (c)-[:HAS_CREATOR]->(critic:Person)
+    WHERE x.nameKor CONTAINS <name>
+
+## "Poems written to female recipients"
+    (poem:Poem)-[:HAS_AUDIENCE]->(recipient:Person)-[:HAS_GENDER]->(g:Topic)
+    WHERE g.nameEng = 'female'
+    RETURN poem.textKor, recipient.nameKor
+
+## "Cross-era critic-poet relationships (critic from Era A, poet from Era B)"
+    (critic:Person)-[:HAS_ERA]->(:Era {nameKor: <A>}),
+    (poet:Person)-[:HAS_ERA]->(:Era {nameKor: <B>}),
+    (c:Critique)-[:HAS_CREATOR]->(critic),
+    (c)-[:HAS_SUBJECT_PERSON]->(poet)
+
+## "Intertextual reference — critiques that discuss a specific poem"
+    (poem:Poem)<-[:HAS_SUBJECT_TEXT]-(c:Critique)-[:HAS_CREATOR]->(critic:Person)
+    WHERE poem.textChi CONTAINS <keyword>
+
+## "Broad topic via Topic-hierarchy expansion"
+    (parent:Topic {nameKor: '자연'})-[:HAS_PART*1..3]->(child:Topic)
+      <-[:HAS_SUBJECT_TOPIC]-(text)
+    RETURN DISTINCT text
+  (Handles cases where the dataset tags specific sub-topics rather than the parent.)
+
+
 ##Named Query Patterns
 Use these path patterns for common query types:
 
@@ -372,6 +488,41 @@ Cypher: MATCH (b:Work)-[:HAS_PART]->(e:Entry)-[:HAS_SUBJECT_PERSON]->(p:Person)
         WHERE p.nameChi CONTAINS '杜甫' OR p.nameKor CONTAINS '두보'
         RETURN b.nameKor, b.nameEng, e.id, e.position,
                e.textKor, e.textChi LIMIT 20
+
+Q: 허균이 평한 시인들이 받은 비평용어는?  (multi-hop: Person → Critique → Person → Critique → CriticalTerm)
+Cypher: MATCH (hg:Person)<-[:HAS_CREATOR]-(c1:Critique)-[:HAS_SUBJECT_PERSON]->(target:Person),
+              (target)<-[:HAS_SUBJECT_PERSON]-(c2:Critique)-[:HAS_SUBJECT_CRITICAL_TERM]->(ct:CriticalTerm)
+        WHERE hg.nameKor CONTAINS '허균' OR hg.nameChi CONTAINS '許筠'
+        RETURN target.nameKor AS evaluated,
+               collect(DISTINCT ct.nameKor)[..10] AS terms,
+               count(DISTINCT c2) AS critique_count
+        ORDER BY critique_count DESC LIMIT 20
+
+Q: '자연' 상위 주제 하위의 세부 주제로 태그된 시들을 보여줘  (Topic hierarchy expansion)
+Cypher: MATCH (parent:Topic)-[:HAS_PART*1..3]->(child:Topic)
+              <-[:HAS_SUBJECT_TOPIC]-(poem:Poem)
+        WHERE parent.nameKor CONTAINS '자연' OR parent.nameEng CONTAINS 'nature'
+        RETURN child.nameKor AS sub_topic,
+               collect(DISTINCT {id: poem.id, textKor: poem.textKor})[..3] AS poems,
+               count(DISTINCT poem) AS n
+        ORDER BY n DESC LIMIT 20
+
+Q: 이백의 시를 인용·논평한 비평문은?  (intertextual — HAS_SUBJECT_TEXT)
+Cypher: MATCH (author:Person)<-[:HAS_CREATOR]-(target_poem:Poem)
+              <-[:HAS_SUBJECT_TEXT]-(c:Critique)-[:HAS_CREATOR]->(critic:Person)
+        WHERE author.nameKor CONTAINS '이백' OR author.nameChi CONTAINS '李白'
+        RETURN critic.nameKor AS critic_name,
+               target_poem.textKor AS quoted_poem,
+               c.textKor AS critique_text,
+               c.id AS critique_id LIMIT 20
+
+Q: 여성에게 보낸 시를 지은 남성 시인들과 그 시는?  (HAS_AUDIENCE + gender filter)
+Cypher: MATCH (poet:Person)-[:HAS_GENDER]->(:Topic {nameEng: 'male'}),
+              (poet)<-[:HAS_CREATOR]-(poem:Poem)-[:HAS_AUDIENCE]->(recipient:Person),
+              (recipient)-[:HAS_GENDER]->(:Topic {nameEng: 'female'})
+        RETURN poet.nameKor AS poet_name,
+               recipient.nameKor AS recipient_name,
+               poem.textKor, poem.textChi LIMIT 20
 
 Schema:
 {schema}

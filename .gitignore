@@ -6,3 +6,6 @@ __pycache__
 .vscode
 .pytest_cache
 .claude/
+
+# Raw Neo4j data exports (embeddings 포함 대용량 CSV, 채팅 로그 등 remote 배제)
+neo4j_data_import/
