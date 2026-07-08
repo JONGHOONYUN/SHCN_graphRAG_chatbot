@@ -2,6 +2,7 @@ import re
 import streamlit as st
 from utils import write_message
 from agent import generate_response
+from text_rag import generate_text_rag_response
 
 
 # ──────────────────────────────────────────────
@@ -109,61 +110,123 @@ def check_password() -> bool:
 if not check_password():
     st.stop()
 
-# Set up Session State
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "assistant", "content": (
-    "안녕하세요! **시화총림(詩話叢林) DB 챗봇**입니다.\n\n"
-    "시화총림(詩話叢林)에 담긴 지식·정보를 그래프 데이터로 구조화하여 연결한 데이터를 검색합니다.\n\n"
-    "인물, 비평, 장소, 시 등 9개의 클래스(Class)로 분류된 8,232개의 노드 데이터와 43,123개의 관계 데이터를 탐색할 수 있습니다.\n\n"
-    "**질문 예시**\n"
-    "- 이수광의 생몰년과 관직은?\n"
-    "- 허균이 평한 시 목록을 알려줘\n"
-    "- 지봉유설에 실린 '달'을 주제로 한 시는?\n"
-    "- 칠언절구를 가장 많이 지은 시인은?\n"
-    "- '기고(奇古)' 비평용어가 쓰인 비평문은?"
-)},
-    ]
-
-# Submit handler
-def handle_submit(message):
-    """
-    Submit handler:
-
-    You will modify this method to talk with an LLM and provide
-    context using data from Neo4j.
-    """
-
-    # Handle the response
-    with st.spinner('Thinking...'):
-        # Call the agent
-        response = generate_response(message)
-        write_message('assistant', response)
-        
+# ──────────────────────────────────────────────
+# Sidebar: 챗봇 모드 토글 (graphRAG on/off)
+# 켜짐 → graphRAG (그래프 관계 + 벡터, 풍부하지만 느림)
+# 꺼짐 → textRAG (Entry 본문 벡터 검색만, 빠르지만 관계 취약)
+# 두 모드는 messages_by_mode + Neo4j session_id suffix로 이력이 완전 분리됨.
+# ──────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ 챗봇 모드")
+    is_graphrag = st.toggle(
+        "graphRAG 모드",
+        value=st.session_state.get("chatbot_mode", "graphRAG") == "graphRAG",
+        help=(
+            "켜짐 (graphRAG): 그래프 관계 + 벡터 + 외부 authority. "
+            "구조적 사실·관계·다국어 인용 우수. 응답 5~30초.\n\n"
+            "꺼짐 (textRAG): Entry 본문 벡터 검색만. 의미 유사도 기반. 응답 1~3초."
+        ),
+    )
+    chatbot_mode = "graphRAG" if is_graphrag else "textRAG"
+    st.session_state["chatbot_mode"] = chatbot_mode
+    st.caption(
+        f"**현재 모드**: `{chatbot_mode}`  \n"
+        "두 모드는 별도의 대화 이력을 유지합니다."
+    )
 
 
-# Display messages in Session State
-for message in st.session_state.messages:
-    write_message(message['role'], message['content'], save=False)
+# ──────────────────────────────────────────────
+# 모드별 초기 인사 메시지
+# ──────────────────────────────────────────────
+GREETING_GRAPHRAG = {
+    "role": "assistant",
+    "content": (
+        "안녕하세요! **시화총림(詩話叢林) DB 챗봇 — graphRAG 모드**입니다.\n\n"
+        "시화총림(詩話叢林)에 담긴 지식·정보를 그래프 데이터로 구조화하여 연결한 데이터를 검색합니다.\n\n"
+        "인물, 비평, 장소, 시 등 9개의 클래스(Class)로 분류된 8,232개의 노드 데이터와 43,123개의 관계 데이터를 탐색할 수 있습니다.\n\n"
+        "**질문 예시 (구조적 사실·관계)**\n"
+        "- 이수광의 생몰년과 관직은?\n"
+        "- 허균이 평한 시 목록을 알려줘\n"
+        "- 지봉유설에 실린 '달'을 주제로 한 시는?\n"
+        "- 칠언절구를 가장 많이 지은 시인은?\n"
+        "- '기고(奇古)' 비평용어가 쓰인 비평문은?"
+    ),
+}
 
-# Handle any user input
-if prompt := st.chat_input("한국어, 영어, 중국어(한문)로 질문해보세요"):
-    # 1) 명시적 락/해제 요청 처리. 락 요청이 발견되면 그 언어로 락 갱신,
-    #    해제 요청이면 락 제거. 두 형태가 모두 없으면 락 상태는 그대로 유지.
+GREETING_TEXTRAG = {
+    "role": "assistant",
+    "content": (
+        "안녕하세요! **시화총림(詩話叢林) DB 챗봇 — textRAG 모드**입니다.\n\n"
+        "이 모드는 그래프 관계를 사용하지 않고, Entry 본문의 한국어·한문·영어 벡터 검색만으로 답변합니다. "
+        "의미·정서·주제 기반 질문에 빠르게 응답합니다.\n\n"
+        "**질문 예시 (의미·주제 검색)**\n"
+        "- 이별의 정한이 담긴 시를 소개해줘\n"
+        "- 달빛을 노래한 구절이 있나?\n"
+        "- 유배지에서 쓴 시 이미지는 어떤가?\n"
+        "- 자연 이미지가 강렬한 비평은?\n\n"
+        "구조적 사실(작자, 관직, 시대 등)이 필요한 질문은 사이드바에서 **graphRAG 모드**로 전환해 주세요."
+    ),
+}
+
+
+# ──────────────────────────────────────────────
+# 모드별 메시지 이력 초기화
+# ──────────────────────────────────────────────
+if "messages_by_mode" not in st.session_state:
+    st.session_state["messages_by_mode"] = {
+        "graphRAG": [GREETING_GRAPHRAG],
+        "textRAG": [GREETING_TEXTRAG],
+    }
+
+
+# ──────────────────────────────────────────────
+# 제출 핸들러 (모드에 따라 다른 백엔드 호출)
+# ──────────────────────────────────────────────
+def handle_submit(message: str, mode: str):
+    with st.spinner("Thinking..."):
+        if mode == "graphRAG":
+            response = generate_response(message)
+        else:
+            response = generate_text_rag_response(message)
+        st.session_state["messages_by_mode"][mode].append(
+            {"role": "assistant", "content": response}
+        )
+        write_message("assistant", response, save=False)
+
+
+# ──────────────────────────────────────────────
+# 현재 모드의 메시지 표시
+# ──────────────────────────────────────────────
+for message in st.session_state["messages_by_mode"][chatbot_mode]:
+    write_message(message["role"], message["content"], save=False)
+
+
+# ──────────────────────────────────────────────
+# 사용자 입력 처리 (모드별 placeholder)
+# ──────────────────────────────────────────────
+placeholder = (
+    "한국어, 영어, 중국어(한문)로 질문해보세요"
+    if chatbot_mode == "graphRAG"
+    else "의미·주제 기반 질문을 입력해보세요 (텍스트 벡터 검색)"
+)
+if prompt := st.chat_input(placeholder):
+    # 1) 명시적 락/해제 요청 처리
     explicit_lock = detect_explicit_lock(prompt)
     if explicit_lock:
         st.session_state["locked_language"] = explicit_lock
     elif detect_release_request(prompt):
         st.session_state.pop("locked_language", None)
 
-    # 2) 이번 턴 적용 언어 결정.
-    #    locked_language 가 있으면 그것을 사용, 없으면 현재 질문 언어 자동 감지.
+    # 2) 이번 턴 적용 언어 결정
     st.session_state["effective_language"] = (
         st.session_state.get("locked_language") or detect_language(prompt)
     )
 
-    # Display user message in chat message container
-    write_message('user', prompt)
+    # 3) 사용자 메시지 저장 + 즉시 표시
+    st.session_state["messages_by_mode"][chatbot_mode].append(
+        {"role": "user", "content": prompt}
+    )
+    write_message("user", prompt, save=False)
 
-    # Generate a response
-    handle_submit(prompt)
+    # 4) 모드별 응답 생성
+    handle_submit(prompt, chatbot_mode)

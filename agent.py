@@ -476,9 +476,10 @@ def generate_response(user_input):
     language_directive = _build_language_directive(user_language)
 
     try:
+        # session_id에 ::graphRAG suffix로 textRAG 이력과 완전 분리
         response = chat_agent.invoke(
             {"input": user_input, "language_directive": language_directive},
-            {"configurable": {"session_id": get_session_id()}},)
+            {"configurable": {"session_id": f"{get_session_id()}::graphRAG"}},)
     except ValueError as e:
         # Gemini가 빈 스트림을 반환한 경우 ("No generation chunks were returned").
         # 원인 후보: safety filter false positive, 일시적 API 오류, 누적 prompt 혼란.
