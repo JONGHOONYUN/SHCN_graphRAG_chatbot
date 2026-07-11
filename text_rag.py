@@ -55,8 +55,9 @@ _LANGUAGE_LABEL = {
 
 def _build_light_retrieval_query(text_property: str) -> str:
     """textRAG 전용 가벼운 메타 retrieval_query.
-    사용자 결정에 따라 Entry.id + Entry.position + Work 이름 + Poetry Talks 링크만
-    반환한다. 그래프 관계·인물·주제 등은 제외."""
+    Entry.id + Entry.position + Work 이름 + Poetry Talks 링크에 더해,
+    한자 원문·번역 병기 인용을 위해 Entry 자신의 세 언어 본문(textChi/textKor/textEng)
+    도 metadata에 포함한다. 그래프 관계·인물·주제 확장은 여전히 제외."""
     return f"""
 RETURN
     node.{text_property} AS text,
@@ -64,6 +65,9 @@ RETURN
     {{
         entry_id: node.id,
         entry_position: node.position,
+        original_chinese: node.textChi,
+        korean_translation: node.textKor,
+        english_translation: node.textEng,
         source_work_kor: [(w:Work)-[:HAS_PART]->(node) | w.nameKor][0],
         source_work_eng: [(w:Work)-[:HAS_PART]->(node) | w.nameEng][0],
         source_work_id: [(w:Work)-[:HAS_PART]->(node) | w.id][0],
@@ -126,6 +130,36 @@ def _build_prompt():
         f"     '{fallback}'\n"
         "5. 그래프 기반 사실(작자·시대·비평 관계 등)은 이 모드에서 알 수 없으므로, "
         f"이런 질문을 받으면 위 안내 문구로 응답하세요.\n\n"
+
+        # ────────────────────────────────────────────
+        # 6. 한자 원문·번역 병기 지시 (Bilingual quotation rule)
+        # ────────────────────────────────────────────
+        "6. [한자 원문·번역 병기]\n"
+        "   시화 자료를 인용할 때 metadata의 original_chinese(textChi), "
+        "korean_translation(textKor), english_translation(textEng)이 모두 존재하면 "
+        "다음 순서·형식으로 병기하세요:\n"
+        "     ① 한자 원문(original_chinese)을 먼저, 원문 그대로(구두점 · 줄바꿈 포함)\n"
+        "     ② 그 아래 사용자 언어에 맞는 번역:\n"
+        f"        - 답변 언어가 Korean이면 korean_translation\n"
+        f"        - 답변 언어가 English이면 english_translation\n"
+        f"        - 답변 언어가 Chinese이면 original_chinese만으로 충분 (번역 병기 생략 가능)\n"
+        "     ③ 원문과 번역은 반드시 blockquote(>) 또는 코드 블록으로 시각적 구분\n"
+        "     ④ 병기 뒤에 출처(위 규칙 3) 명시\n"
+        "   예시 형식 (사용자 언어가 Korean일 때):\n"
+        "     > **[漢文原文]**\n"
+        "     > 兩兩佳人弄夕暉。\n"
+        "     > 青樓朱箔共依依。\n"
+        "     >\n"
+        "     > **[한국어 번역]**\n"
+        "     > 쌍쌍의 가인들이 저녁 햇살 속에 노니는데,\n"
+        "     > 청루의 붉은 발 속에서 함께 가련히 비치네.\n"
+        "     — 출처: 어우야담 > 제N항목 (E###) > https://poetrytalks.org/E###\n"
+        "   주의사항:\n"
+        "   - 세 언어 중 일부만 존재(예: textEng가 null)하면 있는 것만 병기.\n"
+        "   - textChi가 없고 textKor/textEng만 있으면 병기 없이 사용자 언어 번역만 인용.\n"
+        "   - textChi의 원문 문자·구두점(。「」 등)을 절대 정규화하지 말고 그대로 유지.\n"
+        "   - 번역문도 절대 변형하지 말고 데이터베이스 저장 형태 그대로 인용.\n"
+        "   - 사용자 언어가 Japanese 등이라면 textChi를 우선 인용하고 필요 시 textKor을 부가.\n\n"
 
         "참고할 시화 자료(context):\n{context}"
     )

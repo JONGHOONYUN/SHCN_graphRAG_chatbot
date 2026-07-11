@@ -42,6 +42,7 @@ def _build_language_directive(user_language: str) -> str:
 
 from tools.vector import get_poetry_plot
 from tools.cypher import cypher_qa_safe
+from tools.external_authority import external_authority_lookup
 
 chat_prompt = ChatPromptTemplate.from_messages(
     [
@@ -167,7 +168,29 @@ tools = [
         "vector search and merge the results, noting which came from each source."
     ),
     func=lambda q: f"{cypher_qa_safe(q)}\n\n[보완 정보]\n{get_poetry_plot(q)}"
-)
+),
+    Tool.from_function(
+        name="External Authority Lookup",
+        description=(
+            "Fetch external biographical/reference data from public authorities "
+            "using an external ID stored on a Person node. "
+            "Use this AFTER Sihwa Graph Query has returned a Person node with "
+            "an idWikidata or idAKSdigerati value, AND the user's question asks "
+            "for details that go beyond the local graph: aliases, cross-lingual "
+            "names, biographical dates confirmed by an international authority, "
+            "occupation, dynasty context, or a short authoritative summary. "
+            "Do NOT call for questions that only need graph facts (poem lists, "
+            "critique relationships, etc.), and do NOT call speculatively when "
+            "no external ID is present. "
+            "Input format: 'source:id'. Supported sources: "
+            "  - 'wikidata' with a Wikidata Q-id (e.g., 'wikidata:Q2913717' for 이규보) "
+            "  - 'aks_digerati' with a koreanPerson_* id (e.g., 'aks_digerati:koreanPerson_18816'). "
+            "Returns a JSON string. On failure returns a JSON with 'error' — "
+            "in that case, proceed with graph-only information and note that "
+            "external data was unavailable."
+        ),
+        func=external_authority_lookup,
+    ),
 ]
 
 def get_memory(session_id):
@@ -314,16 +337,46 @@ Q (ZH): "有没有据说由鬼魂所作或在梦中获得的诗？"
 Tool: Combined Sihwa Search
 Reason: Niche topic likely under-tagged in the graph. Graph first, then vector content search; note tagging gaps to the user transparently.
 
+Example 8 — Authority-enriched biographical request
+Q (EN): "Tell me about Yi Kyubo in detail, including his international recognition."
+Q (KO): "이규보에 대해 자세히 알려줘. 국제적으로는 어떻게 알려져 있어?"
+Q (ZH): "详细介绍李奎报，包括他在国际上的知名度。"
+Tools (in order): Sihwa Graph Query → External Authority Lookup ('wikidata:<Q-id>') → External Authority Lookup ('aks_digerati:<koreanPerson_id>')
+Reason: Named person + detail request that goes beyond the graph.
+        Step 1 gets nameKor/Chi/dates/works/idWikidata/idAKSdigerati.
+        Step 2 uses the returned idWikidata (e.g., Q2913717) to fetch canonical
+        cross-lingual names, aliases, and a one-line description.
+        Step 3 uses the returned idAKSdigerati to fetch Korean-domain
+        biographical detail. Only call External Authority Lookup when the
+        corresponding external ID actually appears in the graph result; if
+        an ID is missing or the lookup returns an error, proceed with
+        graph-only information and note the gap.
+
 
 
 # Multi-step Reasoning
 ## Multi-Step Reasoning
 For complex queries, break them into steps rather than attempting one query:
-Example: '지봉유설에 실린 달 주제 시의 작자는 어느 시대 사람인가?
+Example A: '지봉유설에 실린 달 주제 시의 작자는 어느 시대 사람인가?'
 Step 1: Sihwa Content Search -> find moon-themed entries in Jibong yusol
 Step 2: Extract author names from results
 Step 3: Sihwa Graph Query -> retrieve yearBirth and HAS_ERA for each author
 Step 4: Synthesise and present combined result
+
+Example B (authority-enriched biography): '이규보에 대해 자세히 알려줘'
+Step 1: Sihwa Graph Query -> retrieve Person (nameKor, nameChi, yearBirth,
+        yearDeath, HAS_ERA, idWikidata, idAKSdigerati, related Poems/Critiques)
+Step 2: If idWikidata is present in Step 1 output → call
+        External Authority Lookup with 'wikidata:<Q-id>' to get canonical
+        cross-lingual names, aliases, dates, one-line authoritative summary.
+Step 3: If idAKSdigerati is present → call
+        External Authority Lookup with 'aks_digerati:<koreanPerson_id>' for
+        Korean-domain biographical detail (office, clan, biography, etc.).
+Step 4: Synthesise: sihwa role/works (graph) + international identity
+        (Wikidata) + Korean-domain context (AKS). Always cite each source
+        explicitly. If any authority lookup returned an 'error' field, say
+        that external data was unavailable and proceed with graph-only facts.
+        Never fabricate external content.
 
 
 
