@@ -171,18 +171,36 @@ def parse_wikidata(data: dict, entity_id: str, user_language: str = "ko") -> dic
 #       지식이므로 절대 금지 (agent_prompt에서 별도 강제).
 # ──────────────────────────────────────────────
 def parse_aks_digerati(data, entity_id: str) -> dict:
-    """실제 스키마 기준 파서. data는 list[dict] 예상. 다른 형태면 raw로 폴백."""
+    """실제 스키마 기준 파서. data는 list[dict] 예상. 다른 형태면 raw로 폴백.
+
+    LLM 환각 방지를 위해 응답에 다음을 함께 담아 반환:
+      - schema_hint : 이 API에 실제로 있는 필드 명시
+      - MUST_NOT_ADD: LLM이 넣기 쉬운 카테고리를 명시적으로 금지
+      - answer_template : 부족한 정보를 어떻게 안내할지 문구 예시
+    """
     base = {
         "source": "aks_digerati",
         "api_url": f"https://digerati.aks.ac.kr:85/api/IdValues/{entity_id}",
-        # 스키마 힌트: LLM이 잘못된 필드를 지어내지 않도록 실제로 사용 가능한
-        # 필드 목록을 함께 반환.
+        # 실측 필드 목록
         "schema_hint": (
-            "AKS Digerati API에는 아래 필드만 존재합니다. 이 목록에 없는 정보 "
-            "(예: 관직 이력, 가족 관계, 전기)는 절대 답변에 추가하지 마세요: "
+            "AKS Digerati API에 실제로 존재하는 필드만 사용하세요: "
             "KoName, ChName, YearBirth, YearDeath, Gender, Link, "
             "aks_PersonAliases(字/號/諡號 등), aks_Address(籍貫 등), "
             "aks_Entry(급제/입사 이력)."
+        ),
+        # 명시적 금지 목록 — Gemini가 pretrained 지식으로 자동 채우기 쉬운 것들
+        "MUST_NOT_ADD": [
+            "관직 이력 (문하시랑평장사·좌사간·한림학사 등 어떤 관직명도 이 API는 반환하지 않습니다)",
+            "가족 관계 (아버지·어머니·아들·형제 등 이 API는 반환하지 않습니다)",
+            "관련 인물 (스승·동료·후원자·최충헌/최우 등 이 API는 반환하지 않습니다)",
+            "저작 목록 (『동국이상국집』 등 어떤 저작명도 이 API는 반환하지 않습니다)",
+            "문학적 특징·평가 (문체·주제·영향력 서술 이 API는 반환하지 않습니다)",
+            "출생지 지명 확대 (aks_Address에 있는 그대로만 사용. 예: '驪州'를 '황해도 해주'로 확대·재해석 금지. 驪州는 경기도 여주의 옛 이름입니다.)",
+            "본관 (aks_Address에 '籍貫'이 있으면 그 값 그대로. 예: '驪州' 그대로 표기, '전주 이씨' 등 다른 본관 절대 지어내지 말 것)",
+        ],
+        # LLM이 그대로 사용할 수 있는 안내 문구 템플릿 (사용자 언어에 맞게 번역해서)
+        "answer_template_when_missing": (
+            "AKS Digerati 데이터베이스에는 이 인물의 [X] 정보가 포함되어 있지 않습니다."
         ),
     }
 
