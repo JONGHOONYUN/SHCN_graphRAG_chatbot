@@ -29,11 +29,33 @@ AUTHORITY_HANDLERS = {
     "wikidata": {
         "url": "https://www.wikidata.org/wiki/Special:EntityData/{id}.json",
         "parser": "parse_wikidata",
+        "id_transform": None,  # Wikidata Q-id는 그대로 사용
     },
     "aks_digerati": {
+        # 실측: 엔드포인트는 GET /api/IdValues/{integer_Id}. 파라미터는 integer 필수.
+        # Neo4j에 저장된 값은 'koreanPerson_18816' 형태 문자열이므로 뒤의 숫자만 추출.
         "url": "https://digerati.aks.ac.kr:85/api/IdValues/{id}",
         "parser": "parse_aks_digerati",
+        "id_transform": "aks_digerati_id",
     },
+}
+
+
+def _transform_aks_digerati_id(raw_id: str) -> Optional[str]:
+    """'koreanPerson_18816' → '18816'.
+    이미 순수 정수 문자열이면 그대로 반환.
+    변환 실패 시 None."""
+    if raw_id.isdigit():
+        return raw_id
+    if "_" in raw_id:
+        tail = raw_id.rsplit("_", 1)[-1]
+        if tail.isdigit():
+            return tail
+    return None
+
+
+ID_TRANSFORMS = {
+    "aks_digerati_id": _transform_aks_digerati_id,
 }
 
 # effective_language별 Wikidata 라벨·설명 선호 순서.
@@ -129,51 +151,105 @@ def parse_wikidata(data: dict, entity_id: str, user_language: str = "ko") -> dic
 
 
 # ──────────────────────────────────────────────
-# AKS Digerati parser
-# 실제 응답 스키마 미확인 단계이므로 방어적으로 처리.
-# 알려진 한국 인물 authority 필드가 있으면 명시적으로 노출하고,
-# 없으면 raw_snippet에 상위 20개 필드를 잘라 담아 LLM이 직접 해석하도록.
+# AKS Digerati parser (실측 스키마 반영)
+#
+# 실제 API 스펙 (GET /api/IdValues/{integer_id}):
+#   응답은 List[aks_BmainModel] 형태:
+#     - AkspId (int)          : AKS 내부 pk
+#     - PersonId (str)         : 한국역대인물 종합정보시스템 ID (예: EXM_KS_5COb_1189_020064)
+#     - Source (str)           : 데이터 출처 표기 (예: "한국역대인물 종합정보시스템")
+#     - ChName / KoName (str)  : 한자·한글 이름
+#     - Gender (int)           : 성별 코드
+#     - YearBirth / YearDeath  : 생몰년 (integer)
+#     - Link (str)             : 사용자용 canonical 뷰 URL (people.aks.ac.kr/...)
+#     - aks_PersonAliases[]    : {AliasType, AliasName} — 字·號·諡號 등
+#     - aks_Address[]          : {AddrType, AddrName}  — 籍貫 등
+#     - aks_Entry[]            : {RuShiDoor, RuShiType, RuShiYear} — 급제/입사 이력
+#
+# 주의: API에는 관직 이력·가족 관계·상세 전기가 없음.
+#       따라서 답변에 이런 내용이 나오면 그것은 API 데이터가 아니라 LLM의 pretrained
+#       지식이므로 절대 금지 (agent_prompt에서 별도 강제).
 # ──────────────────────────────────────────────
-_AKS_KNOWN_FIELDS = (
-    "nameKor", "nameChi", "nameEng", "nameMR", "nameRR", "namePY",
-    "yearBirth", "yearDeath",
-    "gender", "clan", "office",
-    "biography", "descKor", "descEng", "descChi",
-    "era", "dynasty",
-)
-
-
 def parse_aks_digerati(data, entity_id: str) -> dict:
-    result = {
+    """실제 스키마 기준 파서. data는 list[dict] 예상. 다른 형태면 raw로 폴백."""
+    base = {
         "source": "aks_digerati",
-        "url": f"https://digerati.aks.ac.kr:85/api/IdValues/{entity_id}",
+        "api_url": f"https://digerati.aks.ac.kr:85/api/IdValues/{entity_id}",
+        # 스키마 힌트: LLM이 잘못된 필드를 지어내지 않도록 실제로 사용 가능한
+        # 필드 목록을 함께 반환.
+        "schema_hint": (
+            "AKS Digerati API에는 아래 필드만 존재합니다. 이 목록에 없는 정보 "
+            "(예: 관직 이력, 가족 관계, 전기)는 절대 답변에 추가하지 마세요: "
+            "KoName, ChName, YearBirth, YearDeath, Gender, Link, "
+            "aks_PersonAliases(字/號/諡號 등), aks_Address(籍貫 등), "
+            "aks_Entry(급제/입사 이력)."
+        ),
     }
 
-    if isinstance(data, dict):
-        # 익숙한 필드가 있으면 우선 노출
-        for known in _AKS_KNOWN_FIELDS:
-            if known in data and data[known] not in (None, "", []):
-                result[known] = data[known]
-        # 익숙한 필드가 하나도 없었다면 raw_snippet 폴백
-        if len(result) <= 2:
-            snippet = {}
-            for k, v in list(data.items())[:20]:
-                if isinstance(v, (dict, list)):
-                    snippet[k] = "..."
-                else:
-                    snippet[k] = str(v)[:200]
-            result["raw_snippet"] = snippet
-    elif isinstance(data, list):
-        result["items_count"] = len(data)
-        if data:
-            first = data[0]
-            result["first_item"] = (
-                first if isinstance(first, dict) else str(first)[:500]
-            )
-    else:
-        result["raw"] = str(data)[:500]
+    if not isinstance(data, list) or not data:
+        base["error"] = "empty or unexpected response shape"
+        base["raw_head"] = str(data)[:500]
+        return base
 
-    return result
+    entry = data[0]  # 첫 항목 채택. 여러 매칭이 있으면 다중 처리로 확장 가능.
+    if not isinstance(entry, dict):
+        base["error"] = "first item not a dict"
+        base["raw_head"] = str(entry)[:500]
+        return base
+
+    # 사용자 표시용 canonical link (실제 사이트, LLM이 답변에 인용)
+    base["canonical_link"] = entry.get("Link")
+
+    # 이름·생몰
+    base["name_kor"] = entry.get("KoName")
+    base["name_chi"] = entry.get("ChName")
+    year_birth = entry.get("YearBirth")
+    year_death = entry.get("YearDeath")
+    if year_birth:
+        base["year_birth"] = year_birth
+    if year_death:
+        base["year_death"] = year_death
+
+    # 성별 코드 (원시값 그대로 노출 — 매핑은 확인 후 별도)
+    if entry.get("Gender") is not None:
+        base["gender_code"] = entry["Gender"]
+
+    # 출처 및 people.aks.ac.kr 식별자
+    base["source_label"] = entry.get("Source")
+    base["aks_person_id"] = entry.get("PersonId")
+
+    # 별호 (字/號/諡號)
+    aliases = entry.get("aks_PersonAliases") or []
+    if aliases:
+        base["aliases"] = [
+            {"type": a.get("AliasType"), "name": a.get("AliasName")}
+            for a in aliases
+            if isinstance(a, dict) and a.get("AliasName")
+        ]
+
+    # 주소 (본관 등)
+    addresses = entry.get("aks_Address") or []
+    if addresses:
+        base["addresses"] = [
+            {"type": a.get("AddrType"), "name": a.get("AddrName")}
+            for a in addresses
+            if isinstance(a, dict) and a.get("AddrName")
+        ]
+
+    # 급제/입사 이력
+    entries = entry.get("aks_Entry") or []
+    if entries:
+        base["examination_entries"] = [
+            {k: v for k, v in e.items() if v}
+            for e in entries
+            if isinstance(e, dict)
+        ]
+
+    # 여러 매칭이 있었다면 그 개수도 알림
+    if len(data) > 1:
+        base["additional_matches_count"] = len(data) - 1
+
+    return base
 
 
 # ──────────────────────────────────────────────
@@ -227,7 +303,25 @@ def external_authority_lookup(query: str) -> str:
         return cache[cache_key]
 
     cfg = AUTHORITY_HANDLERS[source]
-    url = cfg["url"].format(id=ext_id)
+
+    # ID 변환 (예: 'koreanPerson_18816' → '18816' for aks_digerati integer 파라미터)
+    id_for_url = ext_id
+    transform_key = cfg.get("id_transform")
+    if transform_key:
+        transform_fn = ID_TRANSFORMS.get(transform_key)
+        if transform_fn is not None:
+            transformed = transform_fn(ext_id)
+            if transformed is None:
+                return json.dumps(
+                    {
+                        "error": f"ID transform failed for source '{source}' with id '{ext_id}'",
+                        "hint": "For aks_digerati, id should be 'koreanPerson_<integer>' or a pure integer.",
+                    },
+                    ensure_ascii=False,
+                )
+            id_for_url = transformed
+
+    url = cfg["url"].format(id=id_for_url)
     raw = _fetch(url)
 
     if raw is None:
@@ -249,7 +343,8 @@ def external_authority_lookup(query: str) -> str:
     if source == "wikidata":
         parsed = parse_wikidata(raw, ext_id, user_language)
     elif source == "aks_digerati":
-        parsed = parse_aks_digerati(raw, ext_id)
+        # parser에는 변환된 정수 ID를 전달 (URL 재구성 및 canonical_link 표기용)
+        parsed = parse_aks_digerati(raw, id_for_url)
     else:
         parsed = {"source": source, "raw": str(raw)[:500]}
 

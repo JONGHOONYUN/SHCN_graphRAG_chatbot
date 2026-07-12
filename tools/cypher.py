@@ -559,24 +559,55 @@ cypher_qa = GraphCypherQAChain.from_llm(
 # 다음 iteration에서 vector search 등 다른 tool로 fallback 가능하게 함.
 # ──────────────────────────────────────────────
 def cypher_qa_safe(question: str) -> str:
-    try:
-        result = cypher_qa.invoke({"query": question})
-        if isinstance(result, dict):
-            return result.get("result") or "No graph results."
-        return str(result)
-    except CypherSyntaxError:
-        return (
-            "Graph query failed (Cypher syntax error). "
-            "Try rephrasing the question, or fall back to Sihwa Content Search."
-        )
-    except ClientError as e:
-        return (
-            f"Graph query failed ({type(e).__name__}: {e.code}). "
-            "Try rephrasing, or fall back to Sihwa Content Search."
-        )
-    except Exception as e:
-        return (
-            f"Graph query failed ({type(e).__name__}). "
-            "Try rephrasing, or fall back to Sihwa Content Search."
-        )
+    """GraphCypherQAChain 호출 wrapper.
+
+    langchain-neo4j 0.8 + langchain-classic 1.0.2 조합에서 간헐적으로 KeyError가
+    발생하는 사례가 있어 (qa_chain의 output key 불일치 추정), 다음을 수행:
+      1. 반환 dict에서 result/answer/text 세 키를 순차 확인 (LangChain 버전차 대응)
+      2. KeyError 발생 시 어느 키가 missing이었는지 실제 메시지에 포함해
+         verbose 로그에서 원인 진단 가능하게 함
+      3. 한 번 자동 재시도 (transient Gemini 이슈에 대한 회복)
+    """
+    last_error_msg = None
+    for _ in range(2):  # 첫 시도 + 1회 재시도
+        try:
+            result = cypher_qa.invoke({"query": question})
+            if isinstance(result, dict):
+                # LangChain 버전별 output key 불일치 대응
+                answer = (
+                    result.get("result")
+                    or result.get("answer")
+                    or result.get("text")
+                )
+                if answer:
+                    return answer
+                return "No graph results found."
+            return str(result)
+        except CypherSyntaxError:
+            return (
+                "Graph query failed (Cypher syntax error). "
+                "Try rephrasing the question, or fall back to Sihwa Content Search."
+            )
+        except ClientError as e:
+            return (
+                f"Graph query failed ({type(e).__name__}: {e.code}). "
+                "Try rephrasing, or fall back to Sihwa Content Search."
+            )
+        except KeyError as e:
+            # 재시도 대상. 진단 정보를 축적하여 마지막 attempt에서 노출.
+            missing = e.args[0] if e.args else "unknown"
+            last_error_msg = (
+                f"KeyError('{missing}') from GraphCypherQAChain internals. "
+                "This is likely a langchain-neo4j / langchain-classic version integration issue "
+                "(qa_chain output key mismatch or intermediate step parsing)."
+            )
+            continue  # 재시도
+        except Exception as e:
+            last_error_msg = f"{type(e).__name__}: {str(e)[:120]}"
+            continue  # 재시도
+
+    return (
+        f"Graph query failed after retry — {last_error_msg}. "
+        "Try rephrasing, or fall back to Sihwa Content Search."
+    )
 
