@@ -145,10 +145,10 @@ When a node has an external ID, retrieve the external data and incorporate it in
 HAS_TYPE usage rule (IMPORTANT — the previous "do not use HAS_TYPE" rule was wrong):
 - HAS_TYPE IS a valid, populated relationship (~3,520 instances). Use it for
   FORM / TYPOLOGICAL classification pointing to a Topic node:
-      (Poem)-[:HAS_TYPE]->(Topic)   e.g. Topic {nameKor: '칠언절구'}  (1,754 instances)
+      (Poem)-[:HAS_TYPE]->(Topic)   e.g. Topic {{nameKor: '칠언절구'}}  (1,754 instances)
       (Entry)-[:HAS_TYPE]->(Topic)                                    (918 instances)
-      (Place)-[:HAS_TYPE]->(Topic)  e.g. Topic {nameKor: '산'}          (435 instances)
-      (Person)-[:HAS_TYPE]->(Topic) e.g. Topic {nameKor: '문신'}        (391 instances)
+      (Place)-[:HAS_TYPE]->(Topic)  e.g. Topic {{nameKor: '산'}}          (435 instances)
+      (Person)-[:HAS_TYPE]->(Topic) e.g. Topic {{nameKor: '문신'}}        (391 instances)
 - Do NOT use HAS_TYPE for a Person's gender, official post, or clan/family
   origin. Those have dedicated relationships:
       HAS_GENDER   Person's gender -> Topic
@@ -280,8 +280,8 @@ Use these composed patterns when a question needs traversal of 2+ edges.
     RETURN poem.textKor, recipient.nameKor
 
 ## "Cross-era critic-poet relationships (critic from Era A, poet from Era B)"
-    (critic:Person)-[:HAS_ERA]->(:Era {nameKor: <A>}),
-    (poet:Person)-[:HAS_ERA]->(:Era {nameKor: <B>}),
+    (critic:Person)-[:HAS_ERA]->(:Era {{nameKor: <A>}}),
+    (poet:Person)-[:HAS_ERA]->(:Era {{nameKor: <B>}}),
     (c:Critique)-[:HAS_CREATOR]->(critic),
     (c)-[:HAS_SUBJECT_PERSON]->(poet)
 
@@ -290,7 +290,7 @@ Use these composed patterns when a question needs traversal of 2+ edges.
     WHERE poem.textChi CONTAINS <keyword>
 
 ## "Broad topic via Topic-hierarchy expansion"
-    (parent:Topic {nameKor: '자연'})-[:HAS_PART*1..3]->(child:Topic)
+    (parent:Topic {{nameKor: '자연'}})-[:HAS_PART*1..3]->(child:Topic)
       <-[:HAS_SUBJECT_TOPIC]-(text)
     RETURN DISTINCT text
   (Handles cases where the dataset tags specific sub-topics rather than the parent.)
@@ -503,7 +503,7 @@ Cypher: MATCH (parent:Topic)-[:HAS_PART*1..3]->(child:Topic)
               <-[:HAS_SUBJECT_TOPIC]-(poem:Poem)
         WHERE parent.nameKor CONTAINS '자연' OR parent.nameEng CONTAINS 'nature'
         RETURN child.nameKor AS sub_topic,
-               collect(DISTINCT {id: poem.id, textKor: poem.textKor})[..3] AS poems,
+               collect(DISTINCT {{id: poem.id, textKor: poem.textKor}})[..3] AS poems,
                count(DISTINCT poem) AS n
         ORDER BY n DESC LIMIT 20
 
@@ -517,9 +517,9 @@ Cypher: MATCH (author:Person)<-[:HAS_CREATOR]-(target_poem:Poem)
                c.id AS critique_id LIMIT 20
 
 Q: 여성에게 보낸 시를 지은 남성 시인들과 그 시는?  (HAS_AUDIENCE + gender filter)
-Cypher: MATCH (poet:Person)-[:HAS_GENDER]->(:Topic {nameEng: 'male'}),
+Cypher: MATCH (poet:Person)-[:HAS_GENDER]->(:Topic {{nameEng: 'male'}}),
               (poet)<-[:HAS_CREATOR]-(poem:Poem)-[:HAS_AUDIENCE]->(recipient:Person),
-              (recipient)-[:HAS_GENDER]->(:Topic {nameEng: 'female'})
+              (recipient)-[:HAS_GENDER]->(:Topic {{nameEng: 'female'}})
         RETURN poet.nameKor AS poet_name,
                recipient.nameKor AS recipient_name,
                poem.textKor, poem.textChi LIMIT 20

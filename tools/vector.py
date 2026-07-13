@@ -41,10 +41,10 @@ instructions = (
     "  · idWikidata는 모든 언어에서 유용한 크로스링구얼 authority이므로 "
     "존재하면 항상 함께 인용 권장. "
     "외부 링크 base URL: "
-    "https://www.wikidata.org/wiki/{id} (Wikidata), "
-    "https://encykorea.aks.ac.kr/Article/{id} (AKS 한국민족문화대백과), "
-    "https://digerati.aks.ac.kr:85/api/IdValues/{id} (AKS Digerati Person), "
-    "https://sillok.history.go.kr/{id} (조선왕조실록). "
+    "https://www.wikidata.org/wiki/{{id}} (Wikidata), "
+    "https://encykorea.aks.ac.kr/Article/{{id}} (AKS 한국민족문화대백과), "
+    "https://digerati.aks.ac.kr:85/api/IdValues/{{id}} (AKS Digerati Person), "
+    "https://sillok.history.go.kr/{{id}} (조선왕조실록). "
 
     # Place geographic data (gis 문자열, 예: '37° 56\\' 17.50\" N, 126° 35\\' 16.06\" E')
     "Place 노드에 gis 좌표가 있으면 지리 정보로 활용하세요. "
