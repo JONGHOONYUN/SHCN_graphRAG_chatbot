@@ -16,15 +16,27 @@ Phase 1 지원 소스:
 """
 
 import json
-from typing import Optional
+import time
+from typing import Any, Callable, Optional
 
 import requests
-import streamlit as st
 
 
 TIMEOUT_SEC = 5
 CACHE_KEY = "external_authority_cache"
 
+# ──────────────────────────────────────────────
+# Fetchable vs link-only sources
+#
+# FETCHABLE:  an actual HTTP handler + parser is implemented and tested. Data
+#             returned by these may be cited as *fetched* facts.
+# LINK_ONLY:  the graph may carry an ID for these authorities, and we can build
+#             a public link, but NO data is fetched — the synthesis layer must
+#             NOT claim their contents as retrieved facts.
+#
+# This registry is the single source of truth that prompts/tool descriptions
+# must stay aligned with (see CLAUDE_CODE_REFACTOR_TASK.md § 3).
+# ──────────────────────────────────────────────
 AUTHORITY_HANDLERS = {
     "wikidata": {
         "url": "https://www.wikidata.org/wiki/Special:EntityData/{id}.json",
@@ -39,6 +51,37 @@ AUTHORITY_HANDLERS = {
         "id_transform": "aks_digerati_id",
     },
 }
+
+FETCHABLE_SOURCES = tuple(AUTHORITY_HANDLERS.keys())
+
+# Link-only authorities: we can present a link but must never claim fetched data.
+# base_url uses '{id}' as the substitution point for the stored external ID.
+LINK_ONLY_SOURCES = {
+    "aks_ency": "https://encykorea.aks.ac.kr/Article/{id}",
+    "aks_sillok": "https://sillok.history.go.kr/{id}",
+    "loc": "https://id.loc.gov/authorities/names/{id}",
+    "bnf": "https://catalogue.bnf.fr/ark:/12148/cb{id}",
+    "britannica": "https://www.britannica.com/{id}",
+    "cbdb": "https://cbdb.fas.harvard.edu/cbdbapi/person.php?id={id}",
+    "open_library": "https://openlibrary.org/works/{id}",
+}
+
+
+def link_only_reference(source: str, ext_id: str) -> Optional[dict]:
+    """Build a citable, link-only reference for a non-fetchable authority.
+
+    Returns a dict with fetchable=False so the synthesis layer knows the target
+    is a link, not a set of retrieved facts. Returns None if the source is
+    unknown or the id is empty. Never fabricates a link from a missing id."""
+    if not ext_id or source not in LINK_ONLY_SOURCES:
+        return None
+    return {
+        "source": source,
+        "fetchable": False,
+        "status": "link_only",
+        "url": LINK_ONLY_SOURCES[source].format(id=ext_id),
+        "id": ext_id,
+    }
 
 
 def _transform_aks_digerati_id(raw_id: str) -> Optional[str]:
@@ -67,11 +110,63 @@ _WIKIDATA_LANG_PRIORITY = {
 }
 
 
-def _get_cache() -> dict:
-    """세션 캐시 dict을 반환. 없으면 초기화."""
-    if CACHE_KEY not in st.session_state:
-        st.session_state[CACHE_KEY] = {}
-    return st.session_state[CACHE_KEY]
+def _effective_language(explicit: Optional[str] = None) -> str:
+    """Resolve the response language without hard-depending on streamlit.
+
+    Order: explicit arg → streamlit session_state['effective_language'] → 'ko'.
+    Reading streamlit is wrapped in try/except so this module stays importable
+    and testable outside a streamlit script run context."""
+    if explicit:
+        return explicit
+    try:
+        import streamlit as st  # local import: keep module usable without a ctx
+
+        lang = st.session_state.get("effective_language")
+        if lang:
+            return lang
+    except Exception:
+        pass
+    return "ko"
+
+
+# ──────────────────────────────────────────────
+# TTL + bounded in-process cache
+#
+# Replaces the previous streamlit-session-only cache. Successful authority
+# results are cached by 'source:id' with a TTL and a bounded size so repeated
+# lookups within a session are cheap and broad result sets cannot grow the
+# cache without limit. Failures are NOT cached (so a transient outage can be
+# retried on the next turn). Works without a streamlit context.
+# ──────────────────────────────────────────────
+CACHE_TTL_SEC = 60 * 60  # 1 hour
+CACHE_MAX_SIZE = 256
+
+# key -> (expires_at_epoch, value)
+_authority_cache: "dict[str, tuple[float, Any]]" = {}
+
+
+def _cache_get(key: str):
+    entry = _authority_cache.get(key)
+    if entry is None:
+        return None
+    expires_at, value = entry
+    if time.time() >= expires_at:
+        _authority_cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value: Any) -> None:
+    # Evict oldest-expiring entries when at capacity (cheap bounded policy).
+    if len(_authority_cache) >= CACHE_MAX_SIZE:
+        for old_key in sorted(_authority_cache, key=lambda k: _authority_cache[k][0])[:16]:
+            _authority_cache.pop(old_key, None)
+    _authority_cache[key] = (time.time() + CACHE_TTL_SEC, value)
+
+
+def clear_authority_cache() -> None:
+    """Test/maintenance helper — empties the in-process authority cache."""
+    _authority_cache.clear()
 
 
 def _fetch(url: str) -> Optional[dict]:
@@ -271,58 +366,68 @@ def parse_aks_digerati(data, entity_id: str) -> dict:
 
 
 # ──────────────────────────────────────────────
-# Public entry point (LangChain Tool.func)
+# Structured programmatic entry point (used by the orchestrator)
 # ──────────────────────────────────────────────
-def external_authority_lookup(query: str) -> str:
-    """LangChain ReAct agent가 호출하는 진입점.
+def fetch_authority(
+    source: str,
+    ext_id: str,
+    *,
+    language: Optional[str] = None,
+    fetcher: Optional[Callable[[str], Optional[dict]]] = None,
+) -> dict:
+    """Fetch one fetchable authority record and return a STRUCTURED result.
 
-    query 형식: 'source:id' — 예:
-        'wikidata:Q2913717'
-        'aks_digerati:koreanPerson_18816'
+    Always returns a dict of the shape:
+        {
+          "source": <source>,
+          "id": <original id>,
+          "fetchable": True,
+          "status": "ok" | "unavailable" | "error",
+          "url": <request/link url>,
+          "data": {<parsed fields>},          # present only when status == "ok"
+          ...status-specific keys...
+        }
 
-    반환: JSON 문자열 (한글 포함 시 ensure_ascii=False).
-    Observation으로 그대로 agent에 전달되어 LLM이 해석·인용.
+    Key guarantees for the anti-hallucination policy:
+      * Never invents an authority ID — callers pass an ID that came from a
+        graph node.
+      * On any fetch failure returns status="unavailable" with an empty `data`;
+        the synthesis layer must then say the authority data was unavailable and
+        must NOT backfill from model knowledge.
+      * Successful results are cached (TTL + bounded). Failures are not cached.
 
-    실패 시에도 예외를 raise하지 않고 error dict를 문자열로 반환하여
-    agent iteration이 crash 없이 진행되도록 함.
+    `fetcher` lets tests inject a fake HTTP layer: a callable url -> dict|None.
     """
-    if not isinstance(query, str) or ":" not in query:
-        return json.dumps(
-            {
-                "error": "query must be 'source:id' form",
-                "example": "wikidata:Q2913717",
-                "supported_sources": list(AUTHORITY_HANDLERS.keys()),
-            },
-            ensure_ascii=False,
-        )
-
-    source, ext_id = query.split(":", 1)
-    source = source.strip().lower()
-    ext_id = ext_id.strip()
-
-    if not ext_id:
-        return json.dumps(
-            {"error": "empty id after ':'", "query": query}, ensure_ascii=False
-        )
+    source = (source or "").strip().lower()
+    ext_id = (ext_id or "").strip()
+    language = _effective_language(language)
 
     if source not in AUTHORITY_HANDLERS:
-        return json.dumps(
-            {
-                "error": f"unsupported source: {source}",
-                "supported_sources": list(AUTHORITY_HANDLERS.keys()),
-            },
-            ensure_ascii=False,
-        )
+        return {
+            "source": source,
+            "id": ext_id,
+            "fetchable": source in LINK_ONLY_SOURCES,
+            "status": "error",
+            "error": f"source '{source}' is not fetchable",
+            "supported_sources": list(FETCHABLE_SOURCES),
+        }
+    if not ext_id:
+        return {
+            "source": source,
+            "id": ext_id,
+            "fetchable": True,
+            "status": "error",
+            "error": "empty id",
+        }
 
-    # 세션 캐시 확인
-    cache = _get_cache()
     cache_key = f"{source}:{ext_id}"
-    if cache_key in cache:
-        return cache[cache_key]
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
 
     cfg = AUTHORITY_HANDLERS[source]
 
-    # ID 변환 (예: 'koreanPerson_18816' → '18816' for aks_digerati integer 파라미터)
+    # ID transform is for the API REQUEST only (e.g. 'koreanPerson_18816' → '18816').
     id_for_url = ext_id
     transform_key = cfg.get("id_transform")
     if transform_key:
@@ -330,42 +435,89 @@ def external_authority_lookup(query: str) -> str:
         if transform_fn is not None:
             transformed = transform_fn(ext_id)
             if transformed is None:
-                return json.dumps(
-                    {
-                        "error": f"ID transform failed for source '{source}' with id '{ext_id}'",
-                        "hint": "For aks_digerati, id should be 'koreanPerson_<integer>' or a pure integer.",
-                    },
-                    ensure_ascii=False,
-                )
+                return {
+                    "source": source,
+                    "id": ext_id,
+                    "fetchable": True,
+                    "status": "error",
+                    "error": f"ID transform failed for '{source}' with id '{ext_id}'",
+                    "hint": "aks_digerati id should be 'koreanPerson_<integer>' or a pure integer.",
+                }
             id_for_url = transformed
 
     url = cfg["url"].format(id=id_for_url)
-    raw = _fetch(url)
+    do_fetch = fetcher if fetcher is not None else _fetch
+    raw = do_fetch(url)
 
     if raw is None:
-        # 실패 응답도 캐시하지 않음 (다음 호출에서 재시도 여지)
+        # Not cached — allow a retry on a later turn.
+        return {
+            "source": source,
+            "id": ext_id,
+            "fetchable": True,
+            "status": "unavailable",
+            "url": url,
+            "hint": "fetch failed or timed out; use graph-only info and note the gap.",
+        }
+
+    if source == "wikidata":
+        parsed = parse_wikidata(raw, ext_id, language)
+    elif source == "aks_digerati":
+        parsed = parse_aks_digerati(raw, id_for_url)
+    else:  # pragma: no cover - guarded by the membership check above
+        parsed = {"source": source}
+
+    result = {
+        "source": source,
+        "id": ext_id,
+        "fetchable": True,
+        "status": "ok",
+        # For aks_digerati the citable public link is the API's canonical_link,
+        # NOT a URL built from the raw koreanPerson_<n> id.
+        "url": parsed.get("url") or parsed.get("canonical_link") or url,
+        "data": parsed,
+    }
+    _cache_set(cache_key, result)
+    return result
+
+
+# ──────────────────────────────────────────────
+# String entry point (LangChain Tool.func — backward compatible)
+# ──────────────────────────────────────────────
+def external_authority_lookup(query: str) -> str:
+    """LangChain ReAct agent 진입점. 'source:id' 문자열을 받아 JSON 문자열 반환.
+
+    내부적으로 structured fetch_authority()에 위임하고 결과를 JSON 직렬화한다.
+    실패 시에도 예외를 raise하지 않고 error/unavailable dict를 문자열로 반환하여
+    agent iteration이 crash 없이 진행되도록 한다.
+    """
+    if not isinstance(query, str) or ":" not in query:
         return json.dumps(
             {
-                "error": "외부 정보 미조회 (fetch failed or timeout)",
-                "source": source,
-                "id": ext_id,
-                "url": url,
-                "hint": "5초 안에 응답이 없거나 서버 오류. 답변에서 이 인물의 외부 authority 데이터는 건너뛰고 그래프 정보만 사용하세요.",
+                "error": "query must be 'source:id' form",
+                "example": "wikidata:Q2913717",
+                "supported_sources": list(FETCHABLE_SOURCES),
             },
             ensure_ascii=False,
         )
 
-    # 언어별 파서 분기
-    user_language = st.session_state.get("effective_language", "ko")
+    source, ext_id = query.split(":", 1)
+    result = fetch_authority(source, ext_id)
 
-    if source == "wikidata":
-        parsed = parse_wikidata(raw, ext_id, user_language)
-    elif source == "aks_digerati":
-        # parser에는 변환된 정수 ID를 전달 (URL 재구성 및 canonical_link 표기용)
-        parsed = parse_aks_digerati(raw, id_for_url)
+    # 하위 호환: 기존 tool은 'error'가 있으면 그것을 신호로 사용했으므로
+    # unavailable/ error 상태를 'error' 키로도 노출한다.
+    if result.get("status") == "ok":
+        payload = dict(result.get("data") or {})
+        payload.setdefault("source", result["source"])
+        payload["url"] = result.get("url")
     else:
-        parsed = {"source": source, "raw": str(raw)[:500]}
+        payload = {
+            "error": result.get("error") or "외부 정보 미조회 (fetch failed or timeout)",
+            "source": result.get("source"),
+            "id": result.get("id"),
+            "status": result.get("status"),
+        }
+        if result.get("url"):
+            payload["url"] = result["url"]
 
-    result_str = json.dumps(parsed, ensure_ascii=False)
-    cache[cache_key] = result_str
-    return result_str
+    return json.dumps(payload, ensure_ascii=False)

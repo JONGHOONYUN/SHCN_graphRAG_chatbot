@@ -43,6 +43,12 @@ def _build_language_directive(user_language: str) -> str:
 from tools.vector import get_poetry_plot
 from tools.cypher import cypher_qa_safe
 from tools.external_authority import external_authority_lookup
+from tools.orchestrator import gather_graphrag_evidence
+from tools.synthesis import (
+    SYNTHESIS_SYSTEM_RULES,
+    build_citations,
+    format_evidence_for_prompt,
+)
 
 chat_prompt = ChatPromptTemplate.from_messages(
     [
@@ -182,9 +188,13 @@ tools = [
             "Do NOT call for questions that only need graph facts (poem lists, "
             "critique relationships, etc.), and do NOT call speculatively when "
             "no external ID is present. "
-            "Input format: 'source:id'. Supported sources: "
+            "Input format: 'source:id'. Only these two sources are FETCHABLE "
+            "(an implemented HTTP handler actually retrieves data): "
             "  - 'wikidata' with a Wikidata Q-id (e.g., 'wikidata:Q2913717' for 이규보) "
             "  - 'aks_digerati' with a koreanPerson_* id (e.g., 'aks_digerati:koreanPerson_18816'). "
+            "Other authorities (AKS Encyclopedia, Sillok, CBDB, LOC, BnF, "
+            "Britannica, etc.) are LINK-ONLY: their IDs may be shown as links but "
+            "their contents are NOT fetched and must not be claimed as fetched. "
             "Returns a JSON string. On failure returns a JSON with 'error' — "
             "in that case, proceed with graph-only information and note that "
             "external data was unavailable."
@@ -585,17 +595,75 @@ chat_agent = RunnableWithMessageHistory(
     history_messages_key="chat_history",
 )
 
-def generate_response(user_input):
-    """
-    Create a handler that calls the Conversational agent
-    and returns a response to be rendered in the UI
-    """
+# ──────────────────────────────────────────────
+# Final synthesis step (single LLM call over structured evidence)
+#
+# graphRAG mode now runs: gather structured evidence (graph + vector + optional
+# authority) → ONE synthesis LLM call. The retrievers no longer write the final
+# prose; this prompt does. The ReAct agent above is retained only as a fallback.
+# ──────────────────────────────────────────────
+synthesis_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "{language_directive}\n\n" + SYNTHESIS_SYSTEM_RULES),
+        (
+            "human",
+            "질문(원문 그대로): {question}\n\n"
+            "다음은 검색으로 수집한 구조화된 근거 블록입니다. 이 근거만 사용하세요.\n"
+            "{evidence_blocks}\n\n"
+            "위 규칙에 따라 최종 답변을 작성하고, 마지막에 출처 섹션을 포함하세요. "
+            "권장 인용 라인(있는 경우만, 링크 날조 금지):\n{suggested_citations}",
+        ),
+    ]
+)
 
+synthesis_chain = synthesis_prompt | llm | StrOutputParser()
+
+
+def synthesize_answer(user_input: str, user_language: str) -> str:
+    """graphRAG 최종 합성. 구조화된 근거를 모아 단일 LLM 호출로 답변 생성."""
+    evidence = gather_graphrag_evidence(user_input, user_language)
+    evidence_blocks = format_evidence_for_prompt(evidence, user_language)
+    citations = build_citations(evidence)
+    suggested = "\n".join(citations) if citations else "(no pre-computed citations)"
+
+    return synthesis_chain.invoke(
+        {
+            "language_directive": _build_language_directive(user_language),
+            "question": user_input,
+            "evidence_blocks": evidence_blocks,
+            "suggested_citations": suggested,
+        }
+    )
+
+
+def generate_response(user_input):
+    """graphRAG 응답 생성 엔트리포인트 (bot.py에서 호출).
+
+    새 evidence 파이프라인(gather → synthesize)을 우선 사용한다. 파이프라인이
+    일시적으로 실패하면 기존 ReAct agent로 폴백하여 가용성을 유지한다.
+    """
     # bot.py가 매 턴 결정한 적용 언어(effective_language)를 읽어 prompt에 주입.
-    # - 사용자가 명시적 락 요청을 한 적이 있으면 그 락 언어
-    # - 그렇지 않으면 이번 질문의 자동 감지 언어
     # session_state가 없으면(직접 호출 등) 한국어로 폴백.
     user_language = st.session_state.get("effective_language", "ko")
+
+    try:
+        output = synthesize_answer(user_input, user_language)
+        if output and output.strip():
+            return output
+    except ValueError as e:
+        # Gemini 빈 스트림 응답 등 — 락 언어 안내로 graceful 처리.
+        if "No generation chunks were returned" in str(e):
+            return ITERATION_LIMIT_FALLBACK.get(user_language, ITERATION_LIMIT_FALLBACK["ko"])
+        # 그 외 ValueError는 아래 ReAct 폴백으로.
+    except Exception:
+        # 파이프라인 어떤 단계든 실패하면 ReAct agent 폴백 시도.
+        pass
+
+    return _generate_response_react(user_input, user_language)
+
+
+def _generate_response_react(user_input, user_language):
+    """레거시 ReAct agent 경로 (폴백). 파이프라인 실패 시에만 사용."""
     language_directive = _build_language_directive(user_language)
 
     try:
@@ -605,8 +673,6 @@ def generate_response(user_input):
             {"configurable": {"session_id": f"{get_session_id()}::graphRAG"}},)
     except ValueError as e:
         # Gemini가 빈 스트림을 반환한 경우 ("No generation chunks were returned").
-        # 원인 후보: safety filter false positive, 일시적 API 오류, 누적 prompt 혼란.
-        # 사용자에게 빨간 에러 페이지 대신 락 언어로 안내 메시지 반환.
         if "No generation chunks were returned" in str(e):
             return ITERATION_LIMIT_FALLBACK.get(user_language, ITERATION_LIMIT_FALLBACK["ko"])
         raise

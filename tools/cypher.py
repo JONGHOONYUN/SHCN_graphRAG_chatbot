@@ -116,17 +116,16 @@ NOTE: Do not use yearExam — it has been removed from the data.
     idAKSency      (Place, Work)
                    ID for the AKS Encyclopedia of Korean Culture.
 
-External link URL patterns (use these exact base URLs):
-  AKS Encyclopedia of Korean Culture:
-      https://encykorea.aks.ac.kr/Article/ + idAKSency
-  AKS Digerati — Person (port 85):
-      https://digerati.aks.ac.kr:85/api/IdValues/ + idAKSdigerati
-  AKS Digerati — Work (port 86):
-      https://digerati.aks.ac.kr:86/api/IdValues/ + idAKSdigerati
-  AKS Digerati — Place (port 88):
-      https://digerati.aks.ac.kr:88/api/IdValues/ + idAKSdigerati
+IMPORTANT — this Cypher chain does NOT call any HTTP/external API. It only reads the Neo4j graph. Your job here is to WRITE A CYPHER QUERY that RETURNS the external-ID fields (e.g. p.idWikidata, p.idAKSdigerati) so that a separate authority-enrichment step downstream can fetch them. Do NOT claim in generated Cypher or comments that this step retrieves Wikidata/AKS data — it does not.
 
-When a node has an external ID, retrieve the external data and incorporate it into your answer. For Person nodes, the Digerati API returns biographical data including aliases, birth/death years, and gender that can supplement graph data.
+When a returned node carries an external ID, simply RETURN that ID field. For any Person you return, request the standardized fields below so downstream enrichment is deterministic:
+
+    p.id            AS person_id,
+    p.nameKor       AS person_name_kor,
+    p.nameChi       AS person_name_chi,
+    p.nameEng       AS person_name_eng,
+    p.idWikidata    AS wikidata_id,
+    p.idAKSdigerati AS aks_digerati_id
 
 
 
@@ -411,7 +410,7 @@ Use these path patterns for common query types:
     Chinese  ->  ?uselang=zh
     French   ->  ?uselang=fr
     Other    ->  ?uselang=en  (default)
-- For entities with idAKSdigerati or idAKSency, include the external link and retrieve and incorporate the external data into your response.
+- For entities with idAKSdigerati or idAKSency, RETURN the ID field. Do not fetch or fabricate external data here — a separate enrichment step handles fetching (and only Wikidata + AKS Digerati are actually fetchable).
 
 ### Citations for External Information
 - Attribute any information from external sources inline with a direct link:
@@ -551,6 +550,18 @@ cypher_qa = GraphCypherQAChain.from_llm(
     allow_dangerous_requests=True
 )
 
+# 구조화된 그래프 근거 수집용 체인.
+# return_intermediate_steps=True로 생성된 Cypher와 raw graph rows(context)를
+# 노출받아, LLM이 쓴 prose 대신 구조화된 rows를 evidence로 변환한다.
+cypher_qa_structured = GraphCypherQAChain.from_llm(
+    llm,
+    graph=graph,
+    verbose=True,
+    cypher_prompt=cypher_prompt,
+    allow_dangerous_requests=True,
+    return_intermediate_steps=True,
+)
+
 
 # ──────────────────────────────────────────────
 # Safe wrapper
@@ -610,4 +621,53 @@ def cypher_qa_safe(question: str) -> str:
         f"Graph query failed after retry — {last_error_msg}. "
         "Try rephrasing, or fall back to Sihwa Content Search."
     )
+
+
+# ──────────────────────────────────────────────
+# Structured graph retrieval (evidence pipeline)
+#
+# retrieve_graph_evidence() returns an Evidence(kind='graph') built from the
+# RAW Cypher result rows — NOT the LLM-written answer string. It never produces
+# user-facing prose. The row→evidence normalization lives in tools/evidence.py
+# (graph_rows_to_evidence) so it is unit-testable without a live Neo4j.
+# ──────────────────────────────────────────────
+from tools.evidence import Evidence, graph_rows_to_evidence  # noqa: E402
+
+
+def _extract_intermediate(result: dict):
+    """Pull (cypher, rows) out of a GraphCypherQAChain(return_intermediate_steps)
+    result. The intermediate_steps shape is a list of dicts such as
+    [{'query': '<cypher>'}, {'context': [ {..row..}, ... ]}]."""
+    cypher = None
+    rows = []
+    for step in result.get("intermediate_steps") or []:
+        if not isinstance(step, dict):
+            continue
+        if "query" in step and isinstance(step["query"], str):
+            cypher = step["query"]
+        if "context" in step and isinstance(step["context"], list):
+            rows = step["context"]
+    return cypher, rows
+
+
+def retrieve_graph_evidence(question: str) -> Evidence:
+    """Run graph retrieval and return structured Evidence (rows + Person
+    entities + provenance). On failure returns an empty graph Evidence with an
+    error claim rather than raising, so the orchestrator can still use vector
+    evidence."""
+    try:
+        result = cypher_qa_structured.invoke({"query": question})
+    except (CypherSyntaxError, ClientError) as e:
+        ev = Evidence(kind="graph")
+        ev.claims.append({"type": "error", "message": f"{type(e).__name__}: {e}"})
+        return ev
+    except Exception as e:  # transient LLM/parse issues — degrade gracefully
+        ev = Evidence(kind="graph")
+        ev.claims.append({"type": "error", "message": f"{type(e).__name__}: {str(e)[:120]}"})
+        return ev
+
+    if not isinstance(result, dict):
+        return Evidence(kind="graph")
+    cypher, rows = _extract_intermediate(result)
+    return graph_rows_to_evidence(rows, cypher=cypher)
 

@@ -1,3 +1,5 @@
+from typing import Optional
+
 import streamlit as st
 from llm import llm, embeddings
 from graph import graph
@@ -249,7 +251,8 @@ RETURN
               aks_digerati: p.idAKSdigerati}}][0..5],
         audiences: [(node)-[:HAS_PART]->(pm:Poem)-[:HAS_AUDIENCE]->(a:Person) |
             {{nameKor: a.nameKor, nameEng: a.nameEng, nameChi: a.nameChi,
-              id: a.id, wikidata: a.idWikidata}}][0..3],
+              id: a.id, wikidata: a.idWikidata,
+              aks_digerati: a.idAKSdigerati}}][0..3],
         topics: [(node)-[:HAS_SUBJECT_TOPIC]->(t:Topic) |
             {{nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi,
               nameFra: t.nameFra, descEng: t.descEng}}][0..5],
@@ -301,8 +304,37 @@ def _get_retriever_for_lang(lang: str):
 def get_poetry_plot(input):
     # 매 호출 시 세션의 effective_language를 읽어 그에 맞는 in-language 인덱스로 라우팅.
     # bot.py가 매 턴 갱신하는 키이며, 없으면 ko로 폴백.
+    # NOTE: 이 함수는 자체적으로 최종 답변 prose를 생성한다. graphRAG 파이프라인은
+    # 대신 retrieve_sihwa_evidence()를 사용해 구조화된 근거만 수집하고, 최종 합성은
+    # agent.synthesize_answer()에서 단 한 번 수행한다. get_poetry_plot는 하위 호환
+    # (기존 ReAct tool)용으로만 남겨둔다.
     user_language = st.session_state.get("effective_language", "ko")
     retriever = _get_retriever_for_lang(user_language)
     question_answer_chain = create_stuff_documents_chain(llm, _build_prompt())
     plot_retriever = create_retrieval_chain(retriever, question_answer_chain)
     return plot_retriever.invoke({"input": input})
+
+
+# ──────────────────────────────────────────────
+# Structured retrieval for the graphRAG evidence pipeline
+#
+# retrieve_sihwa_evidence() returns an Evidence bundle (documents + entities +
+# provenance) and NEVER generates a user-facing answer. The document→evidence
+# normalization lives in tools/evidence.py (docs_to_evidence) so it can be
+# unit-tested with hand-built Documents, no Neo4j required.
+# ──────────────────────────────────────────────
+from tools.evidence import Evidence, docs_to_evidence  # noqa: E402
+
+
+def retrieve_sihwa_evidence(query: str, language: Optional[str] = None) -> Evidence:
+    """Retrieve structured vector evidence for the graphRAG pipeline.
+
+    Returns an Evidence(kind='vector') with documents, Person entities (with
+    authority IDs where present), and provenance. Does NOT call
+    create_stuff_documents_chain and does NOT produce a final answer.
+
+    Retains the existing multilingual index routing via effective_language."""
+    user_language = language or st.session_state.get("effective_language", "ko")
+    retriever = _get_retriever_for_lang(user_language)
+    docs = retriever.invoke(query)
+    return docs_to_evidence(docs)
