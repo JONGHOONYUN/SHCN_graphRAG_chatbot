@@ -32,21 +32,24 @@ instructions = (
     "사용자 언어에 맞는 uselang 파라미터를 추가하세요 "
     "(en / ko / zh / fr). "
 
-    # External authority IDs — Person nodes carry up to 15 different external IDs
-    "Person·Place 노드는 여러 외부 authority ID를 보유합니다. context에 존재하는 "
-    "ID가 있으면 답변에 링크·정보를 함께 인용하세요. 사용자 언어·문화권에 따라 "
-    "우선순위를 조정하세요:\n"
-    "  · 한국어 사용자: idAKSdigerati, idAKSency, idAKSsillok, idAKSkdp, idNLK 우선\n"
-    "  · 중국어/일본어 사용자: idCBDB, idAcademiaSinica, idEncyChina 우선\n"
-    "  · 영어/유럽 사용자: idWikidata, idLOC, idBritannica, idBNF, idOpenLibrary, "
-    "idBritishMuseum, idYaleLux 우선\n"
-    "  · idWikidata는 모든 언어에서 유용한 크로스링구얼 authority이므로 "
-    "존재하면 항상 함께 인용 권장. "
-    "외부 링크 base URL: "
-    "https://www.wikidata.org/wiki/{{id}} (Wikidata), "
-    "https://encykorea.aks.ac.kr/Article/{{id}} (AKS 한국민족문화대백과), "
-    "https://digerati.aks.ac.kr:85/api/IdValues/{{id}} (AKS Digerati Person), "
-    "https://sillok.history.go.kr/{{id}} (조선왕조실록). "
+    # External authority IDs — link-only in this legacy path (no HTTP fetching here)
+    "Person·Place 노드는 여러 외부 authority ID를 보유합니다. 단, 이 검색 경로는 "
+    "외부 API를 호출하지 않습니다. 따라서 ID가 있어도 그 사이트의 '내용'을 아는 것처럼 "
+    "쓰지 말고, 오직 참고 링크로만 제시하세요 ('~에 따르면' 금지). "
+    "검증된 링크 패턴만 사용하고, 아래 목록에 없는 ID는 링크를 만들지 마세요:\n"
+    "  · idWikidata      → https://www.wikidata.org/wiki/{{id}}\n"
+    "  · idAKSency       → https://encykorea.aks.ac.kr/Article/{{id}}\n"
+    "  · idLOC           → https://id.loc.gov/authorities/names/{{id}}\n"
+    "  · idOpenLibrary   → https://openlibrary.org/authors/{{id}}\n"
+    "  · idBritannica    → https://www.britannica.com/{{id}}\n"
+    "  · idBNF           → https://data.bnf.fr/ark:/12148/cb{{id}}\n"
+    "  · idWorldHistory  → https://www.worldhistory.org/{{id}}/\n"
+    "  · idAKSdigerati   → 링크를 직접 만들지 마세요. 이 값(koreanPerson_*/koreanPlace_*)은 "
+    "API 요청용이며, 공개 링크는 API 응답의 canonical link로만 얻을 수 있습니다.\n"
+    "  · idAKSsillok / idAKSkdp / idNLK / idEncyChina / idAcademiaSinica / "
+    "idBritishMuseum / idAKSmap → 검증된 공개 URL 패턴이 없으므로 링크를 만들지 마세요.\n"
+    "  · 구조적 사실·외부 전기 정보가 필요한 질문은 graphRAG 근거 파이프라인이 "
+    "담당합니다(이 경로가 아님). "
 
     # Place geographic data (gis 문자열, 예: '37° 56\\' 17.50\" N, 126° 35\\' 16.06\" E')
     "Place 노드에 gis 좌표가 있으면 지리 정보로 활용하세요. "
@@ -129,11 +132,11 @@ instructions = (
     "  · creator_year_birth/death가 없으면 creator_era의 yearStart~yearEnd로 폴백.\n"
 
     # G. Authority linking 활용
-    "\n[Cross-lingual authority linking — 답변 신뢰성 강화]\n"
-    "  · creator_external_ids.wikidata가 있으면 언제나 함께 링크 (교차 검색 가능).\n"
-    "  · 한국 인물: aks_digerati / aks_ency / aks_sillok 우선.\n"
-    "  · 중국 인물: cbdb / academia_sinica / ency_china 우선.\n"
-    "  · 서구 도서관 참조가 필요한 경우: loc / bnf / britannica / open_library.\n"
+    "\n[Cross-lingual authority linking — 참고 링크 전용]\n"
+    "  · creator_external_ids.wikidata가 있으면 참고 링크로 함께 제시 (교차 검색 유용).\n"
+    "  · 이 경로에서는 어떤 authority도 조회하지 않으므로, 링크만 제시하고 "
+    "그 사이트의 내용을 사실로 서술하지 마세요.\n"
+    "  · 위 '검증된 링크 패턴' 목록에 없는 ID는 링크를 만들지 말고 생략.\n"
     "  · authority ID 값이 아예 없는 경우 이 섹션은 통째로 건너뛰기.\n"
 )
 
@@ -247,12 +250,26 @@ RETURN
         mentioned_persons: [(node)-[:HAS_SUBJECT_PERSON]->(p:Person) |
             {{nameKor: p.nameKor, nameEng: p.nameEng, nameChi: p.nameChi,
               nameMR: p.nameMR, namePY: p.namePY, nameRR: p.nameRR,
-              id: p.id, wikidata: p.idWikidata,
-              aks_digerati: p.idAKSdigerati}}][0..5],
+              id: p.id,
+              wikidata: p.idWikidata, aks_digerati: p.idAKSdigerati,
+              aks_ency: p.idAKSency, aks_sillok: p.idAKSsillok,
+              aks_kdp: p.idAKSkdp, cbdb: p.idCBDB,
+              academia_sinica: p.idAcademiaSinica, ency_china: p.idEncyChina,
+              nlk: p.idNLK, loc: p.idLOC, bnf: p.idBNF,
+              britannica: p.idBritannica, british_museum: p.idBritishMuseum,
+              open_library: p.idOpenLibrary, world_history: p.idWorldHistory,
+              yale_lux: p.idYaleLux}}][0..5],
         audiences: [(node)-[:HAS_PART]->(pm:Poem)-[:HAS_AUDIENCE]->(a:Person) |
             {{nameKor: a.nameKor, nameEng: a.nameEng, nameChi: a.nameChi,
-              id: a.id, wikidata: a.idWikidata,
-              aks_digerati: a.idAKSdigerati}}][0..3],
+              id: a.id,
+              wikidata: a.idWikidata, aks_digerati: a.idAKSdigerati,
+              aks_ency: a.idAKSency, aks_sillok: a.idAKSsillok,
+              aks_kdp: a.idAKSkdp, cbdb: a.idCBDB,
+              academia_sinica: a.idAcademiaSinica, ency_china: a.idEncyChina,
+              nlk: a.idNLK, loc: a.idLOC, bnf: a.idBNF,
+              britannica: a.idBritannica, british_museum: a.idBritishMuseum,
+              open_library: a.idOpenLibrary, world_history: a.idWorldHistory,
+              yale_lux: a.idYaleLux}}][0..3],
         topics: [(node)-[:HAS_SUBJECT_TOPIC]->(t:Topic) |
             {{nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi,
               nameFra: t.nameFra, descEng: t.descEng}}][0..5],

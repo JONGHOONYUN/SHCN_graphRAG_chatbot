@@ -116,16 +116,41 @@ NOTE: Do not use yearExam — it has been removed from the data.
     idAKSency      (Place, Work)
                    ID for the AKS Encyclopedia of Korean Culture.
 
-IMPORTANT — this Cypher chain does NOT call any HTTP/external API. It only reads the Neo4j graph. Your job here is to WRITE A CYPHER QUERY that RETURNS the external-ID fields (e.g. p.idWikidata, p.idAKSdigerati) so that a separate authority-enrichment step downstream can fetch them. Do NOT claim in generated Cypher or comments that this step retrieves Wikidata/AKS data — it does not.
+IMPORTANT — this Cypher chain does NOT call any HTTP/external API. It only reads the Neo4j graph. Your job here is to WRITE A CYPHER QUERY that RETURNS the external-ID fields so that a separate authority-enrichment step downstream can fetch them. Do NOT claim in generated Cypher or comments that this step retrieves Wikidata/AKS/LOC data — it does not.
 
-When a returned node carries an external ID, simply RETURN that ID field. For any Person you return, request the standardized fields below so downstream enrichment is deterministic:
+## Standardized authority aliases (REQUIRED)
+
+Whenever a returned Person or Place is relevant to the user's question, RETURN its authority IDs using EXACTLY these aliases. The downstream enrichment step matches on these names, so non-standard aliases silently disable enrichment.
+
+For a Person `p`:
 
     p.id            AS person_id,
     p.nameKor       AS person_name_kor,
     p.nameChi       AS person_name_chi,
     p.nameEng       AS person_name_eng,
     p.idWikidata    AS wikidata_id,
-    p.idAKSdigerati AS aks_digerati_id
+    p.idAKSdigerati AS aks_digerati_id,
+    p.idLOC         AS loc_id,
+    p.idOpenLibrary AS open_library_id,
+    p.idCBDB        AS cbdb_id,
+    p.idYaleLux     AS yale_lux_id,
+    p.idAKSency     AS aks_ency_id
+
+For a Place `pl`:
+
+    pl.id            AS place_id,
+    pl.nameKor       AS place_name_kor,
+    pl.nameChi       AS place_name_chi,
+    pl.nameEng       AS place_name_eng,
+    pl.idAKSdigerati AS aks_digerati_id,
+    pl.idAKSmap      AS aks_map_id,
+    pl.idAKSency     AS aks_ency_id
+
+Only include the ID fields that matter for the question — a poem-list query does not need them. Return a reasonable subset rather than every field every time.
+
+In MULTI-HOP results where several people/places appear in one row, PREFIX the aliases by role so each entity stays distinct, e.g. `critic_person_id`, `critic_wikidata_id`, `subject_person_id`, `subject_wikidata_id`, `place_id`, `place_aks_map_id`. Never mix two entities' IDs into one unprefixed group.
+
+NOTE — Person vs Place IDs are NOT interchangeable: `idAKSdigerati` is `koreanPerson_<n>` on a Person and `koreanPlace_<n>` on a Place, and they resolve against different endpoints. Always return a Place's ID under the `place_*`/`aks_map_id` aliases, never under `person_*`.
 
 
 
