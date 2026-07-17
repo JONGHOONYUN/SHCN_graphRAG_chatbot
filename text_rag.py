@@ -1,5 +1,12 @@
-"""textRAG 모드 — 그래프 관계를 사용하지 않고 Entry.textKor/textChi/textEng
-벡터 인덱스로만 검색하는 단순 RAG chain.
+"""textRAG 모드 — Entry.textKor/textChi/textEng 벡터 인덱스에 대한 의미 기반
+검색만으로 답하는 단순 RAG chain.
+
+정확한 범위 (사용자 안내 문구와 일치해야 함):
+- Entry 본문에 대한 의미 벡터 검색을 수행한다.
+- 그래프 관계 추론·구조 질의(작자·관직·시대·비평 관계 등)는 수행하지 않는다.
+- 단, Entry–Work 포함 관계([:HAS_PART])는 출처·인용 메타데이터(시화집명 등)를
+  붙이기 위해서만 조회한다. "그래프를 전혀 사용하지 않는다"는 표현은 부정확하므로
+  사용하지 말 것.
 
 - ReAct agent를 사용하지 않고 create_retrieval_chain을 직접 호출한다.
 - 세션 언어(effective_language)에 맞는 in-language 인덱스를 선택한다.
@@ -115,7 +122,9 @@ def _build_prompt():
     system_msg = (
         f"이번 답변은 반드시 {label}로 작성하세요. "
         "당신은 시화총림(詩話叢林) 데이터베이스의 텍스트 벡터 검색 결과만을 근거로 "
-        "답하는 어시스턴트입니다. 이 모드에서는 그래프 관계 정보를 활용하지 않습니다.\n\n"
+        "답하는 어시스턴트입니다. 이 모드는 Entry 본문에 대한 의미 벡터 검색을 "
+        "수행하며, 그래프 관계 추론이나 구조적 관계 질의는 수행하지 않습니다. "
+        "Entry가 속한 시화집(Work) 포함 관계는 출처·인용 표기를 위해서만 사용됩니다.\n\n"
 
         "[답변 규칙]\n"
         "1. context에 있는 Entry 본문(textKor/textChi/textEng)만을 근거로 답하세요.\n"

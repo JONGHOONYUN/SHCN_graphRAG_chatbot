@@ -1,6 +1,6 @@
 # GraphRAG External Authority Pipeline — Implementation Note
 
-Covers three work orders, applied in sequence:
+Covers four work orders, applied in sequence:
 
 1. **Evidence pipeline refactor** (`CLAUDE_CODE_REFACTOR_TASK.md`) — structured
    graph/vector/external evidence before one final synthesis LLM call.
@@ -8,6 +8,10 @@ Covers three work orders, applied in sequence:
    — registry-driven support for every Person/Place authority ID stored in Neo4j.
 3. **AKS Digerati type-safety hardening** (`CLAUDE_CODE_AKS_DIGERATI_TYPE_SAFETY.md`)
    — strict Person/Place separation at request, response, cache, and citation level.
+4. **Context, safe errors, authority scale** (`CLAUDE_CODE_RAG_CONTEXT_ERROR_AND_AUTHORITY_CAP.md`)
+   — bounded conversation history on the normal graphRAG path, user-safe
+   retrieval statuses, accurate textRAG wording, and transparent 10/5 authority
+   caps with coverage notes.
 
 ## Architecture
 
@@ -104,16 +108,80 @@ mismatched HTTP 200 can become external factual evidence.*
 ## Authority call policy, caps, cache
 
 - **Gating**: keyword cue gate split by entity type (Person: 생몰/biography/生平…;
-  Place: 어디/location/位置…). Poem-list/structural questions trigger **zero**
-  external calls. `want_authority` allows explicit override.
-- **Caps**: ≤ 3 Person entities, ≤ 2 Place entities per request; ≤ 2 fetchable
-  sources per entity (lifted when the user explicitly asks for cross-source
-  comparison). Calls de-duplicated by `source|node_type|id`.
+  Place: 어디/location/位置…; an explicit cross-source comparison request also
+  counts as an authority request). Poem-list/structural questions trigger
+  **zero** external calls. `want_authority` allows explicit override.
+- **Caps** (configurable via env or Streamlit secrets — `AUTHORITY_PERSON_CAP`,
+  `AUTHORITY_PLACE_CAP`, `AUTHORITY_SOURCES_PER_ENTITY`; resolved once per
+  process):
+  - `DEFAULT_PERSON_AUTHORITY_CAP = 10`, `DEFAULT_PLACE_AUTHORITY_CAP = 5`,
+    `DEFAULT_FETCHABLE_SOURCES_PER_ENTITY = 2`;
+  - an explicit cross-source comparison raises the per-entity source limit only
+    to the documented bounded ceiling `EXHAUSTIVE_SOURCES_PER_ENTITY = 4` — caps
+    are never removed;
+  - calls de-duplicated by `source|node_type|original_id`; merged duplicate
+    entities consume cap capacity once.
+- **Coverage transparency**: the orchestrator tracks
+  `eligible_entity_count` / `enriched_entity_count` / `skipped_due_to_cap_count`
+  per node type. When at least one eligible entity was skipped, a structured
+  coverage claim is added and synthesis renders a localized "Authority Coverage"
+  block that MUST appear in the answer (e.g. "외부 authority 보강은 관련 인물
+  14명 중 10명에 적용했습니다…"). No note is shown when nothing was skipped, and
+  synthesis rule 11 forbids claiming completeness while a note is present.
 - **Never from a name**: entities without a valid authority ID are skipped.
 - **Cache**: in-process, TTL 1 h, bounded 256 entries; successes only.
 - **HTTP hygiene**: descriptive User-Agent, 5–8 s timeouts, JSON content-type
-  check, 2 MB size cap, no retry storms; failures degrade to
-  `unavailable`/`error` and the graph/vector answer still returns.
+  check, 2 MB size cap, sequential fetches (no unbounded concurrency), no retry
+  storms; failures degrade to `unavailable`/`error` and the graph/vector answer
+  still returns.
+
+## Conversation history (graphRAG normal path)
+
+- The normal path loads the `::graphRAG` Neo4j history (never `::textRAG`),
+  serializes it with `tools.synthesis.serialize_chat_history()` — last
+  **8 messages**, **400 chars/message**, **2 400 chars total**, user/assistant
+  roles only; tool traces, raw authority payloads, and error text are excluded
+  by marker filtering.
+- The bounded text goes to (a) graph retrieval, appended to the Cypher-generation
+  question strictly for pronoun/ellipsis resolution, and (b) final synthesis
+  under `HISTORY_RULES`: history is never evidence, ambiguous antecedents get a
+  clarification question, missing referents are never filled from pretraining.
+  Vector search embeds the current question only.
+- Persistence ownership: the normal path saves user+assistant messages itself
+  after a successful answer; the legacy ReAct fallback keeps its
+  `RunnableWithMessageHistory` persistence — one owner per code path, no double
+  save. History load/save failures never block an answer (empty history / skip).
+- Retention: reads are strictly bounded by the serializer; stored history stays
+  in Neo4j chat nodes (`:Message`/`:Session`), which the corpus prompts already
+  exclude. Periodic ops cleanup remains a deployment task (documented decision).
+
+## User-safe retrieval statuses
+
+- Retriever failures are normalized in `tools/orchestrator.py`
+  (`_safe_retrieve`/`_normalize_evidence_status`): raised exceptions and legacy
+  `{"type":"error"}` claims become `{"source", "outcome"}` statuses; the
+  exception text is logged with a correlation code and **stripped from
+  Evidence** — it can never reach the synthesis prompt.
+- Outcomes: `ok` / `no_results` (an answerable state, not an error) /
+  `temporarily_unavailable` / `invalid_query`. Localized wording (ko/en/zh)
+  lives in `tools.synthesis.RETRIEVAL_STATUS_MESSAGES` and renders as a
+  "Retrieval Status" block; synthesis rule 10 requires relaying it briefly.
+- One-source failure: the answer proceeds from the surviving source with a brief
+  localized limitation note. Both sources `temporarily_unavailable` with no
+  external claims: `synthesize_answer()` returns
+  `retrieval_failure_message(lang)` directly — no LLM call, no pretraining.
+- External authority failures keep their existing source-specific statuses and
+  are not merged into retrieval statuses.
+
+## textRAG wording
+
+All user-facing/prompt text (bot.py greeting + sidebar help, text_rag.py system
+prompt and docstring) now states: textRAG performs semantic vector search over
+Entry texts, does **not** perform graph relationship reasoning or structured
+relationship queries, and uses the Entry–Work containment relation only to
+attach source/citation metadata. The graphRAG-switch advice for structural
+questions is retained; tests assert the old inaccurate "no graph relationships"
+claim is gone.
 
 ## API keys and rate limits
 
@@ -133,7 +201,7 @@ AKS Digerati). Any future key (e.g. NLK) must live in Streamlit secrets/env only
 ## Tests
 
 ```
-python -m unittest tests.test_pipeline -v     # 60 tests, all passing
+python -m unittest tests.test_pipeline -v     # 79 tests, all passing
 ```
 
 Covers: JSONL schema + full registry coverage of stored properties; ID
@@ -142,5 +210,10 @@ entities); routing and request blocking in both directions; response-schema and
 ID-mismatch rejection; HTTP guards (timeout/429/404/bad JSON/content-type/
 oversize); caps, de-dup, intent routing, link-only handling; synthesis
 allowlists, bounded blocks, conflict retention, citation safety; cache
-namespace isolation; Cypher template brace safety. Mutation-checked (removing a
-registry entry fails the coverage test).
+namespace isolation; Cypher template brace safety; conversation-history
+serialization bounds/filtering, `::graphRAG` isolation, history-rules wiring;
+textRAG wording accuracy; retrieval-status normalization (raw exception text
+never in the prompt, no_results vs failure, both-failed safe message,
+log-only diagnostics); coverage counts/truncation notes and cap configuration.
+Mutation-checked (removing a registry entry fails the coverage test). No test
+requires live Neo4j, Gemini, or external API access.

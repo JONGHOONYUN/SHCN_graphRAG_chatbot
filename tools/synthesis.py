@@ -24,6 +24,145 @@ _MAX_DOCS = 8
 _MAX_EXTERNAL_CLAIMS = 10
 _MAX_FIELD_CHARS = 1200
 
+# Conversation-history bounds (work order §1): last N messages, per-message and
+# total character budgets, so unlimited history never reaches Gemini.
+HISTORY_MAX_MESSAGES = 8
+HISTORY_MAX_MESSAGE_CHARS = 400
+HISTORY_MAX_TOTAL_CHARS = 2400
+
+# Content markers that identify tool traces / raw payloads / internal errors —
+# such messages are never serialized into the history block.
+_HISTORY_EXCLUDE_MARKERS = (
+    "Observation:", "Action Input:", "Traceback", "MUST_NOT_ADD",
+    "schema_hint", "CypherSyntaxError", "ClientError",
+)
+
+
+# ── User-safe retrieval status (work order §3) ────────────────────────────────
+# Outcomes are stable tokens; localized wording lives here, technical
+# diagnostics live only in server logs (see tools/orchestrator.py).
+RETRIEVAL_OUTCOMES = ("ok", "no_results", "temporarily_unavailable", "invalid_query")
+
+RETRIEVAL_STATUS_MESSAGES = {
+    ("graph", "temporarily_unavailable"): {
+        "ko": "그래프 구조 검색은 현재 일시적으로 사용할 수 없습니다. 다른 검색 결과는 계속 참고했습니다.",
+        "en": "Graph (structural) search is temporarily unavailable. Other retrieval results were still used.",
+        "zh": "图结构检索暂时不可用。其他检索结果仍被参考。",
+    },
+    ("graph", "no_results"): {
+        "ko": "그래프 검색에서 일치하는 결과를 찾지 못했습니다.",
+        "en": "Graph search found no matching results.",
+        "zh": "图检索未找到匹配结果。",
+    },
+    ("graph", "invalid_query"): {
+        "ko": "질문을 그래프 검색으로 해석하지 못했습니다. 인물명·서명 등을 조금 더 구체적으로 적어 주세요.",
+        "en": "The question could not be interpreted as a graph query. Please be more specific (names, titles).",
+        "zh": "无法将问题解释为图查询。请提供更具体的信息（人名、书名等）。",
+    },
+    ("vector", "temporarily_unavailable"): {
+        "ko": "텍스트(벡터) 검색은 현재 일시적으로 사용할 수 없습니다. 그래프 검색 결과는 계속 참고했습니다.",
+        "en": "Text (vector) search is temporarily unavailable. Graph results were still used.",
+        "zh": "文本（向量）检索暂时不可用。图检索结果仍被参考。",
+    },
+    ("vector", "no_results"): {
+        "ko": "텍스트 검색에서 일치하는 결과를 찾지 못했습니다.",
+        "en": "Text search found no matching results.",
+        "zh": "文本检索未找到匹配结果。",
+    },
+}
+
+# Returned directly (no LLM call) when BOTH retrieval sources failed and there is
+# no external evidence to answer from. Never backfilled from pretraining.
+BOTH_RETRIEVALS_FAILED_MESSAGES = {
+    "ko": "죄송합니다. 지금은 그래프 검색과 텍스트 검색이 모두 일시적으로 사용할 수 없습니다. "
+          "잠시 후 다시 시도하거나, 질문을 조금 바꿔서 다시 물어봐 주세요.",
+    "en": "Sorry — both graph search and text search are temporarily unavailable. "
+          "Please try again shortly or rephrase your question.",
+    "zh": "抱歉，图检索与文本检索目前均暂时不可用。请稍后重试或换个问法。",
+}
+
+
+def both_retrievals_failed(statuses: dict) -> bool:
+    """True when graph AND vector retrieval are unavailable (not mere
+    no_results — an empty result set is an answerable state)."""
+    if not isinstance(statuses, dict):
+        return False
+    g = (statuses.get("graph") or {}).get("outcome")
+    v = (statuses.get("vector") or {}).get("outcome")
+    return g == "temporarily_unavailable" and v == "temporarily_unavailable"
+
+
+def retrieval_failure_message(language: str = "ko") -> str:
+    return BOTH_RETRIEVALS_FAILED_MESSAGES.get(
+        language, BOTH_RETRIEVALS_FAILED_MESSAGES["ko"])
+
+
+# ── Conversation-history serialization (work order §1) ────────────────────────
+HISTORY_RULES = """\
+# Conversation history rules (STRICT)
+- Conversation history may resolve pronouns or ellipsis only ("그 인물", "그 작품",
+  "the person mentioned earlier", ...).
+- It is not evidence. Corpus and external facts must come only from the current
+  evidence blocks; never repeat a prior assistant statement as a fact unless the
+  current evidence also supports it.
+- If several previous entities could plausibly match the reference, ask ONE
+  concise clarification question instead of guessing.
+- If the referent cannot be resolved from the history, say so and ask; do not
+  infer a missing entity from pretraining.
+"""
+
+
+def _history_role(item: Any) -> str:
+    """Map a message to 'user'/'assistant'; empty string means 'exclude'."""
+    if isinstance(item, dict):
+        role = (item.get("role") or "").lower()
+    else:
+        role = (getattr(item, "type", "") or "").lower()
+    if role in ("user", "human"):
+        return "user"
+    if role in ("assistant", "ai"):
+        return "assistant"
+    return ""
+
+
+def _history_content(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("content") or "")
+    return str(getattr(item, "content", "") or "")
+
+
+def serialize_chat_history(
+    messages: Any,
+    max_messages: int = HISTORY_MAX_MESSAGES,
+    max_message_chars: int = HISTORY_MAX_MESSAGE_CHARS,
+    max_total_chars: int = HISTORY_MAX_TOTAL_CHARS,
+) -> str:
+    """Bounded, user/assistant-only serialization of prior conversation.
+
+    Accepts LangChain messages (with .type/.content) or plain dicts
+    ({"role","content"}). Tool traces, raw authority payloads, and internal
+    error text are excluded via marker filtering; roles other than
+    user/assistant are dropped. Most recent messages win the budget."""
+    lines: list = []
+    for item in messages or []:
+        role = _history_role(item)
+        if not role:
+            continue
+        content = _history_content(item).strip()
+        if not content:
+            continue
+        if any(marker in content for marker in _HISTORY_EXCLUDE_MARKERS):
+            continue
+        if len(content) > max_message_chars:
+            content = content[:max_message_chars] + "…"
+        lines.append(f"{role}: {content}")
+
+    lines = lines[-max_messages:]
+    # Enforce the total budget by dropping the OLDEST lines first.
+    while lines and sum(len(l) + 1 for l in lines) > max_total_chars:
+        lines.pop(0)
+    return "\n".join(lines)
+
 
 def _allowlist_for(source: str) -> tuple:
     """Per-source parsed-field allowlist, from the authority registry."""
@@ -88,6 +227,17 @@ the only step that writes user-facing prose. Obey these rules strictly:
      - 참고 링크 (내용 미조회): [label](verified URL)
    Every quoted source text must carry full graph provenance.
 
+10. RETRIEVAL STATUS: if a "Retrieval Status" block is present, relay its
+   message briefly in the locked language. "No results" and "temporarily
+   unavailable" are different situations — never present one as the other, and
+   never compensate for an unavailable source with pretraining.
+
+11. AUTHORITY COVERAGE: if an "Authority Coverage" block is present, its
+   statement MUST appear in the final answer. Never claim the authority
+   comparison is complete/exhaustive while a coverage note is present — even if
+   the user explicitly asked for an exhaustive comparison, state that the result
+   is a capped subset and offer a narrowed follow-up.
+
 If no evidence supports the question, say so plainly in the locked language and
 do not invent an answer.
 """
@@ -113,24 +263,30 @@ def _entity_line(e: dict) -> str:
     return "- " + ", ".join(bits)
 
 
-def _format_graph_block(graph: dict) -> str:
+def _format_graph_block(graph: dict, outcome: str = "ok") -> str:
+    """Graph rows only. Error/status claims are NEVER rendered here — raw
+    exception text must not reach the final prompt (work order §3); the
+    localized status line is emitted by _format_status_block instead."""
     lines = ["## Graph Evidence (Neo4j — authoritative for the sihwa corpus)"]
-    err = [c for c in graph.get("claims", []) if c.get("type") == "error"]
-    if err:
-        lines.append(f"(graph retrieval issue: {err[0].get('message')})")
     docs = graph.get("documents", [])
     if not docs:
-        lines.append("(no graph rows)")
+        if outcome == "temporarily_unavailable":
+            lines.append("(graph retrieval unavailable this turn — see Retrieval Status)")
+        else:
+            lines.append("(no graph rows)")
     for row in docs[:_MAX_DOCS]:
         lines.append("- " + _truncate(json.dumps(row, ensure_ascii=False), 800))
     return _truncate("\n".join(lines))
 
 
-def _format_vector_block(vector: dict) -> str:
+def _format_vector_block(vector: dict, outcome: str = "ok") -> str:
     lines = ["## Vector Evidence (Neo4j text retrieval — authoritative source texts)"]
     docs = vector.get("documents", [])
     if not docs:
-        lines.append("(no vector documents)")
+        if outcome == "temporarily_unavailable":
+            lines.append("(vector retrieval unavailable this turn — see Retrieval Status)")
+        else:
+            lines.append("(no vector documents)")
     for d in docs[:_MAX_DOCS]:
         work = d.get("work_name_kor") or d.get("work_name_eng") or "Work"
         lines.append(f"- 출처: {work} > Entry {d.get('entry_position')} ({d.get('entry_id')})")
@@ -148,7 +304,8 @@ def _format_external_block(external: dict) -> str:
         "(status=ok → fetched, supplementary. status=link_only → NOT fetched, "
         "reference link only. Other statuses → unavailable; do not fill gaps.)",
     ]
-    claims = external.get("claims", [])
+    claims = [c for c in external.get("claims", [])
+              if c.get("type") != "coverage"]      # rendered in its own block
     if not claims:
         lines.append("(no external authority data)")
 
@@ -191,6 +348,65 @@ def _format_external_block(external: dict) -> str:
     return _truncate("\n".join(lines))
 
 
+def _format_status_block(statuses: dict, language: str) -> str:
+    """Localized, user-safe retrieval status lines. Only non-ok outcomes are
+    shown; 'no_results' and 'temporarily_unavailable' render differently."""
+    if not isinstance(statuses, dict):
+        return ""
+    lines = []
+    for source in ("graph", "vector"):
+        outcome = (statuses.get(source) or {}).get("outcome")
+        if not outcome or outcome == "ok":
+            continue
+        msgs = RETRIEVAL_STATUS_MESSAGES.get((source, outcome))
+        if msgs:
+            lines.append(f"- {msgs.get(language, msgs['ko'])}")
+    if not lines:
+        return ""
+    return "\n".join(
+        ["## Retrieval Status (사용자에게 관련 내용을 전달할 것)"] + lines)
+
+
+_COVERAGE_TEMPLATES = {
+    "Person": {
+        "ko": "외부 authority 보강은 관련 인물 {eligible}명 중 {enriched}명에 적용했습니다. "
+              "나머지 인물은 시화총림 그래프 정보만으로 제시했습니다.",
+        "en": "External authority enrichment was applied to {enriched} of {eligible} "
+              "relevant persons; the rest are presented from graph data only.",
+        "zh": "外部权威数据补充应用于{eligible}位相关人物中的{enriched}位；其余人物仅基于图数据呈现。",
+    },
+    "Place": {
+        "ko": "외부 authority 보강은 관련 장소 {eligible}곳 중 {enriched}곳에 적용했습니다. "
+              "나머지 장소는 시화총림 그래프 정보만으로 제시했습니다.",
+        "en": "External authority enrichment was applied to {enriched} of {eligible} "
+              "relevant places; the rest are presented from graph data only.",
+        "zh": "外部权威数据补充应用于{eligible}处相关地点中的{enriched}处；其余地点仅基于图数据呈现。",
+    },
+}
+
+
+def _format_coverage_block(coverage: dict, language: str) -> str:
+    """Cap/truncation transparency (work order §4): shown ONLY when at least one
+    eligible entity was skipped due to a cap. The synthesis rules require this
+    statement to appear in the final answer."""
+    if not isinstance(coverage, dict):
+        return ""
+    lines = []
+    for node_type in ("Person", "Place"):
+        c = coverage.get(node_type) or {}
+        if not c.get("skipped_due_to_cap_count"):
+            continue
+        tmpl = _COVERAGE_TEMPLATES[node_type]
+        lines.append("- " + tmpl.get(language, tmpl["ko"]).format(
+            eligible=c.get("eligible_entity_count", 0),
+            enriched=c.get("enriched_entity_count", 0)))
+    if not lines:
+        return ""
+    return "\n".join(
+        ["## Authority Coverage (답변에 반드시 포함할 것 — 완전한 목록이라고 주장 금지)"]
+        + lines)
+
+
 def format_evidence_for_prompt(evidence: dict, language: str = "ko") -> str:
     """Render the evidence bundle into labelled, bounded blocks for the final
     synthesis prompt. Guarantees source labels are present, that only allowlisted
@@ -198,6 +414,8 @@ def format_evidence_for_prompt(evidence: dict, language: str = "ko") -> str:
     graph = _to_dict(evidence.get("graph"))
     vector = _to_dict(evidence.get("vector"))
     external = _to_dict(evidence.get("external"))
+    statuses = evidence.get("statuses") or {}
+    coverage = evidence.get("coverage") or {}
 
     entities = graph.get("entities", []) + vector.get("entities", [])
     ent_lines = ["## Resolved Entities (Person / Place)"]
@@ -212,13 +430,21 @@ def format_evidence_for_prompt(evidence: dict, language: str = "ko") -> str:
     else:
         ent_lines.append("(none resolved)")
 
-    blocks = "\n\n".join([
+    graph_outcome = (statuses.get("graph") or {}).get("outcome", "ok")
+    vector_outcome = (statuses.get("vector") or {}).get("outcome", "ok")
+    parts = [
         "\n".join(ent_lines),
-        _format_graph_block(graph),
-        _format_vector_block(vector),
+        _format_graph_block(graph, graph_outcome),
+        _format_vector_block(vector, vector_outcome),
         _format_external_block(external),
-    ])
-    return _truncate(blocks, _MAX_TOTAL_CHARS)
+    ]
+    status_block = _format_status_block(statuses, language)
+    if status_block:
+        parts.append(status_block)
+    coverage_block = _format_coverage_block(coverage, language)
+    if coverage_block:
+        parts.append(coverage_block)
+    return _truncate("\n\n".join(parts), _MAX_TOTAL_CHARS)
 
 
 def build_citations(evidence: dict) -> list:

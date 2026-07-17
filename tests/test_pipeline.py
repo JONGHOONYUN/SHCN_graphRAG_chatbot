@@ -670,14 +670,17 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(len({(c[0], c[1]) for c in f.calls}), 2)
 
     def test_person_and_place_caps(self):
-        persons = [person(f"P{i}", wikidata=f"Q{i}") for i in range(10)]
-        places = [place(f"L{i}", aks_digerati_place=f"koreanPlace_{i}") for i in range(10)]
+        # Caps are applied independently: Person 10, Place 5 (work order §4).
+        persons = [person(f"P{i}", wikidata=f"Q{i}") for i in range(14)]
+        places = [place(f"L{i}", aks_digerati_place=f"koreanPlace_{i}") for i in range(9)]
         g = Evidence(kind="graph", entities=persons + places)
         f = RecordingFetcher()
-        self._run(g, Evidence(kind="vector"), f,
-                  question="이 인물들의 생몰년과 장소는 어디인가요?")
-        self.assertEqual(len([c for c in f.calls if c[2] == "Person"]), 3)   # person cap
-        self.assertEqual(len([c for c in f.calls if c[2] == "Place"]), 2)    # place cap
+        r = self._run(g, Evidence(kind="vector"), f,
+                      question="이 인물들의 생몰년과 장소는 어디인가요?")
+        self.assertEqual(len([c for c in f.calls if c[2] == "Person"]), 10)  # person cap
+        self.assertEqual(len([c for c in f.calls if c[2] == "Place"]), 5)    # place cap
+        self.assertEqual(r["coverage"]["Person"]["skipped_due_to_cap_count"], 4)
+        self.assertEqual(r["coverage"]["Place"]["skipped_due_to_cap_count"], 4)
 
     def test_sources_per_entity_cap_and_compare_override(self):
         e = person("P1", wikidata="Q1", aks_digerati="koreanPerson_1",
@@ -690,7 +693,9 @@ class TestOrchestrator(unittest.TestCase):
         f2 = RecordingFetcher()
         self._run(g, Evidence(kind="vector"), f2,
                   question="이규보의 생몰년을 여러 출처로 비교해줘")
-        self.assertGreater(len(f2.calls), 2)       # explicit comparison lifts the cap
+        # Explicit comparison raises the limit only to the documented bounded
+        # ceiling (EXHAUSTIVE_SOURCES_PER_ENTITY=4), never unbounded.
+        self.assertEqual(len(f2.calls), 4)
 
     def test_missing_ids_no_name_lookup(self):
         g = Evidence(kind="graph", entities=[person("P2", name="아무개")])
@@ -885,6 +890,247 @@ class TestGraphAndPrompts(unittest.TestCase):
         self.assertNotIn("https://sillok.history.go.kr/", text)
         # The Digerati API endpoint must not be offered as a user-facing link.
         self.assertNotIn("https://digerati.aks.ac.kr:85/api/IdValues/{{id}}", text)
+
+
+# ── Conversation history (context work order §1) ──────────────────────────────
+class TestConversationHistory(unittest.TestCase):
+    def test_serializer_bounds_and_roles(self):
+        msgs = ([{"role": "system", "content": "sys prompt"}]
+                + [{"role": "user", "content": f"질문 {i} " + "가" * 500}
+                   for i in range(6)]
+                + [{"role": "assistant", "content": f"답 {i}"} for i in range(6)])
+        out = synthesis.serialize_chat_history(msgs)
+        self.assertNotIn("sys prompt", out)                       # roles filtered
+        self.assertLessEqual(len(out), synthesis.HISTORY_MAX_TOTAL_CHARS)
+        self.assertLessEqual(len(out.splitlines()), synthesis.HISTORY_MAX_MESSAGES)
+        self.assertIn("답 5", out)                                # recent kept
+
+    def test_serializer_excludes_tool_traces_payloads_errors(self):
+        msgs = [
+            {"role": "assistant", "content": "Observation: raw tool output"},
+            {"role": "assistant", "content": '{"MUST_NOT_ADD": ["관직"]}'},
+            {"role": "assistant", "content": "CypherSyntaxError: bad query"},
+            {"role": "user", "content": "이규보가 쓴 시를 보여줘"},
+            {"role": "assistant", "content": "이규보의 시는 다음과 같습니다."},
+        ]
+        out = synthesis.serialize_chat_history(msgs)
+        self.assertNotIn("Observation", out)
+        self.assertNotIn("MUST_NOT_ADD", out)
+        self.assertNotIn("CypherSyntaxError", out)
+        self.assertIn("user: 이규보가 쓴 시를 보여줘", out)
+        self.assertIn("assistant: 이규보의 시는", out)
+
+    def test_serializer_accepts_langchain_style_messages(self):
+        class Msg:
+            def __init__(self, type_, content):
+                self.type, self.content = type_, content
+
+        out = synthesis.serialize_chat_history(
+            [Msg("human", "그 인물은 누구인가요?"), Msg("ai", "황진이입니다.")])
+        self.assertIn("user: 그 인물은", out)
+        self.assertIn("assistant: 황진이", out)
+
+    def test_history_rules_forbid_evidence_use_and_require_clarification(self):
+        rules = synthesis.HISTORY_RULES
+        self.assertIn("not evidence", rules)
+        self.assertIn("clarification", rules)
+        self.assertIn("pretraining", rules)
+        # agent.py wires the rules + history into the synthesis prompt
+        agent_src = _read("agent.py")
+        self.assertIn("HISTORY_RULES", agent_src)
+        self.assertIn("{chat_history}", agent_src)
+
+    def test_history_passed_to_graph_retriever_only(self):
+        received = {}
+
+        def graph_r(q, l, history_text=None):
+            received["graph"] = history_text
+            return Evidence(kind="graph")
+
+        def vector_r(q, l):                       # legacy 2-arg still works
+            received["vector"] = "called"
+            return Evidence(kind="vector")
+
+        gather_graphrag_evidence(
+            "그 인물은 어떤 시를 썼나요?", "ko",
+            graph_retriever=graph_r, vector_retriever=vector_r,
+            authority_fetcher=RecordingFetcher(),
+            history_text="user: 황진이에 대해 알려줘\nassistant: 황진이는…")
+        self.assertIn("황진이", received["graph"])
+        self.assertEqual(received["vector"], "called")
+
+    def test_graphrag_history_namespace_isolated(self):
+        agent_src = _read("agent.py")
+        self.assertIn("::graphRAG", agent_src)
+        self.assertNotIn("::textRAG", agent_src)          # never mixed
+        self.assertIn("add_user_message", agent_src)       # normal-path owner
+        self.assertIn("add_ai_message", agent_src)
+        text_src = _read("text_rag.py")
+        self.assertIn("::textRAG", text_src)
+        self.assertNotIn("::graphRAG", text_src)
+
+
+# ── textRAG wording accuracy (context work order §2) ──────────────────────────
+class TestTextRagWording(unittest.TestCase):
+    def test_no_inaccurate_graph_free_claim(self):
+        for path in ("text_rag.py", "bot.py"):
+            src = _read(path)
+            self.assertNotIn("그래프 관계를 사용하지 않고", src, path)
+            self.assertNotIn("그래프 관계 정보를 활용하지 않습니다", src, path)
+
+    def test_distinguishes_reasoning_from_citation_metadata(self):
+        for path in ("text_rag.py", "bot.py"):
+            src = _read(path)
+            self.assertIn("그래프 관계 추론", src, path)   # what it does NOT do
+            self.assertIn("출처", src, path)               # containment = citation only
+        bot_src = _read("bot.py")
+        self.assertIn("graphRAG 모드", bot_src)            # switch advice kept
+        self.assertIn("전환", bot_src)
+
+
+# ── User-safe retrieval statuses (context work order §3) ──────────────────────
+class TestRetrievalStatus(unittest.TestCase):
+    def _gather(self, graph_r, vector_r, question="이규보의 시는?"):
+        return gather_graphrag_evidence(
+            question, "ko", graph_retriever=graph_r, vector_retriever=vector_r,
+            authority_fetcher=RecordingFetcher())
+
+    def test_raising_retriever_becomes_safe_status(self):
+        def boom(q, l, h=None):
+            raise RuntimeError("CypherSyntaxError: secret detail key=abc123")
+
+        with self.assertLogs("tools.orchestrator", level="WARNING") as logs:
+            r = self._gather(boom, lambda q, l: Evidence(
+                kind="vector", documents=[{"textKor": "원문", "entry_id": "E001"}]))
+        self.assertEqual(r["statuses"]["graph"]["outcome"], "temporarily_unavailable")
+        self.assertEqual(r["statuses"]["vector"]["outcome"], "ok")
+        # diagnostics logged, never in the prompt
+        self.assertTrue(any("secret detail" in m for m in logs.output))
+        out = synthesis.format_evidence_for_prompt(r, "ko")
+        self.assertNotIn("secret detail", out)
+        self.assertNotIn("CypherSyntaxError", out)
+        self.assertNotIn("abc123", out)
+        self.assertIn("일시적으로 사용할 수 없습니다", out)   # localized safe line
+        self.assertIn("원문", out)                            # vector still answers
+
+    def test_legacy_error_claims_are_stripped_and_logged(self):
+        g = Evidence(kind="graph")
+        g.claims.append({"type": "error",
+                         "message": "CypherSyntaxError: Invalid input at line 3"})
+        with self.assertLogs("tools.orchestrator", level="WARNING"):
+            r = self._gather(lambda q, l: g, lambda q, l: Evidence(kind="vector"))
+        self.assertEqual(r["statuses"]["graph"]["outcome"], "temporarily_unavailable")
+        self.assertFalse([c for c in r["graph"].claims if c.get("type") == "error"])
+        out = synthesis.format_evidence_for_prompt(r, "ko")
+        self.assertNotIn("CypherSyntaxError", out)
+        self.assertNotIn("Invalid input", out)
+
+    def test_no_results_and_failure_render_differently(self):
+        empty = lambda q, l: Evidence(kind="graph")            # noqa: E731
+        r_none = self._gather(empty, lambda q, l: Evidence(kind="vector"))
+        self.assertEqual(r_none["statuses"]["graph"]["outcome"], "no_results")
+
+        def boom(q, l, h=None):
+            raise TimeoutError("t")
+
+        r_fail = self._gather(boom, lambda q, l: Evidence(kind="vector"))
+        out_none = synthesis.format_evidence_for_prompt(r_none, "ko")
+        out_fail = synthesis.format_evidence_for_prompt(r_fail, "ko")
+        self.assertIn("찾지 못했습니다", out_none)
+        self.assertNotIn("일시적으로 사용할 수 없습니다", out_none)
+        self.assertIn("일시적으로 사용할 수 없습니다", out_fail)
+
+    def test_both_failed_yields_localized_safe_message_only(self):
+        def boom(q, l, h=None):
+            raise RuntimeError("provider down")
+
+        r = self._gather(boom, boom)
+        self.assertTrue(synthesis.both_retrievals_failed(r["statuses"]))
+        for lang in ("ko", "en", "zh"):
+            msg = synthesis.retrieval_failure_message(lang)
+            self.assertTrue(msg)
+            self.assertNotIn("provider down", msg)
+        # single failure is NOT "both failed"
+        r_one = self._gather(boom, lambda q, l: Evidence(
+            kind="vector", documents=[{"textKor": "x"}]))
+        self.assertFalse(synthesis.both_retrievals_failed(r_one["statuses"]))
+        # agent short-circuits before any LLM call
+        self.assertIn("retrieval_failure_message", _read("agent.py"))
+
+
+# ── Authority coverage & caps (context work order §4) ─────────────────────────
+class TestAuthorityCoverage(unittest.TestCase):
+    def _run(self, entities, question="이 인물들의 생몰년을 자세히 알려줘", **kw):
+        g = Evidence(kind="graph", entities=entities)
+        f = RecordingFetcher()
+        r = gather_graphrag_evidence(
+            question, "ko", graph_retriever=lambda q, l: g,
+            vector_retriever=lambda q, l: Evidence(kind="vector"),
+            authority_fetcher=f, **kw)
+        return r, f
+
+    def test_eleven_eligible_persons_truncated_with_counts(self):
+        r, f = self._run([person(f"P{i}", wikidata=f"Q{i}") for i in range(11)])
+        cov = r["coverage"]["Person"]
+        self.assertEqual(cov, {"eligible_entity_count": 11,
+                               "enriched_entity_count": 10,
+                               "skipped_due_to_cap_count": 1})
+        self.assertEqual(len(f.calls), 10)
+        out = synthesis.format_evidence_for_prompt(r, "ko")
+        self.assertIn("인물 11명 중 10명", out)
+        self.assertIn("Authority Coverage", out)
+
+    def test_at_or_under_cap_no_truncation_note(self):
+        r, _ = self._run([person(f"P{i}", wikidata=f"Q{i}") for i in range(10)])
+        self.assertEqual(r["coverage"]["Person"]["skipped_due_to_cap_count"], 0)
+        out = synthesis.format_evidence_for_prompt(r, "ko")
+        self.assertNotIn("Authority Coverage", out)
+
+    def test_duplicates_do_not_consume_cap_twice(self):
+        g = Evidence(kind="graph",
+                     entities=[person(f"P{i}", wikidata=f"Q{i}") for i in range(10)])
+        v = Evidence(kind="vector",
+                     entities=[person(f"P{i}", wikidata=f"Q{i}") for i in range(10)])
+        f = RecordingFetcher()
+        r = gather_graphrag_evidence(
+            "이 인물들의 생몰년을 자세히 알려줘", "ko",
+            graph_retriever=lambda q, l: g, vector_retriever=lambda q, l: v,
+            authority_fetcher=f)
+        self.assertEqual(len(r["persons"]), 10)          # merged, not 20
+        self.assertEqual(r["coverage"]["Person"]["enriched_entity_count"], 10)
+        self.assertEqual(r["coverage"]["Person"]["skipped_due_to_cap_count"], 0)
+
+    def test_caps_configurable_via_argument(self):
+        r, f = self._run([person(f"P{i}", wikidata=f"Q{i}") for i in range(5)],
+                         person_cap=2)
+        self.assertEqual(len(f.calls), 2)
+        self.assertEqual(r["coverage"]["Person"]["skipped_due_to_cap_count"], 3)
+
+    def test_poem_list_query_still_zero_calls_and_no_coverage(self):
+        r, f = self._run([person("P1", wikidata="Q1")],
+                         question="황진이는 어떤 시를 썼나요?")
+        self.assertEqual(f.calls, [])
+        self.assertEqual(r["coverage"], {})
+        self.assertNotIn("Authority Coverage",
+                         synthesis.format_evidence_for_prompt(r, "ko"))
+
+    def test_exhaustive_request_never_claims_completeness(self):
+        # Even with explicit compare/exhaustive wording, the cap stays bounded,
+        # the coverage note is still produced, and the synthesis rules forbid a
+        # completeness claim while the note is present.
+        r, f = self._run([person(f"P{i}", wikidata=f"Q{i}") for i in range(12)],
+                         question="관련 인물 전부를 여러 출처로 빠짐없이 비교해줘")
+        self.assertEqual(r["coverage"]["Person"]["skipped_due_to_cap_count"], 2)
+        self.assertIn("Authority Coverage",
+                      synthesis.format_evidence_for_prompt(r, "ko"))
+        self.assertIn("Never claim the authority", synthesis.SYNTHESIS_SYSTEM_RULES)
+
+    def test_default_constants(self):
+        from tools import orchestrator as orch
+        self.assertEqual(orch.DEFAULT_PERSON_AUTHORITY_CAP, 10)
+        self.assertEqual(orch.DEFAULT_PLACE_AUTHORITY_CAP, 5)
+        self.assertEqual(orch.DEFAULT_FETCHABLE_SOURCES_PER_ENTITY, 2)
+        self.assertEqual(orch.EXHAUSTIVE_SOURCES_PER_ENTITY, 4)
 
 
 def _read(rel_path):

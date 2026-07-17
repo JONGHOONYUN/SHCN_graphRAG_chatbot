@@ -655,8 +655,26 @@ def cypher_qa_safe(question: str) -> str:
 # RAW Cypher result rows — NOT the LLM-written answer string. It never produces
 # user-facing prose. The row→evidence normalization lives in tools/evidence.py
 # (graph_rows_to_evidence) so it is unit-testable without a live Neo4j.
+#
+# Failure policy (user-safe statuses): exceptions are logged with a correlation
+# code; the returned Evidence carries only {"type": "status", "outcome": ...} —
+# raw exception text never enters Evidence and never reaches the synthesis LLM.
 # ──────────────────────────────────────────────
+import logging  # noqa: E402
+import uuid  # noqa: E402
+
 from tools.evidence import Evidence, graph_rows_to_evidence  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+
+def _status_evidence(outcome: str, exc: Exception) -> Evidence:
+    code = uuid.uuid4().hex[:8]
+    logger.warning("graph retrieval failed [%s]: %s: %s",
+                   code, type(exc).__name__, exc)
+    ev = Evidence(kind="graph")
+    ev.claims.append({"type": "status", "outcome": outcome})
+    return ev
 
 
 def _extract_intermediate(result: dict):
@@ -675,21 +693,33 @@ def _extract_intermediate(result: dict):
     return cypher, rows
 
 
-def retrieve_graph_evidence(question: str) -> Evidence:
-    """Run graph retrieval and return structured Evidence (rows + Person
-    entities + provenance). On failure returns an empty graph Evidence with an
-    error claim rather than raising, so the orchestrator can still use vector
-    evidence."""
+def retrieve_graph_evidence(question: str,
+                            history_text: str | None = None) -> Evidence:
+    """Run graph retrieval and return structured Evidence (rows + entities +
+    provenance).
+
+    `history_text` is a BOUNDED serialization of recent conversation, used only
+    so the Cypher generator can resolve pronouns/ellipsis ("그 인물" 등). Prior
+    assistant assertions are context, never evidence — the rows returned by
+    Neo4j remain the only graph facts.
+
+    On failure returns an empty graph Evidence carrying only a user-safe status
+    claim; the exception itself is logged with a correlation code and never
+    placed in Evidence."""
+    query = question
+    if history_text:
+        query = (
+            f"{question}\n\n"
+            "[이전 대화 맥락 — 지시어·생략 해석 전용. 아래 내용은 검색 조건 해석에만 "
+            "사용하고, 사실(근거)로 취급하지 말 것]\n"
+            f"{history_text}"
+        )
     try:
-        result = cypher_qa_structured.invoke({"query": question})
+        result = cypher_qa_structured.invoke({"query": query})
     except (CypherSyntaxError, ClientError) as e:
-        ev = Evidence(kind="graph")
-        ev.claims.append({"type": "error", "message": f"{type(e).__name__}: {e}"})
-        return ev
+        return _status_evidence("temporarily_unavailable", e)
     except Exception as e:  # transient LLM/parse issues — degrade gracefully
-        ev = Evidence(kind="graph")
-        ev.claims.append({"type": "error", "message": f"{type(e).__name__}: {str(e)[:120]}"})
-        return ev
+        return _status_evidence("temporarily_unavailable", e)
 
     if not isinstance(result, dict):
         return Evidence(kind="graph")

@@ -45,9 +45,13 @@ from tools.cypher import cypher_qa_safe
 from tools.external_authority import external_authority_lookup
 from tools.orchestrator import gather_graphrag_evidence
 from tools.synthesis import (
+    HISTORY_RULES,
     SYNTHESIS_SYSTEM_RULES,
+    both_retrievals_failed,
     build_citations,
     format_evidence_for_prompt,
+    retrieval_failure_message,
+    serialize_chat_history,
 )
 
 chat_prompt = ChatPromptTemplate.from_messages(
@@ -611,9 +615,11 @@ chat_agent = RunnableWithMessageHistory(
 # ──────────────────────────────────────────────
 synthesis_prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", "{language_directive}\n\n" + SYNTHESIS_SYSTEM_RULES),
+        ("system",
+         "{language_directive}\n\n" + SYNTHESIS_SYSTEM_RULES + "\n\n" + HISTORY_RULES),
         (
             "human",
+            "이전 대화 (지시어·생략 해석 전용 — 근거 아님):\n{chat_history}\n\n"
             "질문(원문 그대로): {question}\n\n"
             "다음은 검색으로 수집한 구조화된 근거 블록입니다. 이 근거만 사용하세요.\n"
             "{evidence_blocks}\n\n"
@@ -626,21 +632,64 @@ synthesis_prompt = ChatPromptTemplate.from_messages(
 synthesis_chain = synthesis_prompt | llm | StrOutputParser()
 
 
+def _graphrag_history(session_id: str):
+    """graphRAG 전용 Neo4j 이력 핸들 (textRAG 이력과 ::graphRAG suffix로 분리)."""
+    return Neo4jChatMessageHistory(session_id=f"{session_id}::graphRAG", graph=graph)
+
+
+def _load_bounded_history(session_id: str) -> str:
+    """직전 대화를 bounded 직렬화. 이력 조회 실패는 답변을 막지 않는다(빈 이력)."""
+    try:
+        return serialize_chat_history(_graphrag_history(session_id).messages)
+    except Exception:
+        return ""
+
+
 def synthesize_answer(user_input: str, user_language: str) -> str:
-    """graphRAG 최종 합성. 구조화된 근거를 모아 단일 LLM 호출로 답변 생성."""
-    evidence = gather_graphrag_evidence(user_input, user_language)
+    """graphRAG 최종 합성. bounded 대화 이력 + 구조화된 근거로 단일 LLM 호출.
+
+    이력 정책 (persistence 소유권):
+    - 정상 경로(이 함수)가 성공 답변을 반환하기 직전에 user/assistant 메시지를
+      ::graphRAG 이력에 저장한다.
+    - 레거시 ReAct 폴백 경로는 RunnableWithMessageHistory가 자체 저장하므로,
+      이 함수가 빈 출력/예외로 폴백에 넘어간 경우 여기서는 저장하지 않는다
+      (이중 저장 방지 — 경로당 소유자 1곳).
+    """
+    session_id = get_session_id()
+    history_text = _load_bounded_history(session_id)
+
+    evidence = gather_graphrag_evidence(
+        user_input, user_language, history_text=history_text or None)
+
+    # 그래프·벡터 검색이 모두 일시 불가하고 외부 근거도 없으면, pretraining으로
+    # 메우지 않고 즉시 락 언어 안내를 반환한다 (LLM 호출 없음).
+    if both_retrievals_failed(evidence.get("statuses") or {}) \
+            and not evidence["external"].claims:
+        return retrieval_failure_message(user_language)
+
     evidence_blocks = format_evidence_for_prompt(evidence, user_language)
     citations = build_citations(evidence)
     suggested = "\n".join(citations) if citations else "(no pre-computed citations)"
 
-    return synthesis_chain.invoke(
+    output = synthesis_chain.invoke(
         {
             "language_directive": _build_language_directive(user_language),
+            "chat_history": history_text or "(이전 대화 없음)",
             "question": user_input,
             "evidence_blocks": evidence_blocks,
             "suggested_citations": suggested,
         }
     )
+
+    if output and output.strip():
+        # 성공 답변만 저장. 저장 실패는 답변을 막지 않는다.
+        try:
+            hist = _graphrag_history(session_id)
+            hist.add_user_message(user_input)
+            hist.add_ai_message(output)
+        except Exception:
+            pass
+    return output
 
 
 def generate_response(user_input):

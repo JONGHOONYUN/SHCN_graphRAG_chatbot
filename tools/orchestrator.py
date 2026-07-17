@@ -17,6 +17,9 @@ network, or streamlit-bound modules.
 
 from __future__ import annotations
 
+import logging
+import os
+import uuid
 from typing import Callable, Optional
 
 from tools.evidence import Entity, Evidence, Provenance, collect_entities
@@ -26,10 +29,50 @@ from tools.external_authority import (
     sources_for_node_type,
 )
 
-# Caps: a broad result set must not fan out into unbounded external calls.
-DEFAULT_PERSON_CAP = 3
-DEFAULT_PLACE_CAP = 2
-DEFAULT_SOURCES_PER_ENTITY = 2   # raised when the user asks to compare sources
+logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────
+# Authority-enrichment caps (bounded, configurable — work order §4)
+#
+# Defaults can be overridden via environment variables or Streamlit secrets
+# (AUTHORITY_PERSON_CAP / AUTHORITY_PLACE_CAP / AUTHORITY_SOURCES_PER_ENTITY).
+# Caps are never removed: an explicit cross-source comparison request raises the
+# per-entity source limit only to the documented EXHAUSTIVE bound below.
+# ──────────────────────────────────────────────
+DEFAULT_PERSON_AUTHORITY_CAP = 10
+DEFAULT_PLACE_AUTHORITY_CAP = 5
+DEFAULT_FETCHABLE_SOURCES_PER_ENTITY = 2
+EXHAUSTIVE_SOURCES_PER_ENTITY = 4   # documented bounded ceiling for compare asks
+
+# Legacy aliases (previous defaults were 3/2; names kept for compatibility).
+DEFAULT_PERSON_CAP = DEFAULT_PERSON_AUTHORITY_CAP
+DEFAULT_PLACE_CAP = DEFAULT_PLACE_AUTHORITY_CAP
+DEFAULT_SOURCES_PER_ENTITY = DEFAULT_FETCHABLE_SOURCES_PER_ENTITY
+
+
+_config_cache: dict = {}
+
+
+def _config_int(name: str, default: int) -> int:
+    """Read a bounded-cap override from env or Streamlit secrets; fall back to
+    the default on any error. Never returns a negative value. Resolved once per
+    process (cached) — restart to change."""
+    if name in _config_cache:
+        return _config_cache[name]
+    raw = os.environ.get(name)
+    if raw is None:
+        try:
+            import streamlit as st
+
+            raw = st.secrets.get(name)  # type: ignore[attr-defined]
+        except Exception:
+            raw = None
+    try:
+        value = max(0, int(raw)) if raw is not None else default
+    except (TypeError, ValueError):
+        value = default
+    _config_cache[name] = value
+    return value
 
 
 # ──────────────────────────────────────────────
@@ -95,22 +138,84 @@ def authority_intent(question: str, language: str = "ko") -> dict:
     questions reliably reach Place authorities."""
     person = _matches(question, _PERSON_CUES)
     place = _matches(question, _PLACE_CUES)
-    return {"Person": person, "Place": place, "compare": _matches(question, _COMPARE_CUES)}
+    compare = _matches(question, _COMPARE_CUES)
+    # An explicit cross-source comparison request IS an authority request even
+    # without a separate biographical cue ("여러 출처로 비교해줘").
+    if compare and not (person or place):
+        person = True
+    return {"Person": person, "Place": place, "compare": compare}
 
 
 # ──────────────────────────────────────────────
 # Lazy default dependencies (kept out of the import path for tests)
 # ──────────────────────────────────────────────
-def _default_graph_retriever(question: str, language: str) -> Evidence:
+def _default_graph_retriever(question: str, language: str,
+                             history_text: Optional[str] = None) -> Evidence:
     from tools.cypher import retrieve_graph_evidence
 
-    return retrieve_graph_evidence(question)
+    return retrieve_graph_evidence(question, history_text=history_text)
 
 
-def _default_vector_retriever(question: str, language: str) -> Evidence:
+def _default_vector_retriever(question: str, language: str,
+                              history_text: Optional[str] = None) -> Evidence:
+    # Vector search embeds the CURRENT question only: mixing serialized history
+    # into the embedding would degrade similarity matching. History-based
+    # reference resolution happens in graph retrieval and final synthesis.
     from tools.vector import retrieve_sihwa_evidence
 
     return retrieve_sihwa_evidence(question, language)
+
+
+# ──────────────────────────────────────────────
+# User-safe retrieval status (work order §3)
+#
+# Retriever failures never surface raw exception text to the synthesis prompt:
+# diagnostics go to server logs with a correlation code, evidence keeps only a
+# stable outcome token, and tools/synthesis.py renders the localized wording.
+# ──────────────────────────────────────────────
+def _safe_retrieve(fn: Callable, question: str, language: str,
+                   history_text: Optional[str], kind: str) -> tuple:
+    """Run one retriever; returns (Evidence, status_dict). Any raised exception
+    or legacy error claim is normalized into a user-safe status."""
+    try:
+        try:
+            ev = fn(question, language, history_text)
+        except TypeError:
+            ev = fn(question, language)     # injected 2-arg retrievers (tests)
+    except Exception as e:
+        code = uuid.uuid4().hex[:8]
+        logger.warning("%s retrieval failed [%s]: %s: %s",
+                       kind, code, type(e).__name__, e)
+        return Evidence(kind=kind), {"source": kind,
+                                     "outcome": "temporarily_unavailable"}
+    ev = ev or Evidence(kind=kind)
+    return _normalize_evidence_status(ev, kind)
+
+
+def _normalize_evidence_status(ev: Evidence, kind: str) -> tuple:
+    """Strip technical error claims out of Evidence (logging them instead) and
+    derive the user-safe outcome. 'no_results' is NOT an error state."""
+    outcome = None
+    kept = []
+    for claim in ev.claims or []:
+        ctype = claim.get("type") if isinstance(claim, dict) else None
+        if ctype == "error":
+            # Legacy shape carrying raw exception text — log-only, never kept.
+            code = uuid.uuid4().hex[:8]
+            logger.warning("%s retrieval error claim [%s]: %s",
+                           kind, code, claim.get("message"))
+            outcome = outcome or "temporarily_unavailable"
+            continue
+        if ctype == "status":
+            if claim.get("outcome") in ("temporarily_unavailable",
+                                        "invalid_query", "no_results"):
+                outcome = claim.get("outcome")
+            continue                        # status claims are never rendered
+        kept.append(claim)
+    ev.claims = kept
+    if outcome is None:
+        outcome = "ok" if ev.documents else "no_results"
+    return ev, {"source": kind, "outcome": outcome}
 
 
 def _default_authority_fetcher(source: str, ext_id: str, language: str,
@@ -129,16 +234,27 @@ def _call_fetcher(fetcher: Callable, source: str, ext_id: str, language: str,
         return fetcher(source, ext_id, language)
 
 
+def _has_valid_fetchable_id(entity: Entity, node_type: str) -> bool:
+    """True when the entity carries at least one registry-valid fetchable ID for
+    its node type (link-only IDs alone do not make it cap-eligible)."""
+    for cfg in sources_for_node_type(node_type, capability=CAPABILITY_FETCHABLE):
+        ext_id = entity.authority_ids.get(cfg.id_key)
+        if ext_id and cfg.validate_id(ext_id):
+            return True
+    return False
+
+
 def gather_graphrag_evidence(
     question: str,
     language: str = "ko",
     *,
-    graph_retriever: Optional[Callable[[str, str], Evidence]] = None,
-    vector_retriever: Optional[Callable[[str, str], Evidence]] = None,
+    graph_retriever: Optional[Callable] = None,
+    vector_retriever: Optional[Callable] = None,
     authority_fetcher: Optional[Callable] = None,
-    person_cap: int = DEFAULT_PERSON_CAP,
-    place_cap: int = DEFAULT_PLACE_CAP,
-    sources_per_entity: int = DEFAULT_SOURCES_PER_ENTITY,
+    history_text: Optional[str] = None,
+    person_cap: Optional[int] = None,
+    place_cap: Optional[int] = None,
+    sources_per_entity: Optional[int] = None,
     want_authority: Optional[bool] = None,
 ) -> dict:
     """Collect graph + vector + (optional) external authority evidence.
@@ -152,20 +268,34 @@ def gather_graphrag_evidence(
           "entities": list[Entity],   # de-duplicated Person + Place
           "persons":  list[Entity],   # compatibility view
           "places":   list[Entity],
+          "statuses": {"graph": {source, outcome}, "vector": {...}},  # user-safe
+          "coverage": {"Person": {eligible_entity_count, enriched_entity_count,
+                                  skipped_due_to_cap_count}, "Place": {...}},
           "authority_attempted": bool,
         }
 
     Sequence: graph → vector → collect entities → de-duplicate → registry-driven
     selection → capped, de-duplicated fetches → link-only references recorded
-    separately. Enrichment is OPTIONAL: failures record an unavailable/error
-    status and never abort the response.
-    """
+    separately. `history_text` (bounded prior conversation) is forwarded to
+    graph retrieval for reference resolution only. Retrieval failures become
+    user-safe statuses; enrichment failures never abort the response. External
+    fetches stay sequential (bounded, provider-friendly — no unbounded
+    concurrency)."""
     graph_retriever = graph_retriever or _default_graph_retriever
     vector_retriever = vector_retriever or _default_vector_retriever
     authority_fetcher = authority_fetcher or _default_authority_fetcher
+    if person_cap is None:
+        person_cap = _config_int("AUTHORITY_PERSON_CAP", DEFAULT_PERSON_AUTHORITY_CAP)
+    if place_cap is None:
+        place_cap = _config_int("AUTHORITY_PLACE_CAP", DEFAULT_PLACE_AUTHORITY_CAP)
+    if sources_per_entity is None:
+        sources_per_entity = _config_int(
+            "AUTHORITY_SOURCES_PER_ENTITY", DEFAULT_FETCHABLE_SOURCES_PER_ENTITY)
 
-    graph_ev = graph_retriever(question, language) or Evidence(kind="graph")
-    vector_ev = vector_retriever(question, language) or Evidence(kind="vector")
+    graph_ev, graph_status = _safe_retrieve(
+        graph_retriever, question, language, history_text, "graph")
+    vector_ev, vector_status = _safe_retrieve(
+        vector_retriever, question, language, history_text, "vector")
 
     entities = collect_entities(graph_ev, vector_ev)
     persons = [e for e in entities if (e.node_type or "Person") == "Person"]
@@ -177,22 +307,30 @@ def gather_graphrag_evidence(
     elif want_authority is False:
         intent = {"Person": False, "Place": False, "compare": False}
 
-    max_sources = 99 if intent.get("compare") else sources_per_entity
+    # An explicit cross-source comparison raises the per-entity source limit
+    # only to the documented bounded ceiling — caps are never removed.
+    max_sources = (max(EXHAUSTIVE_SOURCES_PER_ENTITY, sources_per_entity)
+                   if intent.get("compare") else sources_per_entity)
 
     external_ev = Evidence(kind="external")
-    seen: set = set()          # (key|node_type|id) already requested
+    seen: set = set()          # source|node_type|original_id already requested
     attempted = False
+    coverage: dict = {}
 
     for group, cap in ((persons, person_cap), (places, place_cap)):
         node_type = "Person" if group is persons else "Place"
         if not intent.get(node_type):
             continue
-        enriched = 0
+        eligible = enriched = skipped = 0
         for entity in group:
-            if enriched >= cap:
-                break
             if not entity.has_authority_id():
                 continue        # never look up from a name alone
+            fetch_eligible = _has_valid_fetchable_id(entity, node_type)
+            if fetch_eligible:
+                eligible += 1
+                if enriched >= cap:
+                    skipped += 1
+                    continue    # cap reached — counted, reported, not fetched
             hit = _enrich_entity(
                 entity, node_type, external_ev, seen, authority_fetcher,
                 language, max_sources,
@@ -200,6 +338,20 @@ def gather_graphrag_evidence(
             if hit:
                 enriched += 1
                 attempted = True
+        if eligible or enriched:
+            coverage[node_type] = {
+                "eligible_entity_count": eligible,
+                "enriched_entity_count": enriched,
+                "skipped_due_to_cap_count": skipped,
+            }
+            if skipped > 0:
+                # Structured, user-safe coverage note (rendered by synthesis).
+                external_ev.claims.append({
+                    "type": "coverage", "node_type": node_type,
+                    "eligible_entity_count": eligible,
+                    "enriched_entity_count": enriched,
+                    "skipped_due_to_cap_count": skipped,
+                })
 
     return {
         "question": question,
@@ -210,6 +362,8 @@ def gather_graphrag_evidence(
         "entities": entities,
         "persons": persons,
         "places": places,
+        "statuses": {"graph": graph_status, "vector": vector_status},
+        "coverage": coverage,
         "authority_attempted": attempted,
     }
 
