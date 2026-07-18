@@ -381,6 +381,17 @@ Use these path patterns for common query types:
   requests more results.
 - Ignore Edition nodes entirely. Do not query, traverse, or return them.
 - Do not invent property names. Use only the properties listed in Section # Property Naming.
+- APOSTROPHE ESCAPING (CRITICAL): Romanized Korean names frequently contain
+  apostrophes (Ch'wisŏn, Kim Ch'ŏn-t'aek, T'aejong). Cypher does NOT support
+  SQL-style doubled quotes ('') — writing 'Ch''wisŏn' is a SYNTAX ERROR.
+  Whenever a string literal contains an apostrophe, wrap the literal in
+  DOUBLE QUOTES instead:
+      ✓ p.nameMR CONTAINS "Ch'wisŏn"
+      ✓ p.nameEng CONTAINS "Kim Ch'ŏn-t'aek"
+      ✗ p.nameMR CONTAINS 'Ch''wisŏn'   ← SQL-style escaping — INVALID in Cypher
+      ✗ p.nameMR CONTAINS 'Ch'wisŏn'    ← unescaped — INVALID
+  (Escaping with a backslash 'Ch\\'wisŏn' also works, but double quotes are
+  preferred for readability.)
 
 
 ## Response Constraints
@@ -540,6 +551,13 @@ Cypher: MATCH (author:Person)<-[:HAS_CREATOR]-(target_poem:Poem)
                c.textKor AS critique_text,
                c.id AS critique_id LIMIT 20
 
+Q: What did Ch'wisŏn write?  (romanized name with apostrophe — use DOUBLE-quoted literals)
+Cypher: MATCH (p:Person)-[:HAS_CREATOR]-(poem:Poem)
+        WHERE p.nameMR CONTAINS "Ch'wisŏn" OR p.nameEng CONTAINS "Ch'wisŏn"
+        RETURN p.nameKor, p.nameChi, p.nameEng, p.id AS person_id,
+               p.idAKSdigerati AS aks_digerati_id,
+               poem.textChi, poem.textKor, poem.textEng LIMIT 20
+
 Q: 여성에게 보낸 시를 지은 남성 시인들과 그 시는?  (HAS_AUDIENCE + gender filter)
 Cypher: MATCH (poet:Person)-[:HAS_GENDER]->(:Topic {{nameEng: 'male'}}),
               (poet)<-[:HAS_CREATOR]-(poem:Poem)-[:HAS_AUDIENCE]->(recipient:Person),
@@ -594,6 +612,16 @@ cypher_qa_structured = GraphCypherQAChain.from_llm(
 # 중단되어 사용자가 에러 페이지를 보게 됨. wrapper로 예외를 잡아 agent가
 # 다음 iteration에서 vector search 등 다른 tool로 fallback 가능하게 함.
 # ──────────────────────────────────────────────
+
+# CypherSyntaxError 재시도용 힌트. 가장 흔한 실패 원인은 로마자 이름의
+# 아포스트로피(Ch'wisŏn 등)를 SQL식 ''로 이스케이프하는 것 — Cypher에서는
+# 문법 오류다. 재시도 시 질문에 이 힌트를 덧붙여 재생성을 유도한다.
+_SYNTAX_RETRY_HINT = (
+    "\n\n[SYSTEM NOTE] The previously generated Cypher was rejected with a "
+    "syntax error. If any string literal contains an apostrophe (e.g. "
+    "Ch'wisŏn), wrap that literal in DOUBLE quotes (\"Ch'wisŏn\") — never "
+    "escape it SQL-style by doubling (''). Regenerate the query accordingly."
+)
 def cypher_qa_safe(question: str) -> str:
     """GraphCypherQAChain 호출 wrapper.
 
@@ -605,9 +633,10 @@ def cypher_qa_safe(question: str) -> str:
       3. 한 번 자동 재시도 (transient Gemini 이슈에 대한 회복)
     """
     last_error_msg = None
-    for _ in range(2):  # 첫 시도 + 1회 재시도
+    query = question
+    for attempt in range(2):  # 첫 시도 + 1회 재시도
         try:
-            result = cypher_qa.invoke({"query": question})
+            result = cypher_qa.invoke({"query": query})
             if isinstance(result, dict):
                 # LangChain 버전별 output key 불일치 대응
                 answer = (
@@ -620,6 +649,11 @@ def cypher_qa_safe(question: str) -> str:
                 return "No graph results found."
             return str(result)
         except CypherSyntaxError:
+            if attempt == 0:
+                # 아포스트로피 이스케이프 힌트를 덧붙여 Cypher 재생성 시도
+                query = question + _SYNTAX_RETRY_HINT
+                last_error_msg = "CypherSyntaxError (retried with escaping hint)"
+                continue
             return (
                 "Graph query failed (Cypher syntax error). "
                 "Try rephrasing the question, or fall back to Sihwa Content Search."
@@ -716,7 +750,16 @@ def retrieve_graph_evidence(question: str,
         )
     try:
         result = cypher_qa_structured.invoke({"query": query})
-    except (CypherSyntaxError, ClientError) as e:
+    except CypherSyntaxError as e:
+        # 흔한 원인: 로마자 이름의 아포스트로피(Ch'wisŏn)를 SQL식 ''로
+        # 이스케이프한 잘못된 Cypher. 힌트를 덧붙여 1회 재생성 시도.
+        logger.info("Cypher syntax error — retrying with escaping hint: %s", e)
+        try:
+            result = cypher_qa_structured.invoke(
+                {"query": query + _SYNTAX_RETRY_HINT})
+        except Exception as e2:
+            return _status_evidence("temporarily_unavailable", e2)
+    except ClientError as e:
         return _status_evidence("temporarily_unavailable", e)
     except Exception as e:  # transient LLM/parse issues — degrade gracefully
         return _status_evidence("temporarily_unavailable", e)
