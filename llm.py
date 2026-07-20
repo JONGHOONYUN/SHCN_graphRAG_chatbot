@@ -1,145 +1,322 @@
-import streamlit as st
+"""LLM and embedding client construction.
 
-# ──────────────────────────────────────────────
-# LLM 모델 초기화
-# ChatGoogleGenerativeAI: LangChain에서 Google Gemini 모델을 사용하기 위한 클래스
-# ──────────────────────────────────────────────
+Phase 5 hardening:
+  * The embedding model is pinned via `GOOGLE_EMBEDDING_MODEL` in secrets.
+    Auto-discovery is NOT run in the request path — it belongs to a
+    one-shot admin task and is opt-in via `discover_available_model()`.
+  * HTTP calls use bounded exponential backoff with jitter, honour the
+    server's `Retry-After` header for 429/503, and never retry 4xx auth
+    errors. The old 60-second fixed sleep is gone — a live user session is
+    never blocked that long.
+  * Every response is validated (HTTP status, JSON schema, numeric vector,
+    expected length) before any value reaches Neo4j / the retriever.
+  * `embed_documents([])` returns `[]` with ZERO network calls.
+
+Module import performs NO network I/O; the Gemini and embedding clients are
+created only when their factories are called (Phase 2 auth-gated init).
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+import time
+from typing import List, Optional, Sequence
+
+import requests
+import streamlit as st
+from langchain_core.embeddings import Embeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-# 참고: safety_settings 파라미터는 langchain-google-genai 버전마다 enum 타입과
-# 형식이 달라 호환성 이슈가 있다. 학술 텍스트의 safety filter false positive로 인한
-# "No generation chunks were returned" 에러는 agent.py의 generate_response에서
-# try/except로 잡아 사용자 친화 안내문으로 변환하는 방식으로 우회한다.
+from errors import ConfigurationError, ModelResponseError, TransientProviderError
+
+logger = logging.getLogger(__name__)
+
+
+# ── Chat LLM ────────────────────────────────────────────────────────────────
+# `safety_settings` remains removed: langchain-google-genai 4.2.1 rejects the
+# format we previously used with a pydantic ValidationError. The academic-
+# text false-positive `No generation chunks were returned` is now handled by
+# the top-level fallback policy in `agent.generate_response` (Phase 3).
 llm = ChatGoogleGenerativeAI(
-    google_api_key=st.secrets["GOOGLE_API_KEY"],  # Google AI Studio API 키
-    model=st.secrets["GOOGLE_MODEL"],              # 사용할 Gemini 모델명 (secrets.toml에서 관리)
-    temperature=0,                                 # 0: 가장 결정론적 응답 → 할루시네이션 최소화
-    convert_system_message_to_human=True,          # Gemini는 system role 미지원 → human role로 자동 변환
+    google_api_key=st.secrets["GOOGLE_API_KEY"],
+    model=st.secrets["GOOGLE_MODEL"],
+    temperature=0,
+    convert_system_message_to_human=True,
 )
 
 
-# ──────────────────────────────────────────────
-# 임베딩 모델 초기화
-# langchain_google_genai 2.x / google-generativeai 0.8.x 모두 v1beta API만 사용하여
-# text-embedding-004가 404를 반환하는 문제 발생.
-# 두 SDK를 우회하여 Google REST API v1 엔드포인트를 직접 호출하는 커스텀 클래스 사용.
-# ──────────────────────────────────────────────
-import requests
-import time
-from langchain_core.embeddings import Embeddings  # LangChain 표준 임베딩 인터페이스
-from typing import List
+# ── HTTP retry policy ───────────────────────────────────────────────────────
+_MAX_RETRIES = 3                     # total attempts INCLUDING the first
+_BASE_BACKOFF_SECONDS = 1.0          # exp base — bounded, not the old 60s
+_MAX_BACKOFF_SECONDS = 8.0           # cap so live sessions stay responsive
+_REQUEST_TIMEOUT_SECONDS = (5, 30)   # (connect, read)
 
-# 429 발생 시 재시도 설정
-MAX_RETRIES = 3        # 최대 재시도 횟수
-RETRY_DELAY = 60       # 429 응답 시 대기 시간(초) — Free tier 분당 제한 초기화 대기
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
-# 모델 우선순위 목록: 앞에서부터 순서대로 시도하여 최초 성공한 모델을 사용
-# Google이 모델을 폐기하더라도 다음 모델로 자동 전환
-EMBEDDING_MODEL_CANDIDATES = [
-    "models/gemini-embedding-001",        # 1순위: Gemini 기본 임베딩 모델 (안정 버전)
-    "models/gemini-embedding-2-preview",  # 2순위: Gemini 임베딩 2세대 프리뷰 (최신 버전)
-]
 
-def _find_available_model(api_key: str) -> str:
-    """
-    후보 모델 목록을 순서대로 시도하여 실제로 응답하는 모델명을 반환.
-    모든 모델이 실패할 경우 예외를 발생시킴.
-    """
-    base_url = "https://generativelanguage.googleapis.com/v1beta"
-    test_payload = {
-        "content": {"parts": [{"text": "test"}]}
-    }
-    for model in EMBEDDING_MODEL_CANDIDATES:
-        test_payload["model"] = model
-        url = f"{base_url}/{model}:embedContent"
-        try:
-            resp = requests.post(url, params={"key": api_key}, json=test_payload, timeout=10)
-            if resp.status_code == 200:
-                return model  # 정상 응답한 첫 번째 모델 반환
-        except requests.RequestException:
-            continue  # 네트워크 오류 시 다음 모델로 시도
-    raise RuntimeError(
-        f"사용 가능한 임베딩 모델을 찾을 수 없습니다. 확인된 후보: {EMBEDDING_MODEL_CANDIDATES}\n"
-        "Google AI Studio에서 API 키 권한 및 사용 가능한 모델 목록을 확인하세요."
-    )
+def _sleep_before_retry(response: Optional[requests.Response],
+                        attempt: int,
+                        sleeper=time.sleep,
+                        rng=random.random) -> None:
+    """Honour Retry-After when present; otherwise bounded exp backoff+jitter."""
+    delay: Optional[float] = None
+    if response is not None:
+        raw = response.headers.get("Retry-After")
+        if raw:
+            try:
+                delay = float(raw)
+            except (TypeError, ValueError):
+                delay = None
+    if delay is None:
+        delay = min(_MAX_BACKOFF_SECONDS,
+                    _BASE_BACKOFF_SECONDS * (2 ** attempt))
+        delay += rng() * 0.5   # jitter
+    sleeper(delay)
 
 
 class GoogleEmbeddings(Embeddings):
-    """
-    Google Generative AI REST API v1을 직접 호출하는 LangChain 호환 임베딩 클래스.
-    - embed_query: 단일 텍스트 임베딩 (벡터 검색 질의 시 사용)
-    - embed_documents: 다수 텍스트 일괄 임베딩 (Neo4j 인덱스 구축 시 사용)
+    """LangChain-compatible embedding client for Google's REST API v1.
+
+    Model pinning: `model` is required. If not passed, it is read from
+    `st.secrets["GOOGLE_EMBEDDING_MODEL"]`. If neither is set, a
+    `ConfigurationError` is raised — the client refuses to auto-discover in
+    the request path.
+
+    Dimension pinning: `expected_dim`, if supplied, is checked on every
+    response so a silent server-side model swap can never poison the vector
+    index. When absent, the first successful response initializes it.
     """
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: Optional[str] = None,
+                 expected_dim: Optional[int] = None,
+                 session: Optional[requests.Session] = None) -> None:
+        if not api_key:
+            raise ConfigurationError("GOOGLE_API_KEY is empty")
+        if model is None:
+            try:
+                model = st.secrets["GOOGLE_EMBEDDING_MODEL"]
+            except Exception as exc:
+                raise ConfigurationError(
+                    "GOOGLE_EMBEDDING_MODEL is not configured. Set it in "
+                    "secrets.toml — auto-discovery is disabled in the "
+                    "request path."
+                ) from exc
+        if not model:
+            raise ConfigurationError("embedding model name is empty")
         self.api_key = api_key
+        self.model = model
+        self.expected_dim = expected_dim
         self.base_url = "https://generativelanguage.googleapis.com/v1beta"
+        self.embed_url = f"{self.base_url}/{model}:embedContent"
+        self.batch_url = f"{self.base_url}/{model}:batchEmbedContents"
+        self._session = session or requests.Session()
 
-        # 앱 시작 시 사용 가능한 모델을 자동 탐색하여 고정
-        self.model = _find_available_model(api_key)
-        self.embed_url = f"{self.base_url}/{self.model}:embedContent"
-        self.batch_url = f"{self.base_url}/{self.model}:batchEmbedContents"
-
+    # ── Public API ─────────────────────────────────────────────────────────
     def embed_query(self, text: str) -> List[float]:
+        """Embed a single query. Returns a list[float] of length
+        `expected_dim` (or whatever the model returned on first successful
+        response)."""
+        response_json = self._post_with_retry(
+            self.embed_url,
+            {"model": self.model, "content": {"parts": [{"text": text}]}},
+        )
+        vector = self._extract_single_vector(response_json)
+        self._check_dimension([vector])
+        return vector
+
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """Batch-embed. Returns `[]` with NO network call when `texts` is
+        empty — the old code called the API with an empty array and could
+        fail 400 or return an unexpected shape."""
+        if not texts:
+            return []
+        payload = {
+            "requests": [
+                {"model": self.model, "content": {"parts": [{"text": t}]}}
+                for t in texts
+            ]
+        }
+        response_json = self._post_with_retry(self.batch_url, payload)
+        vectors = self._extract_batch_vectors(response_json, len(texts))
+        self._check_dimension(vectors)
+        return vectors
+
+    # ── HTTP + retry ───────────────────────────────────────────────────────
+    def _post_with_retry(self, url: str, payload: dict,
+                         *, sleeper=time.sleep, rng=random.random) -> dict:
+        """POST with bounded retry.
+
+        Retryable: 429 + 5xx (subset above).
+        Non-retryable: 4xx auth/validation errors (400/401/403/404), any
+        response body that fails validation (invalid JSON / wrong content
+        type / no numeric vector).
         """
-        단일 텍스트를 벡터로 변환.
-        사용자 질문을 Neo4j 벡터 인덱스 검색에 사용할 수 있는 형태로 변환.
-        429(요청 초과) 발생 시 RETRY_DELAY초 대기 후 MAX_RETRIES회 재시도.
-        반환값: float 리스트 (예: 3072차원 벡터)
-        """
-        for attempt in range(MAX_RETRIES):
-            response = requests.post(
-                self.embed_url,
-                params={"key": self.api_key},
-                json={
-                    "model": self.model,
-                    "content": {"parts": [{"text": text}]}
-                },
-                timeout=30
-            )
-            if response.status_code == 429:
-                # API 분당 요청 제한 초과 — 대기 후 재시도
-                # 마지막 시도에서도 429면 아래에서 raise_for_status()로 오류 발생
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY)
-                    continue
+        last_status: Optional[int] = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = self._session.post(
+                    url,
+                    params={"key": self.api_key},
+                    json=payload,
+                    timeout=_REQUEST_TIMEOUT_SECONDS,
+                )
+            except requests.Timeout as exc:
+                logger.warning(
+                    "embedding request timed out (attempt %s/%s)",
+                    attempt + 1, _MAX_RETRIES,
+                )
+                if attempt == _MAX_RETRIES - 1:
+                    raise TransientProviderError(
+                        "embedding provider timed out") from exc
+                _sleep_before_retry(None, attempt, sleeper, rng)
+                continue
+            except requests.RequestException as exc:
+                # Non-timeout connection failure — bounded retry.
+                logger.warning(
+                    "embedding transport error (attempt %s/%s): %s",
+                    attempt + 1, _MAX_RETRIES, type(exc).__name__,
+                )
+                if attempt == _MAX_RETRIES - 1:
+                    raise TransientProviderError(
+                        f"embedding transport failure: "
+                        f"{type(exc).__name__}") from exc
+                _sleep_before_retry(None, attempt, sleeper, rng)
+                continue
+
+            last_status = response.status_code
+            if response.status_code in _RETRYABLE_STATUSES:
+                if attempt == _MAX_RETRIES - 1:
+                    raise TransientProviderError(
+                        f"embedding retry budget exhausted "
+                        f"(last status: {last_status})"
+                    )
+                _sleep_before_retry(response, attempt, sleeper, rng)
+                continue
+            if 400 <= response.status_code < 500:
+                # 4xx: auth / validation / not-found — retrying is pointless
+                # and only leaks attempts. Surface as ConfigurationError so
+                # the operator fixes the key/model rather than the caller
+                # retrying blindly.
+                raise ConfigurationError(
+                    f"embedding provider rejected the request "
+                    f"(HTTP {response.status_code})"
+                )
             response.raise_for_status()
-            return response.json()["embedding"]["values"]
 
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """
-        다수의 텍스트를 한 번의 API 호출로 일괄 임베딩.
-        batchEmbedContents 엔드포인트 사용으로 순차 호출 대비 속도 대폭 향상.
-        429(요청 초과) 발생 시 RETRY_DELAY초 대기 후 MAX_RETRIES회 재시도.
-        Neo4j 벡터 인덱스 생성 또는 갱신 시 사용됨.
-        반환값: float 리스트의 리스트 (각 텍스트에 대한 벡터)
-        """
-        for attempt in range(MAX_RETRIES):
-            response = requests.post(
-                self.batch_url,
-                params={"key": self.api_key},
-                json={
-                    # 각 텍스트를 독립 요청으로 구성하여 배열로 전송
-                    "requests": [
-                        {
-                            "model": self.model,
-                            "content": {"parts": [{"text": text}]}
-                        }
-                        for text in texts
-                    ]
-                },
-                timeout=60  # 대량 문서 처리 시 여유 있는 타임아웃 설정
+            return self._parse_response(response)
+        raise TransientProviderError(
+            f"embedding request failed after {_MAX_RETRIES} attempts")
+
+    # ── Response validation ────────────────────────────────────────────────
+    @staticmethod
+    def _parse_response(response: requests.Response) -> dict:
+        """Return the parsed JSON body, or raise on malformed content."""
+        ctype = response.headers.get("content-type", "").lower()
+        if "application/json" not in ctype:
+            raise ModelResponseError(
+                f"unexpected embedding content-type: {ctype!r}")
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise ModelResponseError(
+                "embedding response body is not valid JSON") from exc
+
+    @staticmethod
+    def _extract_single_vector(response_json: dict) -> List[float]:
+        embedding = response_json.get("embedding")
+        if not isinstance(embedding, dict):
+            raise ModelResponseError(
+                "embedding response missing 'embedding' object")
+        values = embedding.get("values")
+        return _validate_vector(values)
+
+    @staticmethod
+    def _extract_batch_vectors(response_json: dict, expected_count: int
+                               ) -> List[List[float]]:
+        items = response_json.get("embeddings")
+        if not isinstance(items, list):
+            raise ModelResponseError(
+                "batch embedding response missing 'embeddings' list")
+        if len(items) != expected_count:
+            raise ModelResponseError(
+                f"batch embedding count mismatch: sent {expected_count}, "
+                f"got {len(items)}"
             )
-            if response.status_code == 429:
-                # API 분당 요청 제한 초과 — 대기 후 재시도
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY)
-                    continue
-            response.raise_for_status()
-            # 응답에서 각 텍스트의 임베딩 벡터만 추출하여 반환
-            return [item["values"] for item in response.json()["embeddings"]]
+        return [_validate_vector(item.get("values")) for item in items]
+
+    def _check_dimension(self, vectors: List[List[float]]) -> None:
+        """Enforce dimension consistency across calls.
+
+        If `expected_dim` was set at init, every vector must match it.
+        Otherwise, the first vector we see pins the dimension for later
+        calls (so an accidental model swap surfaces as an assertion, not as
+        silently poisoned index writes)."""
+        for v in vectors:
+            if self.expected_dim is None:
+                self.expected_dim = len(v)
+                continue
+            if len(v) != self.expected_dim:
+                raise ConfigurationError(
+                    f"embedding dimension mismatch: expected "
+                    f"{self.expected_dim}, got {len(v)} — this usually means "
+                    "the pinned model changed. Reindex before using it."
+                )
 
 
-# 앱 전역에서 사용할 임베딩 인스턴스 생성
-# _find_available_model()이 여기서 실행되어 사용 가능한 모델을 자동 탐색
-embeddings = GoogleEmbeddings(api_key=st.secrets["GOOGLE_API_KEY"])
+def _validate_vector(values) -> List[float]:
+    if not isinstance(values, list) or not values:
+        raise ModelResponseError(
+            "embedding vector is empty or malformed")
+    for x in values:
+        if not isinstance(x, (int, float)):
+            raise ModelResponseError(
+                "embedding vector contains non-numeric entry")
+    return list(values)
+
+
+# ── Admin-only: opt-in auto-discovery ───────────────────────────────────────
+# Kept OUT of the request path (Phase 5 §2). Import and call this ONLY from a
+# management CLI when picking a new model name; never from Streamlit.
+_EMBEDDING_MODEL_CANDIDATES = (
+    "models/gemini-embedding-001",
+    "models/gemini-embedding-2-preview",
+)
+
+
+def discover_available_model(api_key: str,
+                             candidates: Sequence[str] = _EMBEDDING_MODEL_CANDIDATES,
+                             ) -> str:
+    """Probe each candidate model with a tiny request; return the first one
+    that responds 200. Admin/one-shot only — never invoked from Streamlit."""
+    base = "https://generativelanguage.googleapis.com/v1beta"
+    payload = {"content": {"parts": [{"text": "probe"}]}}
+    for model in candidates:
+        payload["model"] = model
+        try:
+            r = requests.post(f"{base}/{model}:embedContent",
+                              params={"key": api_key}, json=payload,
+                              timeout=(5, 15))
+            if r.status_code == 200:
+                return model
+        except requests.RequestException:
+            continue
+    raise ConfigurationError(
+        f"no embedding model candidate is available: {list(candidates)}")
+
+
+# ── Module-level embedding client ───────────────────────────────────────────
+# Constructed at import time INTENTIONALLY: this module is itself only imported
+# after authentication succeeds (bot.py Phase 2 lazy import), so no
+# unauthenticated user triggers this.
+_embedding_expected_dim: Optional[int] = None
+try:
+    _embedding_expected_dim = int(st.secrets["EMBEDDING_DIMENSION"])
+except Exception:
+    _embedding_expected_dim = None
+
+embeddings = GoogleEmbeddings(
+    api_key=st.secrets["GOOGLE_API_KEY"],
+    model=st.secrets.get("GOOGLE_EMBEDDING_MODEL"),
+    expected_dim=_embedding_expected_dim,
+)

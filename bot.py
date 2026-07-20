@@ -1,8 +1,22 @@
+import hmac
+import logging
 import re
+import uuid
+
 import streamlit as st
+
 from utils import write_message
-from agent import generate_response
-from text_rag import generate_text_rag_response
+
+# NOTE — Phase 2 hardening (auth-gated lazy init):
+# `agent` and `text_rag` are NOT imported at module top-level. Importing them
+# would transitively import `llm.py` and `graph.py`, whose module bodies open
+# Google Gemini and Neo4j clients at import time. Deferring those imports
+# until AFTER `check_password()` succeeds guarantees that a user who fails
+# authentication triggers zero external calls. Python's `sys.modules` cache
+# means the deferred `from ... import ...` is essentially free on repeat
+# submissions — no per-turn cost.
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────
@@ -87,13 +101,25 @@ st.set_page_config("PoetryTalks", page_icon=":speech_balloon:")
 # 미인증 사용자가 LLM/DB 호출을 트리거하지 못하게 함.
 # ──────────────────────────────────────────────
 def check_password() -> bool:
-    """비밀번호 일치 시 True, 아니면 입력창을 표시하고 False."""
+    """비밀번호 일치 시 True, 아니면 입력창을 표시하고 False.
+
+    Constant-time comparison via `hmac.compare_digest` — prevents input-length
+    or early-mismatch timing side-channels from leaking password structure.
+    Application-level rate limiting is intentionally NOT implemented here: it
+    belongs at the deployment proxy (Streamlit Cloud IP throttling, or a
+    reverse proxy in front); documented in README."""
     def _on_submit():
-        if st.session_state.get("password") == st.secrets["APP_PASSWORD"]:
-            st.session_state["auth_ok"] = True
-            del st.session_state["password"]      # 입력값을 세션에서 즉시 제거
-        else:
-            st.session_state["auth_ok"] = False
+        entered = st.session_state.get("password") or ""
+        expected = st.secrets["APP_PASSWORD"]
+        # `compare_digest` requires both arguments to be str or bytes of the
+        # same type. Streamlit always yields str; cast defensively.
+        ok = hmac.compare_digest(str(entered), str(expected))
+        st.session_state["auth_ok"] = ok
+        # Clear the entered password from session state regardless of outcome
+        # so a failed attempt does not leave the plaintext in memory across
+        # reruns / subsequent screen captures.
+        if "password" in st.session_state:
+            del st.session_state["password"]
 
     if st.session_state.get("auth_ok"):
         return True
@@ -185,12 +211,46 @@ if "messages_by_mode" not in st.session_state:
 # ──────────────────────────────────────────────
 # 제출 핸들러 (모드에 따라 다른 백엔드 호출)
 # ──────────────────────────────────────────────
+# Localized fallback for infrastructure errors — Gemini/Neo4j misconfigured or
+# briefly unavailable. Rendered instead of a raw stack trace / secret leak.
+_INIT_FAILURE_MESSAGE = {
+    "ko": "죄송합니다. 챗봇 서비스가 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+    "en": "Sorry — the chatbot service is temporarily unavailable. Please try again shortly.",
+    "zh": "抱歉，聊天服务暂时不可用。请稍后重试。",
+}
+
+
+def _init_failure_message() -> str:
+    lang = st.session_state.get("effective_language", "ko")
+    return _INIT_FAILURE_MESSAGE.get(lang, _INIT_FAILURE_MESSAGE["ko"])
+
+
 def handle_submit(message: str, mode: str):
+    """Route a user submission to the selected mode's backend.
+
+    Backend modules (`agent`, `text_rag`) are imported LAZILY — the first call
+    after authentication triggers Google Gemini and Neo4j client creation via
+    Python's own import machinery. Subsequent calls hit the `sys.modules`
+    cache and pay no re-import cost.
+
+    A top-level guard converts any infrastructure or coding error into a
+    localized safe message. Correlation id is logged server-side so operators
+    can correlate without exposing raw exception text to the user."""
     with st.spinner("Thinking..."):
-        if mode == "graphRAG":
-            response = generate_response(message)
-        else:
-            response = generate_text_rag_response(message)
+        try:
+            if mode == "graphRAG":
+                from agent import generate_response
+                response = generate_response(message)
+            else:
+                from text_rag import generate_text_rag_response
+                response = generate_text_rag_response(message)
+        except Exception as exc:
+            correlation_id = uuid.uuid4().hex[:8]
+            logger.exception(
+                "handle_submit failed [%s] mode=%s type=%s",
+                correlation_id, mode, type(exc).__name__,
+            )
+            response = f"{_init_failure_message()} [ref: {correlation_id}]"
         st.session_state["messages_by_mode"][mode].append(
             {"role": "assistant", "content": response}
         )

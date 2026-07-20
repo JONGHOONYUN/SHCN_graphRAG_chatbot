@@ -7,6 +7,14 @@ from langchain_neo4j import GraphCypherQAChain
 from langchain_core.prompts import PromptTemplate
 from neo4j.exceptions import CypherSyntaxError, ClientError
 
+# Read-only Cypher validator (Phase 1 hardening).
+# Wraps the Neo4jGraph passed to GraphCypherQAChain so every LLM-generated
+# Cypher is validated BEFORE Neo4j execution. Neo4jChatMessageHistory is NOT
+# wrapped — it legitimately writes history nodes and must retain full access.
+from tools.cypher_safety import safe_graph, UnsafeCypherError
+
+_safe_graph = safe_graph(graph)
+
 CYPHER_GENERATION_TEMPLATE = """
 You are a research assistant for Sihwa ch'ongnim (詩話叢林 / 시화총림), a classical Korean poetry compendium. You help users explore its poems, critiques, persons, places, and critical vocabulary by querying a Neo4j graph database and retrieving relevant texts. You answer in the same language the user writes in.
 
@@ -637,7 +645,7 @@ cypher_prompt = PromptTemplate.from_template(CYPHER_GENERATION_TEMPLATE)
 
 cypher_qa = GraphCypherQAChain.from_llm(
     llm,
-    graph=graph,
+    graph=_safe_graph,
     verbose=True,
     cypher_prompt=cypher_prompt,
     allow_dangerous_requests=True
@@ -648,7 +656,7 @@ cypher_qa = GraphCypherQAChain.from_llm(
 # 노출받아, LLM이 쓴 prose 대신 구조화된 rows를 evidence로 변환한다.
 cypher_qa_structured = GraphCypherQAChain.from_llm(
     llm,
-    graph=graph,
+    graph=_safe_graph,
     verbose=True,
     cypher_prompt=cypher_prompt,
     allow_dangerous_requests=True,
@@ -707,6 +715,13 @@ def cypher_qa_safe(question: str) -> str:
             return (
                 "Graph query failed (Cypher syntax error). "
                 "Try rephrasing the question, or fall back to Sihwa Content Search."
+            )
+        except UnsafeCypherError as e:
+            # LLM-generated Cypher tried to write / call an un-allowlisted
+            # procedure / etc. Never echo the query text back — reason only.
+            return (
+                f"Graph query blocked by safety validator [{e.correlation_id}]. "
+                "Please rephrase the question."
             )
         except ClientError as e:
             return (
@@ -807,8 +822,20 @@ def retrieve_graph_evidence(question: str,
         try:
             result = cypher_qa_structured.invoke(
                 {"query": query + _SYNTAX_RETRY_HINT})
+        except UnsafeCypherError as e2:
+            return _status_evidence("invalid_query", e2)
         except Exception as e2:
             return _status_evidence("temporarily_unavailable", e2)
+    except UnsafeCypherError as e:
+        # Read-only validator rejected the LLM-generated Cypher. This is a
+        # user-safe `invalid_query` outcome — no raw text propagates.
+        logger.warning(
+            "graph retrieval rejected unsafe cypher [%s]: %s",
+            e.correlation_id, e.reason,
+        )
+        ev = Evidence(kind="graph")
+        ev.claims.append({"type": "status", "outcome": "invalid_query"})
+        return ev
     except ClientError as e:
         return _status_evidence("temporarily_unavailable", e)
     except Exception as e:  # transient LLM/parse issues — degrade gracefully

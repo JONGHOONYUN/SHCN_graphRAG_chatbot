@@ -17,6 +17,7 @@ network, or streamlit-bound modules.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import uuid
@@ -173,15 +174,65 @@ def _default_vector_retriever(question: str, language: str,
 # diagnostics go to server logs with a correlation code, evidence keeps only a
 # stable outcome token, and tools/synthesis.py renders the localized wording.
 # ──────────────────────────────────────────────
+# ── Signature-based arity dispatch (Phase 4) ────────────────────────────────
+# The legacy pattern `try: fn(3-args) except TypeError: fn(2-args)` conflates
+# two very different failures:
+#   (a) the callable does not accept 3 positional args (compatibility);
+#   (b) the callable's body raised a TypeError (a real defect).
+# Case (b) was being silently swallowed and the callable retried with 2 args
+# — masking bugs AND double-calling network-touching mocks.
+#
+# The new dispatch decides arity BEFORE the call using `inspect.signature`.
+# A TypeError from the callable's BODY is now surfaced as a retrieval failure
+# with a correlation id, never as an arity-retry signal.
+
+
+def _fn_accepts_arity(fn: Callable, target_arity: int) -> bool:
+    """True iff `fn` can be called with exactly `target_arity` positional args.
+
+    A callable that declares `*args` (e.g. MagicMock, most decorators) is
+    reported as compatible with any arity. If signature introspection fails
+    (some C-level callables), we return True — a genuine mismatch will
+    surface as TypeError from the body, which is treated as retrieval
+    failure (not retried)."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True
+    params = list(sig.parameters.values())
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
+        return True
+    positional = [p for p in params
+                  if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+    required = sum(1 for p in positional
+                   if p.default is inspect.Parameter.empty)
+    return required <= target_arity <= len(positional)
+
+
 def _safe_retrieve(fn: Callable, question: str, language: str,
                    history_text: Optional[str], kind: str) -> tuple:
-    """Run one retriever; returns (Evidence, status_dict). Any raised exception
-    or legacy error claim is normalized into a user-safe status."""
+    """Run one retriever with the arity its signature actually declares.
+
+    Signature dispatch order (Phase 4):
+      1. `fn(question, language, history_text)` — canonical 3-arg
+      2. `fn(question, language)` — legacy 2-arg (kept for existing tests)
+
+    A TypeError raised from inside the callable is NOT interpreted as an
+    arity mismatch — it becomes a retrieval failure with a correlation id.
+    """
+    if _fn_accepts_arity(fn, 3):
+        args: tuple = (question, language, history_text)
+    elif _fn_accepts_arity(fn, 2):
+        args = (question, language)
+    else:
+        code = uuid.uuid4().hex[:8]
+        logger.warning(
+            "%s retriever signature incompatible [%s]", kind, code)
+        return Evidence(kind=kind), {"source": kind,
+                                     "outcome": "temporarily_unavailable"}
     try:
-        try:
-            ev = fn(question, language, history_text)
-        except TypeError:
-            ev = fn(question, language)     # injected 2-arg retrievers (tests)
+        ev = fn(*args)
     except Exception as e:
         code = uuid.uuid4().hex[:8]
         logger.warning("%s retrieval failed [%s]: %s: %s",
@@ -227,11 +278,20 @@ def _default_authority_fetcher(source: str, ext_id: str, language: str,
 
 def _call_fetcher(fetcher: Callable, source: str, ext_id: str, language: str,
                   node_type: str) -> dict:
-    """Call the injected fetcher, tolerating 3-arg fetchers from older tests."""
-    try:
+    """Call the injected fetcher with signature-appropriate arity.
+
+    Introspection-based (Phase 4): a TypeError raised inside the fetcher is
+    NOT interpreted as an arity mismatch — it propagates so the retriever
+    layer can classify it as a real fetch failure. This prevents side-
+    effectful fetchers (network calls, counters) from being invoked twice
+    when their body raised for an unrelated reason."""
+    if _fn_accepts_arity(fetcher, 4):
         return fetcher(source, ext_id, language, node_type)
-    except TypeError:
+    if _fn_accepts_arity(fetcher, 3):
         return fetcher(source, ext_id, language)
+    raise TypeError(
+        "authority fetcher signature incompatible — expected 3 or 4 "
+        "positional arguments")
 
 
 def _has_valid_fetchable_id(entity: Entity, node_type: str) -> bool:

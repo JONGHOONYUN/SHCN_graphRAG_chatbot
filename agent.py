@@ -698,30 +698,91 @@ def synthesize_answer(user_input: str, user_language: str) -> str:
     return output
 
 
+import logging as _logging  # noqa: E402
+import uuid as _uuid  # noqa: E402
+
+from errors import (  # noqa: E402
+    ConfigurationError,
+    RetrievalError,
+    UnsafeQueryError,
+    is_fallback_eligible,
+)
+from tools.cypher_safety import UnsafeCypherError  # noqa: E402
+
+_logger = _logging.getLogger(__name__)
+
+
 def generate_response(user_input):
     """graphRAG 응답 생성 엔트리포인트 (bot.py에서 호출).
 
-    새 evidence 파이프라인(gather → synthesize)을 우선 사용한다. 파이프라인이
-    일시적으로 실패하면 기존 ReAct agent로 폴백하여 가용성을 유지한다.
+    Fallback policy (Phase 3):
+      * `synthesize_answer` succeeds with non-empty output → return that.
+      * `synthesize_answer` returns empty → treat as `no_results`; NO fallback.
+      * `TransientProviderError` (Gemini 5xx, Neo4j drop, etc.) → ReAct fallback.
+      * `UnsafeCypherError` / `UnsafeQueryError` → user is told to rephrase;
+        NO fallback (the ReAct path would just regenerate the same query).
+      * `ConfigurationError` / `RetrievalError` → localized safe message;
+        NO fallback (an operator must fix the underlying issue).
+      * Bare `ValueError` matching Gemini's empty-stream signature → localized
+        safe message; NO fallback (the ReAct path would repeat the same
+        failure and burn tokens).
+      * Anything else → log with correlation id, localized safe message,
+        NO fallback (hiding a coding bug behind ReAct forever is exactly
+        what the work order forbids).
     """
-    # bot.py가 매 턴 결정한 적용 언어(effective_language)를 읽어 prompt에 주입.
-    # session_state가 없으면(직접 호출 등) 한국어로 폴백.
     user_language = st.session_state.get("effective_language", "ko")
 
     try:
         output = synthesize_answer(user_input, user_language)
         if output and output.strip():
             return output
-    except ValueError as e:
-        # Gemini 빈 스트림 응답 등 — 락 언어 안내로 graceful 처리.
-        if "No generation chunks were returned" in str(e):
-            return ITERATION_LIMIT_FALLBACK.get(user_language, ITERATION_LIMIT_FALLBACK["ko"])
-        # 그 외 ValueError는 아래 ReAct 폴백으로.
-    except Exception:
-        # 파이프라인 어떤 단계든 실패하면 ReAct agent 폴백 시도.
-        pass
+        # Empty output is treated as no_results — safe message, not fallback.
+        return ITERATION_LIMIT_FALLBACK.get(
+            user_language, ITERATION_LIMIT_FALLBACK["ko"])
+    except (UnsafeCypherError, UnsafeQueryError) as exc:
+        _logger.warning(
+            "graphRAG blocked unsafe query [%s]",
+            getattr(exc, "correlation_id", "?"),
+        )
+        return ITERATION_LIMIT_FALLBACK.get(
+            user_language, ITERATION_LIMIT_FALLBACK["ko"])
+    except (ConfigurationError, RetrievalError) as exc:
+        _logger.error(
+            "graphRAG non-fallback error [%s] type=%s",
+            getattr(exc, "correlation_id", "?"), type(exc).__name__,
+        )
+        return ITERATION_LIMIT_FALLBACK.get(
+            user_language, ITERATION_LIMIT_FALLBACK["ko"])
+    except ValueError as exc:
+        if "No generation chunks were returned" in str(exc):
+            _logger.info(
+                "graphRAG Gemini empty stream — safe message, no fallback")
+            return ITERATION_LIMIT_FALLBACK.get(
+                user_language, ITERATION_LIMIT_FALLBACK["ko"])
+        # Any other ValueError is unexpected; fall through to policy check.
+        return _react_fallback_or_safe(exc, user_input, user_language)
+    except Exception as exc:
+        return _react_fallback_or_safe(exc, user_input, user_language)
 
-    return _generate_response_react(user_input, user_language)
+
+def _react_fallback_or_safe(exc: BaseException, user_input: str,
+                            user_language: str) -> str:
+    """Policy: only TransientProviderError triggers the ReAct fallback. Any
+    other exception is logged with a correlation id and converted to the
+    localized safe message so a coding bug is not hidden behind a fallback."""
+    correlation_id = getattr(exc, "correlation_id", None) or _uuid.uuid4().hex[:8]
+    if is_fallback_eligible(exc):
+        _logger.warning(
+            "graphRAG transient failure [%s] type=%s — invoking ReAct fallback",
+            correlation_id, type(exc).__name__,
+        )
+        return _generate_response_react(user_input, user_language)
+    _logger.error(
+        "graphRAG unexpected failure [%s] type=%s — NO fallback (%s)",
+        correlation_id, type(exc).__name__, str(exc)[:200],
+    )
+    return ITERATION_LIMIT_FALLBACK.get(
+        user_language, ITERATION_LIMIT_FALLBACK["ko"])
 
 
 def _generate_response_react(user_input, user_language):
