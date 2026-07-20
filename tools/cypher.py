@@ -460,6 +460,39 @@ Use these path patterns for common query types:
 - When a question is ambiguous or matches multiple entities, present a
   clarifying list rather than selecting one arbitrarily.
 
+# Common Cypher Anti-Patterns to Avoid
+
+The following mistakes have been observed and MUST be avoided.
+
+## Anti-Pattern 1: Multi-label filter with backticks (produces "Unknown label" warning)
+
+❌ WRONG:
+    WHERE (text:`Entry OR text`:Poem OR text:Critique)
+    -- backticks turn "Entry OR text" into ONE label name that does NOT exist.
+    -- Neo4j returns 0 rows and emits UnknownLabelWarning.
+
+✅ CORRECT (each label predicate written separately, joined by OR):
+    WHERE text:Entry OR text:Poem OR text:Critique
+
+✅ ALSO CORRECT (using labels() function with IN):
+    WHERE any(l IN labels(text) WHERE l IN ['Entry','Poem','Critique'])
+
+Note: When you MATCH a variable without a label — MATCH (text)-[:HAS_SUBJECT_PERSON]->(p) —
+and you want to restrict the label afterward, use one of the two correct forms above.
+Never combine multiple label names inside a single backtick-quoted identifier.
+
+## Anti-Pattern 2: Making up node labels
+
+The ONLY node labels in this database are:
+    Person, Poem, Critique, Entry, Topic, CriticalTerm, Place, Work, Era
+Do not use :Book, :Sihwa, :Author, :Book_or_Work, etc. — those do NOT exist.
+
+## Anti-Pattern 3: Making up relationship types
+
+Use only the relationship types listed in "##Relationship Type Rules" above.
+Do not invent variations like HAS_WRITER, IS_ABOUT, MENTIONS, etc.
+
+
 Few-shot examples:
 Q: 이수광이 평한 시 목록을 알려줘
 Cypher: MATCH (p:Person)-[:HAS_CREATOR]-(c:Critique)-[:HAS_SUBJECT_TEXT]->(poem:Poem)
@@ -517,6 +550,23 @@ Cypher: MATCH (p:Person)-[:HAS_ERA]->(e:Era),
         WHERE e.nameKor = '고려'
         RETURN t.nameKor, count(poem) AS n
         ORDER BY n DESC LIMIT 20
+
+Q: 왕(king) 관직을 지낸 인물이 시화총림에서 가장 많이 언급되는 사례는? (multi-label filter demonstration)
+Cypher: MATCH (p:Person)-[:HAS_OFFICE]->(office:Topic)
+        WHERE office.nameKor CONTAINS '왕'
+           OR office.nameEng CONTAINS 'king'
+           OR office.nameChi CONTAINS '王'
+        WITH p
+        MATCH (text)-[:HAS_SUBJECT_PERSON]->(p)
+        WHERE text:Entry OR text:Poem OR text:Critique
+        RETURN p.nameKor AS person_name_kor,
+               p.nameChi AS person_name_chi,
+               p.idAKSdigerati AS aks_digerati_id,
+               p.idWikidata AS wikidata_id,
+               count(text) AS mention_count
+        ORDER BY mention_count DESC LIMIT 10
+        // NOTE: multi-label filter written as separate `text:Label` predicates joined by OR.
+        //       Never wrap multiple labels in one backtick-quoted string.
 
 Q: 시화총림에서 두보를 언급하는 항목은?
 Cypher: MATCH (b:Work)-[:HAS_PART]->(e:Entry)-[:HAS_SUBJECT_PERSON]->(p:Person)
