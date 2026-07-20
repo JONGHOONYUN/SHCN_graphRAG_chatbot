@@ -619,12 +619,18 @@ synthesis_prompt = ChatPromptTemplate.from_messages(
          "{language_directive}\n\n" + SYNTHESIS_SYSTEM_RULES + "\n\n" + HISTORY_RULES),
         (
             "human",
-            "이전 대화 (지시어·생략 해석 전용 — 근거 아님):\n{chat_history}\n\n"
-            "질문(원문 그대로): {question}\n\n"
-            "다음은 검색으로 수집한 구조화된 근거 블록입니다. 이 근거만 사용하세요.\n"
+            "Prior conversation (for pronoun/ellipsis resolution only — NOT evidence):\n"
+            "{chat_history}\n\n"
+            "Question (original wording, do not translate before searching): {question}\n\n"
+            "Below are the structured evidence blocks retrieved for this question. "
+            "Use ONLY these blocks as factual sources:\n"
             "{evidence_blocks}\n\n"
-            "위 규칙에 따라 최종 답변을 작성하고, 마지막에 출처 섹션을 포함하세요. "
-            "권장 인용 라인(있는 경우만, 링크 날조 금지):\n{suggested_citations}",
+            "Write the final answer following every rule above, ending with a "
+            "Sources section whose header AND group labels are in the LOCKED "
+            "response language (see rule 9 for the exact label set per language). "
+            "Recommended citation lines (already pre-composed in the locked "
+            "language — reuse verbatim, do not fabricate URLs):\n"
+            "{suggested_citations}",
         ),
     ]
 )
@@ -668,7 +674,7 @@ def synthesize_answer(user_input: str, user_language: str) -> str:
         return retrieval_failure_message(user_language)
 
     evidence_blocks = format_evidence_for_prompt(evidence, user_language)
-    citations = build_citations(evidence)
+    citations = build_citations(evidence, user_language)
     suggested = "\n".join(citations) if citations else "(no pre-computed citations)"
 
     output = synthesis_chain.invoke(

@@ -71,6 +71,30 @@ RETRIEVAL_STATUS_MESSAGES = {
     },
 }
 
+# ── Localized citation labels (matches locked response language) ─────────────
+# The final answer's "Sources" section must be written in the user's language,
+# not always Korean. These labels are used by (a) build_citations() when
+# pre-composing suggested citation lines and (b) the system-rule text below,
+# which shows the LLM the exact per-language label set to use.
+CITATION_LABELS = {
+    "ko": {
+        "sources_header":    "출처",
+        "graph_prefix":      "시화총림 그래프",
+        "link_only_prefix":  "참고 링크 (내용 미조회)",
+    },
+    "en": {
+        "sources_header":    "Sources",
+        "graph_prefix":      "Sihwa Ch'ongnim Graph",
+        "link_only_prefix":  "Reference Link (not fetched)",
+    },
+    "zh": {
+        "sources_header":    "来源",
+        "graph_prefix":      "诗话丛林图谱",
+        "link_only_prefix":  "参考链接（内容未获取）",
+    },
+}
+
+
 # Returned directly (no LLM call) when BOTH retrieval sources failed and there is
 # no external evidence to answer from. Never backfilled from pretraining.
 BOTH_RETRIEVALS_FAILED_MESSAGES = {
@@ -187,9 +211,10 @@ the only step that writes user-facing prose. Obey these rules strictly:
      HAS_SUBJECT_*, HAS_PART, poem/critique text, and Poetry Talks provenance.
    - FETCHED external authorities (status=ok) are SUPPLEMENTARY: use only the
      fields shown in their evidence block.
-   - LINK-ONLY references (status=link_only) were NOT fetched. You may show the
-     link as a 참고 링크 / reference link. You must NEVER write "according to
-     [source]" for them, and never assert any fact from that site.
+   - LINK-ONLY references (status=link_only) were NOT fetched. You may show
+     the link under the localized "link-only" group label (see rule 9). You
+     must NEVER write "according to [source]" for them, and never assert any
+     fact from that site.
 
 2. DO NOT infer careers, family relations, work lists, or literary assessments
    from an authority record unless the same fact is separately present in GRAPH
@@ -210,6 +235,12 @@ the only step that writes user-facing prose. Obey these rules strictly:
    own pretraining.
 
 7. Never fabricate a link. Cite only URLs present in the evidence.
+   Exception — POETRY TALKS wiki URLs: every graph node ID (B/E/M/C/P/L/T/H
+   followed by digits, e.g. E003, P027, B016) resolves deterministically to
+   `https://poetrytalks.org/<ID>`. Evidence and citation lines ALREADY embed
+   these as markdown links, e.g. `[E003](https://poetrytalks.org/E003)` — use
+   them verbatim; never rewrite the base URL, never drop the link, and never
+   construct one for anything that is not a graph node ID from evidence.
 
 7b. ENTITY-TYPE SEPARATION: every external record is tagged [Person] or
    [Place]. Use a [Person] record only for that person and a [Place] record
@@ -220,12 +251,34 @@ the only step that writes user-facing prose. Obey these rules strictly:
    given — never translate, summarize, or alter them. Your commentary is in the
    locked response language; quoted source text keeps its original characters.
 
-9. CITATIONS: end with a "출처 / Sources" section, source-separated:
-     - 시화총림 그래프: 지봉유설(B016) > 제3항목(E003) > 제2시(M012)
-     - Wikidata: [label](verified URL)
-     - AKS Digerati: [label](canonical URL)
-     - 참고 링크 (내용 미조회): [label](verified URL)
-   Every quoted source text must carry full graph provenance.
+9. CITATIONS: end with a source-separated Sources section. The section header
+   AND every group label MUST be written in the LOCKED response language above
+   (never mix languages here). Use exactly these localized labels — do not
+   translate them yourself, do not substitute synonyms:
+     Korean → header "출처"
+         · graph group prefix:     "시화총림 그래프"
+         · link-only group prefix: "참고 링크 (내용 미조회)"
+     English → header "Sources"
+         · graph group prefix:     "Sihwa Ch'ongnim Graph"
+         · link-only group prefix: "Reference Link (not fetched)"
+     Chinese → header "来源"
+         · graph group prefix:     "诗话丛林图谱"
+         · link-only group prefix: "参考链接（内容未获取）"
+   External authority proper names (Wikidata, AKS Digerati, Library of
+   Congress, ...) stay in their original form in every language.
+   Every quoted source text must carry full graph provenance from the graph
+   evidence block. The recommended-citation lines you receive are pre-built in
+   the same locked language — you may reuse them verbatim.
+
+   POETRY TALKS LINKS in the graph group: provenance labels already embed
+   every referenced node ID as a markdown link
+   (e.g. `[E003](https://poetrytalks.org/E003)`,
+   `[P027](https://poetrytalks.org/P027)`,
+   `[B016](https://poetrytalks.org/B016)`). Keep those markdown links intact
+   in the Sources section AND, whenever you mention a specific entity in the
+   body of the answer, wrap its ID with the same markdown link so the reader
+   can jump straight to that node's Poetry Talks wiki page. The URL is always
+   `https://poetrytalks.org/<ID>` — never invent a different base URL.
 
 10. RETRIEVAL STATUS: if a "Retrieval Status" block is present, relay its
    message briefly in the locked language. "No results" and "temporarily
@@ -250,13 +303,21 @@ def _truncate(text: str, limit: int = _MAX_BLOCK_CHARS) -> str:
 
 
 def _entity_line(e: dict) -> str:
+    """Render one resolved-entity line. The node_id is embedded as a markdown
+    link to its Poetry Talks wiki page (deterministic — same URL scheme every
+    referenced graph node uses) so the LLM can weave clickable references into
+    the answer without reconstructing URLs itself."""
+    from tools.evidence import poetrytalks_url  # local import: avoids cycle
+
     name = (
         e.get("name_kor") or e.get("name_eng") or e.get("name_chi")
         or e.get("node_id") or "?"
     )
     bits = [f"{name} [{e.get('node_type') or 'Person'}]"]
-    if e.get("node_id"):
-        bits.append(f"id={e['node_id']}")
+    node_id = e.get("node_id")
+    if node_id:
+        url = poetrytalks_url(node_id)
+        bits.append(f"id=[{node_id}]({url})" if url else f"id={node_id}")
     for key, value in sorted((e.get("authority_ids") or {}).items()):
         if value:
             bits.append(f"{key}={value}")
@@ -289,7 +350,11 @@ def _format_vector_block(vector: dict, outcome: str = "ok") -> str:
             lines.append("(no vector documents)")
     for d in docs[:_MAX_DOCS]:
         work = d.get("work_name_kor") or d.get("work_name_eng") or "Work"
-        lines.append(f"- 출처: {work} > Entry {d.get('entry_position')} ({d.get('entry_id')})")
+        # NOTE: "source:" is a language-neutral evidence-block metadata label —
+        # kept in English so the LLM does not mirror a Korean prefix into the
+        # user-facing Sources section. Final citation labels are enforced by
+        # CITATION_LABELS + rule 9 in SYNTHESIS_SYSTEM_RULES.
+        lines.append(f"- source: {work} > Entry {d.get('entry_position')} ({d.get('entry_id')})")
         for f in ("textChi", "textKor", "textEng", "descEng"):
             if d.get(f):
                 lines.append(f"    {f}: {d[f]}")
@@ -318,8 +383,9 @@ def _format_external_block(external: dict) -> str:
 
         if status == "link_only":
             lines.append(
-                f"- {label} for {who} [{ntype}]: LINK-ONLY (내용 미조회) — "
-                f"참고 링크로만 제시, 내용 주장 금지. url: {c.get('url')}"
+                f"- {label} for {who} [{ntype}]: LINK-ONLY (not fetched) — "
+                f"present as a reference link only, do NOT assert its "
+                f"contents. url: {c.get('url')}"
             )
             continue
         if status != "ok":
@@ -447,11 +513,17 @@ def format_evidence_for_prompt(evidence: dict, language: str = "ko") -> str:
     return _truncate("\n\n".join(parts), _MAX_TOTAL_CHARS)
 
 
-def build_citations(evidence: dict) -> list:
+def build_citations(evidence: dict, language: str = "ko") -> list:
     """Build source-separated citation lines from provenance/claims.
 
-    Never fabricates a link — only emits URLs present in the evidence. Link-only
-    sources are labelled 참고 링크 and never presented as fetched facts."""
+    Never fabricates a link — only emits URLs present in the evidence.
+    Localized per the locked response language: graph and link-only prefixes
+    come from CITATION_LABELS[language]. External authority proper names
+    (Wikidata, AKS Digerati, ...) stay in their original form."""
+    labels = CITATION_LABELS.get(language) or CITATION_LABELS["ko"]
+    graph_prefix = labels["graph_prefix"]
+    link_only_prefix = labels["link_only_prefix"]
+
     citations: list = []
     seen: set = set()
 
@@ -465,7 +537,7 @@ def build_citations(evidence: dict) -> list:
     external = _to_dict(evidence.get("external"))
 
     for prov in graph.get("provenance", []) + vector.get("provenance", []):
-        _add(f"- 시화총림 그래프: {prov.get('label')}")
+        _add(f"- {graph_prefix}: {prov.get('label')}")
 
     for c in external.get("claims", []):
         url = c.get("url")
@@ -477,7 +549,7 @@ def build_citations(evidence: dict) -> list:
         if status == "ok":
             _add(f"- {label}: [{who}]({url})")
         elif status == "link_only":
-            _add(f"- 참고 링크 (내용 미조회) — {label}: [{who}]({url})")
+            _add(f"- {link_only_prefix} — {label}: [{who}]({url})")
     return citations
 
 

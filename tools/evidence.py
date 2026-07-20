@@ -38,6 +38,41 @@ EVIDENCE_KINDS = ("graph", "vector", "external")
 # Node types eligible for external authority enrichment.
 ENRICHABLE_TYPES = ("Person", "Place")
 
+# ──────────────────────────────────────────────
+# Poetry Talks wiki URL scheme
+#
+# Every referenced graph node ID (B/E/M/C/P/L/T/H followed by digits) resolves
+# to https://poetrytalks.org/<ID>. URLs are derived deterministically here so
+# the final answer's Sources section always shows a clickable link — never
+# depending on the LLM to remember or reconstruct the URL correctly.
+# ──────────────────────────────────────────────
+POETRYTALKS_BASE = "https://poetrytalks.org/"
+
+
+def poetrytalks_url(node_id: Any) -> Optional[str]:
+    """Return the Poetry Talks wiki URL for a graph node ID.
+
+    Only returns a URL when the value matches a known node-id shape
+    (prefix in B/E/M/C/P/L/T/H followed by digits). Returns None for anything
+    else, so callers never fabricate a URL from an unrelated string."""
+    if not isinstance(node_id, str):
+        return None
+    node_id = node_id.strip()
+    if not node_id:
+        return None
+    if _looks_like_node_id(node_id):
+        return POETRYTALKS_BASE + node_id
+    return None
+
+
+def _linked_id(node_id: Optional[str]) -> str:
+    """Format a node ID as a markdown link if it matches a known prefix, else
+    return it verbatim. Empty/None becomes '?'."""
+    if not node_id:
+        return "?"
+    url = poetrytalks_url(node_id)
+    return f"[{node_id}]({url})" if url else node_id
+
 
 @dataclass
 class Entity:
@@ -343,16 +378,26 @@ def document_to_parts(doc: Any) -> tuple:
     document = {k: v for k, v in document.items() if v not in (None, [], {})}
 
     entities = entities_from_vector_meta(meta)
+    entry_id = meta.get("entry_id")
+    work_id = meta.get("source_work_id")
+    # Prefer the deterministic URL built from the entry_id; fall back to the
+    # Cypher-provided poetrytalks_link if the id shape is unrecognized.
+    entry_url = poetrytalks_url(entry_id) or meta.get("poetrytalks_link")
+    work_ref = _linked_id(work_id) if work_id else None
+    work_name = (
+        meta.get("source_work_kor") or meta.get("source_work_eng") or "Work"
+    )
+    work_label = f"{work_name} ({work_ref})" if work_ref else work_name
     provenance = [
         Provenance(
             source_type="neo4j_vector",
             label=(
-                f"{meta.get('source_work_kor') or meta.get('source_work_eng') or 'Work'}"
-                f" > Entry {meta.get('entry_position')} ({meta.get('entry_id')})"
+                f"{work_label} > Entry {meta.get('entry_position')} "
+                f"({_linked_id(entry_id)})"
             ),
-            source_url=meta.get("poetrytalks_link"),
-            work_id=meta.get("source_work_id"),
-            entry_id=meta.get("entry_id"),
+            source_url=entry_url,
+            work_id=work_id,
+            entry_id=entry_id,
         )
     ]
     return document, entities, provenance
@@ -500,7 +545,13 @@ def entities_from_graph_row(row: dict) -> list:
 
 
 def provenance_from_graph_row(row: dict) -> list:
-    """Best-effort provenance from id-looking values in a graph row."""
+    """Best-effort provenance from id-looking values in a graph row.
+
+    Each detected node ID is embedded as a markdown link to its Poetry Talks
+    wiki page so the final Sources section renders one link per referenced
+    node — deterministic, not LLM-dependent. `source_url` carries the primary
+    reference URL (first non-empty in entry → poem/critique → work → entity)
+    for tooling that consumes the Provenance record directly."""
     if not isinstance(row, dict):
         return []
     ids: dict = {}
@@ -510,11 +561,17 @@ def provenance_from_graph_row(row: dict) -> list:
             ids[kind] = value
     if not ids:
         return []
-    label_bits = [f"{k}={v}" for k, v in ids.items()]
+    label_bits = [f"{k}={_linked_id(v)}" for k, v in ids.items()]
+    primary_id = (
+        ids.get("entry") or ids.get("poem") or ids.get("critique")
+        or ids.get("work") or ids.get("person") or ids.get("place")
+        or ids.get("topic") or ids.get("era")
+    )
     return [
         Provenance(
             source_type="neo4j_graph",
             label="Graph: " + ", ".join(label_bits),
+            source_url=poetrytalks_url(primary_id),
             work_id=ids.get("work"),
             entry_id=ids.get("entry"),
             poem_or_critique_id=ids.get("poem") or ids.get("critique"),

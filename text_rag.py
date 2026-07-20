@@ -113,11 +113,43 @@ FALLBACK_HINT = {
 }
 
 
+# ──────────────────────────────────────────────
+# 인용 섹션 언어별 라벨 (답변 언어와 sources 언어를 일치시키기 위함)
+# ──────────────────────────────────────────────
+_CITATION_LABELS = {
+    "ko": {
+        "sources_header":      "출처",
+        "work_name_label":     "시화집명",
+        "entry_position_label": "항목 위치: 제 [entry_position] 항목 (entry_id)",
+        "poetrytalks_label":   "Poetry Talks 링크",
+        "example_line":        "예: 지봉유설 > 제3항목 (E003) > https://poetrytalks.org/E003",
+        "bilingual_source_line": "— 출처: 어우야담 > 제N항목 (E###) > https://poetrytalks.org/E###",
+    },
+    "en": {
+        "sources_header":      "Sources",
+        "work_name_label":     "Sihwa collection name",
+        "entry_position_label": "Entry position: Entry [entry_position] (entry_id)",
+        "poetrytalks_label":   "Poetry Talks link",
+        "example_line":        "e.g. Jibong yusol > Entry 3 (E003) > https://poetrytalks.org/E003",
+        "bilingual_source_line": "— Source: Eou yadam > Entry N (E###) > https://poetrytalks.org/E###",
+    },
+    "zh": {
+        "sources_header":      "来源",
+        "work_name_label":     "诗话集名称",
+        "entry_position_label": "条目位置：第 [entry_position] 条 (entry_id)",
+        "poetrytalks_label":   "Poetry Talks 链接",
+        "example_line":        "例：芝峰类说 > 第3条 (E003) > https://poetrytalks.org/E003",
+        "bilingual_source_line": "— 来源：於于野譚 > 第N条 (E###) > https://poetrytalks.org/E###",
+    },
+}
+
+
 def _build_prompt():
     """호출 시점의 effective_language를 반영한 ChatPromptTemplate 생성."""
     user_language = st.session_state.get("effective_language", "ko")
     label = _LANGUAGE_LABEL.get(user_language, _LANGUAGE_LABEL["ko"])
     fallback = FALLBACK_HINT.get(user_language, FALLBACK_HINT["ko"])
+    cit = _CITATION_LABELS.get(user_language) or _CITATION_LABELS["ko"]
 
     system_msg = (
         f"이번 답변은 반드시 {label}로 작성하세요. "
@@ -129,11 +161,19 @@ def _build_prompt():
         "[답변 규칙]\n"
         "1. context에 있는 Entry 본문(textKor/textChi/textEng)만을 근거로 답하세요.\n"
         "2. 원문 인용은 그대로 유지하고, 절대 번역·요약·변형하지 마세요.\n"
-        "3. 매 인용마다 다음 가벼운 출처를 명시하세요:\n"
-        "     시화집명(source_work_kor / source_work_eng)\n"
-        "     항목 위치: 제 [entry_position] 항목 (entry_id)\n"
-        "     Poetry Talks 링크: poetrytalks_link\n"
-        "   예: 지봉유설 > 제3항목 (E003) > https://poetrytalks.org/E003\n"
+        "3. 매 인용마다 다음 가벼운 출처를 명시하세요. Sources 섹션의 헤더와 "
+        f"라벨은 반드시 답변 언어({label})로 작성 — 하드코딩된 한국어 라벨을 "
+        f"복사하지 말고 아래의 언어별 라벨을 사용:\n"
+        f"     • Sources section header: \"{cit['sources_header']}\"\n"
+        f"     • {cit['work_name_label']} (source_work_kor / source_work_eng / source_work_chi)\n"
+        f"     • {cit['entry_position_label']}\n"
+        f"     • {cit['poetrytalks_label']}: poetrytalks_link\n"
+        f"   {cit['example_line']}\n"
+        "   [Poetry Talks 링크 규칙 — 반드시 준수]\n"
+        "   metadata의 entry_id (예: E003) 는 항상 URL `https://poetrytalks.org/<entry_id>`\n"
+        "   로 해석됩니다. 인용을 표시할 때 entry_id는 반드시 markdown 링크로 감싸\n"
+        "   `[E003](https://poetrytalks.org/E003)` 형태로 노출하세요. 본문에서 특정\n"
+        "   Entry를 언급할 때도 같은 링크 형식을 그대로 사용하세요.\n"
         "4. context에 답에 필요한 근거가 없거나 검색 결과가 질문과 관련성이 낮으면, "
         f"다음 문구를 사용자에게 안내하세요:\n"
         f"     '{fallback}'\n"
@@ -153,8 +193,9 @@ def _build_prompt():
         f"        - 답변 언어가 English이면 english_translation\n"
         f"        - 답변 언어가 Chinese이면 original_chinese만으로 충분 (번역 병기 생략 가능)\n"
         "     ③ 원문과 번역은 반드시 blockquote(>) 또는 코드 블록으로 시각적 구분\n"
-        "     ④ 병기 뒤에 출처(위 규칙 3) 명시\n"
-        "   예시 형식 (사용자 언어가 Korean일 때):\n"
+        "     ④ 병기 뒤에 출처(위 규칙 3) 명시 — 반드시 답변 언어의 라벨 사용\n"
+        "   예시 형식 (사용자 언어가 Korean일 때 — 답변 언어가 English/Chinese라면 "
+        "아래 예시의 '한국어 번역' 라벨과 '출처:' 라벨을 각각 답변 언어에 맞게 번역):\n"
         "     > **[漢文原文]**\n"
         "     > 兩兩佳人弄夕暉。\n"
         "     > 青樓朱箔共依依。\n"
@@ -162,7 +203,7 @@ def _build_prompt():
         "     > **[한국어 번역]**\n"
         "     > 쌍쌍의 가인들이 저녁 햇살 속에 노니는데,\n"
         "     > 청루의 붉은 발 속에서 함께 가련히 비치네.\n"
-        "     — 출처: 어우야담 > 제N항목 (E###) > https://poetrytalks.org/E###\n"
+        f"     {cit['bilingual_source_line']}\n"
         "   주의사항:\n"
         "   - 세 언어 중 일부만 존재(예: textEng가 null)하면 있는 것만 병기.\n"
         "   - textChi가 없고 textKor/textEng만 있으면 병기 없이 사용자 언어 번역만 인용.\n"
