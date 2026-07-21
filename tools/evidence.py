@@ -39,35 +39,62 @@ EVIDENCE_KINDS = ("graph", "vector", "external")
 ENRICHABLE_TYPES = ("Person", "Place")
 
 # ──────────────────────────────────────────────
-# Poetry Talks wiki URL scheme
+# Poetry Talks wiki URL scheme  ("poetrytalks wikidata")
 #
-# Every referenced graph node ID (B/E/M/C/P/L/T/H followed by digits) resolves
-# to https://poetrytalks.org/<ID>. URLs are derived deterministically here so
-# the final answer's Sources section always shows a clickable link — never
-# depending on the LLM to remember or reconstruct the URL correctly.
+# EVERY graph node — regardless of class (Person, Entry, Poem, Critique,
+# Work, Place, Topic, Era, CriticalTerm, Series, ...) — has an `id` property
+# on the Neo4j node whose value resolves deterministically to
+# `https://poetrytalks.org/<id>`. The final Sources section refers to these
+# URLs as **"poetrytalks wikidata"** links (per user's naming convention);
+# they are the canonical, unconditional reference URL for any node cited in
+# an answer.
+#
+# Detection strategy: any single uppercase letter followed by 1–4 digits.
+# The digit ceiling rejects external-authority IDs that share a first letter
+# with a node prefix — most notably `idAKSency` values like `E0063034`
+# (7 digits) that look like Entry IDs but are Encyclopedia of Korean Culture
+# references. Column-name filtering (`_is_external_id_key`) provides a
+# second guard against those.
 # ──────────────────────────────────────────────
 POETRYTALKS_BASE = "https://poetrytalks.org/"
 
+# Canonical citation category name for these URLs.
+POETRYTALKS_WIKIDATA_LABEL = "poetrytalks wikidata"
+
+
+def is_valid_node_id(value: Any) -> bool:
+    """True if `value` fits the node-id shape: one uppercase A–Z followed by
+    1–4 decimal digits. Works for every node class in the schema — including
+    ones whose prefix letter is not enumerated in `_ID_PREFIX_TO_KIND`
+    (e.g. CriticalTerm)."""
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not (2 <= len(value) <= 5):
+        return False
+    if not (value[0].isascii() and value[0].isupper() and value[0].isalpha()):
+        return False
+    return value[1:].isdigit()
+
 
 def poetrytalks_url(node_id: Any) -> Optional[str]:
-    """Return the Poetry Talks wiki URL for a graph node ID.
-
-    Only returns a URL when the value matches a known node-id shape
-    (prefix in B/E/M/C/P/L/T/H followed by digits). Returns None for anything
-    else, so callers never fabricate a URL from an unrelated string."""
+    """Return the Poetry Talks wiki URL ("poetrytalks wikidata" link) for any
+    node ID matching the canonical shape (single uppercase letter + 1–4
+    digits). Returns None for anything else — callers must never fabricate a
+    URL from an unrelated string (e.g. `idAKSency` values, Wikidata Q-ids)."""
     if not isinstance(node_id, str):
         return None
     node_id = node_id.strip()
     if not node_id:
         return None
-    if _looks_like_node_id(node_id):
+    if is_valid_node_id(node_id):
         return POETRYTALKS_BASE + node_id
     return None
 
 
 def _linked_id(node_id: Optional[str]) -> str:
-    """Format a node ID as a markdown link if it matches a known prefix, else
-    return it verbatim. Empty/None becomes '?'."""
+    """Format a node ID as a markdown link if it fits the node-id shape,
+    else return it verbatim. Empty/None becomes '?'."""
     if not node_id:
         return "?"
     url = poetrytalks_url(node_id)
@@ -447,29 +474,20 @@ _ROW_ID_SUFFIXES = {
 
 
 def _looks_like_node_id(value: Any) -> Optional[str]:
-    """Return the id-kind for a value like 'B016'/'E003'/'P027', else None.
+    """Return the id-kind for a value like 'B016'/'E003'/'P027', or the
+    generic 'node' string for any correctly-shaped id whose prefix is not
+    enumerated (e.g. CriticalTerm). Returns None if the value is not a valid
+    node id shape.
 
-    Real node IDs in this project are 1–4 digit numeric suffixes, typically
-    zero-padded (e.g. P001, E921, P1249, H044) — no node type has more than
-    ~2,000 members, so 4 digits is a hard ceiling.
-
-    External authority IDs stored on nodes SOMETIMES share the same first
-    letter but have a much longer digit run — most notably `idAKSency` values
-    like 'E0063034' or 'E0043772' (Encyclopedia of Korean Culture IDs).
-    Rejecting values with 5+ digit suffixes prevents those external IDs from
-    being mistaken for graph nodes and turned into broken Poetry Talks URLs
-    such as `https://poetrytalks.org/E0063034`. The correct URL for a Person
-    entity is derived from its OWN `id` field (e.g. `P553`)."""
-    if not isinstance(value, str) or len(value) < 2:
+    Every uppercase-letter + 1-4-digit value is treated as a node id — the
+    schema has 9 node classes and this project should never DROP a node
+    citation just because we don't know the exact prefix letter. External
+    authority IDs (idAKSency like 'E0063034', Wikidata like 'Q464558') are
+    rejected by the >4-digit ceiling and by column-name filtering elsewhere."""
+    if not is_valid_node_id(value):
         return None
-    prefix, rest = value[0], value[1:]
-    if prefix not in _ID_PREFIX_TO_KIND:
-        return None
-    if not rest.isdigit():
-        return None
-    if len(rest) > 4:               # external-ID length band — never a node
-        return None
-    return _ID_PREFIX_TO_KIND[prefix]
+    prefix = value[0]
+    return _ID_PREFIX_TO_KIND.get(prefix, "node")
 
 
 def _is_external_id_key(key: str) -> bool:
@@ -579,42 +597,63 @@ def entities_from_graph_row(row: dict) -> list:
 def provenance_from_graph_row(row: dict) -> list:
     """Best-effort provenance from id-looking values in a graph row.
 
-    Each detected node ID is embedded as a markdown link to its Poetry Talks
-    wiki page so the final Sources section renders one link per referenced
-    node — deterministic, not LLM-dependent. `source_url` carries the primary
-    reference URL (first non-empty in entry → poem/critique → work → entity)
-    for tooling that consumes the Provenance record directly."""
+    Every referenced node — Person, Entry, Poem, Critique, Work, Place,
+    Topic, Era, CriticalTerm, or any other class the graph exposes — has
+    its `id` value rendered as a markdown link to
+    `https://poetrytalks.org/<id>`. This link is the canonical
+    **"poetrytalks wikidata"** reference and MUST appear in the answer's
+    Sources section for every node cited in the answer body.
+
+    Unknown-prefix IDs (e.g. CriticalTerm if it uses a letter outside the
+    named-kind map) are preserved individually under `_extra_ids` so the
+    citation renderer can list them all — no node is silently dropped."""
     if not isinstance(row, dict):
         return []
-    ids: dict = {}
+
+    kinds: dict = {}          # kind → value  (for named kinds: entry, person, …)
+    extras: list = []         # (raw_value,)  (for unknown-prefix nodes)
+    seen_values: set = set()  # de-dup across the same row
+
     for key, value in row.items():
         # External-authority columns (idAKSency, idWikidata, ...) sometimes
-        # hold values whose first letter matches a node-type prefix
-        # (e.g. 'E0063034' starts with 'E'). Skipping those keys entirely
-        # keeps a row's OWN id (`person_id`, `entry_id`, ...) as the sole
-        # source for Poetry Talks URLs.
+        # hold values whose first letter matches a node-type prefix.
+        # Skipping those columns keeps only a row's OWN id fields as URL
+        # sources.
         if isinstance(key, str) and _is_external_id_key(key):
             continue
         kind = _looks_like_node_id(value)
-        if kind and kind not in ids:
-            ids[kind] = value
-    if not ids:
+        if not kind:
+            continue
+        if value in seen_values:
+            continue
+        seen_values.add(value)
+        if kind == "node":
+            extras.append(value)   # unknown-prefix — keep in insertion order
+        elif kind not in kinds:
+            kinds[kind] = value
+
+    if not kinds and not extras:
         return []
-    label_bits = [f"{k}={_linked_id(v)}" for k, v in ids.items()]
+
+    label_bits = [f"{k}={_linked_id(v)}" for k, v in kinds.items()]
+    for value in extras:
+        label_bits.append(f"node={_linked_id(value)}")
+
     primary_id = (
-        ids.get("entry") or ids.get("poem") or ids.get("critique")
-        or ids.get("work") or ids.get("person") or ids.get("place")
-        or ids.get("topic") or ids.get("era")
+        kinds.get("entry") or kinds.get("poem") or kinds.get("critique")
+        or kinds.get("work") or kinds.get("person") or kinds.get("place")
+        or kinds.get("topic") or kinds.get("era")
+        or (extras[0] if extras else None)
     )
     return [
         Provenance(
             source_type="neo4j_graph",
             label="Graph: " + ", ".join(label_bits),
             source_url=poetrytalks_url(primary_id),
-            work_id=ids.get("work"),
-            entry_id=ids.get("entry"),
-            poem_or_critique_id=ids.get("poem") or ids.get("critique"),
-            entity_id=ids.get("person") or ids.get("place"),
+            work_id=kinds.get("work"),
+            entry_id=kinds.get("entry"),
+            poem_or_critique_id=kinds.get("poem") or kinds.get("critique"),
+            entity_id=kinds.get("person") or kinds.get("place"),
         )
     ]
 

@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from tools.evidence import is_valid_node_id, poetrytalks_url
+
 _MAX_BLOCK_CHARS = 4000
 _MAX_TOTAL_CHARS = 14000
 _MAX_DOCS = 8
@@ -76,21 +78,31 @@ RETRIEVAL_STATUS_MESSAGES = {
 # not always Korean. These labels are used by (a) build_citations() when
 # pre-composing suggested citation lines and (b) the system-rule text below,
 # which shows the LLM the exact per-language label set to use.
+#
+# `poetrytalks_wikidata_prefix` is the canonical group label for URLs of the
+# form `https://poetrytalks.org/<node_id>` — the deterministic reference URL
+# for EVERY graph node (Person, Entry, Poem, Critique, Work, Place, Topic,
+# Era, CriticalTerm, ...). By explicit user policy this group MUST appear in
+# every response that cites any graph node, using exactly the proper name
+# "poetrytalks wikidata" across all languages (no translation of the name).
 CITATION_LABELS = {
     "ko": {
-        "sources_header":    "출처",
-        "graph_prefix":      "시화총림 그래프",
-        "link_only_prefix":  "참고 링크 (내용 미조회)",
+        "sources_header":            "출처",
+        "poetrytalks_wikidata_prefix": "poetrytalks wikidata",
+        "graph_prefix":              "시화총림 그래프",
+        "link_only_prefix":          "참고 링크 (내용 미조회)",
     },
     "en": {
-        "sources_header":    "Sources",
-        "graph_prefix":      "Sihwa Ch'ongnim Graph",
-        "link_only_prefix":  "Reference Link (not fetched)",
+        "sources_header":            "Sources",
+        "poetrytalks_wikidata_prefix": "poetrytalks wikidata",
+        "graph_prefix":              "Sihwa Ch'ongnim Graph",
+        "link_only_prefix":          "Reference Link (not fetched)",
     },
     "zh": {
-        "sources_header":    "来源",
-        "graph_prefix":      "诗话丛林图谱",
-        "link_only_prefix":  "参考链接（内容未获取）",
+        "sources_header":            "来源",
+        "poetrytalks_wikidata_prefix": "poetrytalks wikidata",
+        "graph_prefix":              "诗话丛林图谱",
+        "link_only_prefix":          "参考链接（内容未获取）",
     },
 }
 
@@ -235,12 +247,29 @@ the only step that writes user-facing prose. Obey these rules strictly:
    own pretraining.
 
 7. Never fabricate a link. Cite only URLs present in the evidence.
-   Exception — POETRY TALKS wiki URLs: every graph node ID (B/E/M/C/P/L/T/H
-   followed by digits, e.g. E003, P027, B016) resolves deterministically to
-   `https://poetrytalks.org/<ID>`. Evidence and citation lines ALREADY embed
-   these as markdown links, e.g. `[E003](https://poetrytalks.org/E003)` — use
-   them verbatim; never rewrite the base URL, never drop the link, and never
-   construct one for anything that is not a graph node ID from evidence.
+   Exception — POETRY TALKS WIKIDATA URLs: EVERY graph node ID, regardless
+   of the node's class (Person, Entry, Poem, Critique, Work, Place, Topic,
+   Era, CriticalTerm, ...), resolves deterministically to
+   `https://poetrytalks.org/<ID>`. Evidence and pre-computed citation lines
+   ALREADY embed these as markdown links, e.g.
+   `[E003](https://poetrytalks.org/E003)`,
+   `[P553](https://poetrytalks.org/P553)`. Use them verbatim; never rewrite
+   the base URL; never drop the link; never construct one for anything that
+   is not a graph node id present in the evidence.
+
+7a. MANDATORY "poetrytalks wikidata" GROUP — apply to EVERY response that
+    cites any graph node, without exception:
+      * The Sources section MUST begin with a group whose label is the
+        proper name "poetrytalks wikidata" (kept as-is in Korean, English,
+        and Chinese — DO NOT translate this proper name).
+      * Under that group, list ONE bullet per referenced node id, in the
+        form `- poetrytalks wikidata: [<ID>](https://poetrytalks.org/<ID>)`.
+      * Include every distinct node id you actually cited or relied on in
+        the answer body. If the answer references N nodes, the group has
+        N bullets — no fewer.
+      * Never omit this group when the answer references nodes; never
+        collapse it into another group; never rename it. This rule takes
+        priority over all formatting preferences.
 
 7b. ENTITY-TYPE SEPARATION: every external record is tagged [Person] or
    [Place]. Use a [Person] record only for that person and a [Place] record
@@ -251,34 +280,47 @@ the only step that writes user-facing prose. Obey these rules strictly:
    given — never translate, summarize, or alter them. Your commentary is in the
    locked response language; quoted source text keeps its original characters.
 
-9. CITATIONS: end with a source-separated Sources section. The section header
-   AND every group label MUST be written in the LOCKED response language above
-   (never mix languages here). Use exactly these localized labels — do not
-   translate them yourself, do not substitute synonyms:
+9. CITATIONS: end with a source-separated Sources section. Order (top-down):
+     (1) MANDATORY "poetrytalks wikidata" group (rule 7a) — one bullet per
+         referenced graph node id, kept as the literal proper name
+         "poetrytalks wikidata" in every language.
+     (2) Graph-provenance breadcrumbs (localized group label).
+     (3) External authority references (Wikidata / AKS Digerati / ...).
+     (4) Link-only reference URLs.
+
+   The Sources HEADER and the group labels for (2) and (4) MUST be written
+   in the LOCKED response language above (never mix languages). Use exactly
+   these localized labels — do not translate them yourself, do not
+   substitute synonyms:
      Korean → header "출처"
-         · graph group prefix:     "시화총림 그래프"
-         · link-only group prefix: "참고 링크 (내용 미조회)"
+         · "poetrytalks wikidata"                 (unchanged proper name)
+         · graph group prefix:      "시화총림 그래프"
+         · link-only group prefix:  "참고 링크 (내용 미조회)"
      English → header "Sources"
-         · graph group prefix:     "Sihwa Ch'ongnim Graph"
-         · link-only group prefix: "Reference Link (not fetched)"
+         · "poetrytalks wikidata"                 (unchanged proper name)
+         · graph group prefix:      "Sihwa Ch'ongnim Graph"
+         · link-only group prefix:  "Reference Link (not fetched)"
      Chinese → header "来源"
-         · graph group prefix:     "诗话丛林图谱"
-         · link-only group prefix: "参考链接（内容未获取）"
+         · "poetrytalks wikidata"                 (unchanged proper name)
+         · graph group prefix:      "诗话丛林图谱"
+         · link-only group prefix:  "参考链接（内容未获取）"
    External authority proper names (Wikidata, AKS Digerati, Library of
    Congress, ...) stay in their original form in every language.
    Every quoted source text must carry full graph provenance from the graph
-   evidence block. The recommended-citation lines you receive are pre-built in
-   the same locked language — you may reuse them verbatim.
+   evidence block. The recommended-citation lines you receive are pre-built
+   in the same locked language — you may reuse them verbatim.
 
-   POETRY TALKS LINKS in the graph group: provenance labels already embed
-   every referenced node ID as a markdown link
+   POETRY TALKS LINKS IN THE ANSWER BODY: provenance labels and citation
+   lines already embed every referenced node ID as a markdown link
    (e.g. `[E003](https://poetrytalks.org/E003)`,
    `[P027](https://poetrytalks.org/P027)`,
-   `[B016](https://poetrytalks.org/B016)`). Keep those markdown links intact
-   in the Sources section AND, whenever you mention a specific entity in the
-   body of the answer, wrap its ID with the same markdown link so the reader
-   can jump straight to that node's Poetry Talks wiki page. The URL is always
-   `https://poetrytalks.org/<ID>` — never invent a different base URL.
+   `[B016](https://poetrytalks.org/B016)`,
+   `[K123](https://poetrytalks.org/K123)` for a CriticalTerm-shape id).
+   Keep those markdown links intact AND, whenever you mention a specific
+   entity in the body of the answer, wrap its ID with the same markdown
+   link so the reader can jump straight to that node's Poetry Talks page.
+   The URL is always `https://poetrytalks.org/<ID>` — never invent a
+   different base URL, never omit the link for any cited node.
 
 10. RETRIEVAL STATUS: if a "Retrieval Status" block is present, relay its
    message briefly in the locked language. "No results" and "temporarily
@@ -516,11 +558,18 @@ def format_evidence_for_prompt(evidence: dict, language: str = "ko") -> str:
 def build_citations(evidence: dict, language: str = "ko") -> list:
     """Build source-separated citation lines from provenance/claims.
 
-    Never fabricates a link — only emits URLs present in the evidence.
-    Localized per the locked response language: graph and link-only prefixes
-    come from CITATION_LABELS[language]. External authority proper names
-    (Wikidata, AKS Digerati, ...) stay in their original form."""
+    Every referenced graph node — regardless of class — carries a canonical
+    `https://poetrytalks.org/<id>` URL. Those URLs are collected into a
+    single **"poetrytalks wikidata"** group that MUST appear whenever any
+    graph node is cited. The group name is a proper noun and is NOT
+    translated between languages.
+
+    Never fabricates a link — only emits URLs derivable from ids present in
+    the evidence. Graph and link-only group labels come from
+    CITATION_LABELS[language]. External authority proper names (Wikidata,
+    AKS Digerati, ...) stay in their original form."""
     labels = CITATION_LABELS.get(language) or CITATION_LABELS["ko"]
+    ptw_prefix = labels["poetrytalks_wikidata_prefix"]
     graph_prefix = labels["graph_prefix"]
     link_only_prefix = labels["link_only_prefix"]
 
@@ -536,6 +585,21 @@ def build_citations(evidence: dict, language: str = "ko") -> list:
     vector = _to_dict(evidence.get("vector"))
     external = _to_dict(evidence.get("external"))
 
+    # (a) Collect every node id referenced anywhere in the evidence bundle,
+    # in insertion order (which mirrors the order the LLM will see them).
+    # These become the mandatory "poetrytalks wikidata" citations.
+    ptw_ids = _collect_all_node_ids(graph, vector)
+    for node_id in ptw_ids:
+        url = poetrytalks_url(node_id)
+        if not url:
+            continue
+        _add(f"- {ptw_prefix}: [{node_id}]({url})")
+
+    # (b) Legacy per-provenance rendering — kept so the LLM still sees the
+    # human-oriented breadcrumb (지봉유설 > Entry 3 (E003)). Every embedded
+    # node id inside these labels is already surfaced above under the
+    # "poetrytalks wikidata" group, but the breadcrumb adds provenance
+    # context (work name, entry position) that the raw id list lacks.
     for prov in graph.get("provenance", []) + vector.get("provenance", []):
         _add(f"- {graph_prefix}: {prov.get('label')}")
 
@@ -551,6 +615,59 @@ def build_citations(evidence: dict, language: str = "ko") -> list:
         elif status == "link_only":
             _add(f"- {link_only_prefix} — {label}: [{who}]({url})")
     return citations
+
+
+def _collect_all_node_ids(graph: dict, vector: dict) -> list:
+    """Return every distinct node id referenced in graph + vector evidence,
+    preserving first-seen order. Sources:
+
+      * `Provenance.work_id / entry_id / poem_or_critique_id / entity_id`
+        stored on the provenance record for named kinds;
+      * Any `E###` `M###` `C###` `P###` etc. embedded in a provenance label
+        (covers unknown-prefix / additional ids the row exposed);
+      * `Entity.node_id` for resolved Person / Place entities;
+      * `document['entry_id']` on each vector document.
+
+    All values are shape-validated by `is_valid_node_id` so external
+    authority values (Wikidata Q-ids, idAKSency codes, ...) never leak into
+    this group."""
+    order: list = []
+    seen: set = set()
+
+    def _push(candidate):
+        if not isinstance(candidate, str):
+            return
+        candidate = candidate.strip()
+        if not candidate or candidate in seen:
+            return
+        if not is_valid_node_id(candidate):
+            return
+        seen.add(candidate)
+        order.append(candidate)
+
+    for prov in graph.get("provenance", []) + vector.get("provenance", []):
+        for k in ("work_id", "entry_id", "poem_or_critique_id", "entity_id"):
+            _push(prov.get(k))
+        # `label` embeds every id already rendered as a markdown link.
+        for match in _MD_LINK_ID_RE.findall(prov.get("label") or ""):
+            _push(match)
+
+    for ent in graph.get("entities", []) + vector.get("entities", []):
+        _push(ent.get("node_id"))
+
+    for doc in vector.get("documents", []):
+        _push(doc.get("entry_id"))
+        _push(doc.get("work_id"))
+
+    return order
+
+
+# Extract the `<id>` from any `[<id>](https://poetrytalks.org/<id>)` markdown
+# link embedded in provenance labels — recovers unknown-prefix ids that
+# `Provenance.*_id` fields don't structurally represent.
+_MD_LINK_ID_RE = __import__("re").compile(
+    r"\[([A-Z]\d{1,4})\]\(https://poetrytalks\.org/[A-Z]\d{1,4}\)"
+)
 
 
 def _to_dict(ev: Any) -> dict:
