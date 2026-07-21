@@ -152,7 +152,13 @@ class Entity:
 
 @dataclass
 class Provenance:
-    """Where a claim/document came from, in citable form."""
+    """Where a claim/document came from, in citable form.
+
+    `label` is the retrieval-time default (Korean-first) string. Synthesis
+    consumers should PREFER rebuilding a language-appropriate label from the
+    raw components (`work_name_kor/eng/chi`, `entry_position`) so a locked
+    response language of `en` or `zh` doesn't leak Korean into the Sources
+    section. When those fields are absent, `label` remains the fallback."""
 
     source_type: str
     label: str
@@ -161,6 +167,11 @@ class Provenance:
     work_id: Optional[str] = None
     entry_id: Optional[str] = None
     poem_or_critique_id: Optional[str] = None
+    # Raw components for language-aware rendering at synthesis time.
+    work_name_kor: Optional[str] = None
+    work_name_eng: Optional[str] = None
+    work_name_chi: Optional[str] = None
+    entry_position: Any = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -407,10 +418,14 @@ def document_to_parts(doc: Any) -> tuple:
     entities = entities_from_vector_meta(meta)
     entry_id = meta.get("entry_id")
     work_id = meta.get("source_work_id")
+    entry_position = meta.get("entry_position")
     # Prefer the deterministic URL built from the entry_id; fall back to the
     # Cypher-provided poetrytalks_link if the id shape is unrecognized.
     entry_url = poetrytalks_url(entry_id) or meta.get("poetrytalks_link")
     work_ref = _linked_id(work_id) if work_id else None
+    # Retrieval-time default label — Korean-first for backward compatibility.
+    # Synthesis code should rebuild a language-appropriate label from the raw
+    # `work_name_*` components on the Provenance record.
     work_name = (
         meta.get("source_work_kor") or meta.get("source_work_eng") or "Work"
     )
@@ -419,12 +434,16 @@ def document_to_parts(doc: Any) -> tuple:
         Provenance(
             source_type="neo4j_vector",
             label=(
-                f"{work_label} > Entry {meta.get('entry_position')} "
+                f"{work_label} > Entry {entry_position} "
                 f"({_linked_id(entry_id)})"
             ),
             source_url=entry_url,
             work_id=work_id,
             entry_id=entry_id,
+            work_name_kor=meta.get("source_work_kor"),
+            work_name_eng=meta.get("source_work_eng"),
+            work_name_chi=meta.get("source_work_chi"),
+            entry_position=entry_position,
         )
     ]
     return document, entities, provenance

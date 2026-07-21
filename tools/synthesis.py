@@ -20,6 +20,70 @@ from typing import Any
 
 from tools.evidence import is_valid_node_id, poetrytalks_url
 
+
+# ── Language-aware label rebuild helpers (fixes Korean-in-English-Sources) ───
+def _pick_by_language(kor: Optional[str], eng: Optional[str],
+                      chi: Optional[str], language: str) -> Optional[str]:
+    """Return the name variant that matches the locked response language.
+    Falls back through the other languages when the preferred one is empty.
+
+    Priority order per language:
+      * en → eng, kor, chi
+      * zh → chi, kor, eng
+      * ko (or unknown) → kor, eng, chi
+    """
+    if language == "en":
+        return eng or kor or chi
+    if language == "zh":
+        return chi or kor or eng
+    return kor or eng or chi
+
+
+def _work_name_bilingual(prov: dict, language: str) -> Optional[str]:
+    """Language-aware work name, bilingual when the answer language differs
+    from the original (Korean) name — e.g. "Paegwan Chapki (패관잡기)" for
+    English answers so English-language readers can still cross-reference
+    the Korean original."""
+    kor = prov.get("work_name_kor")
+    eng = prov.get("work_name_eng")
+    chi = prov.get("work_name_chi")
+    if not any((kor, eng, chi)):
+        return None
+    primary = _pick_by_language(kor, eng, chi, language)
+    if language == "ko":
+        return primary
+    # For en / zh, append the Korean original in parentheses when it differs
+    # from the primary — informative bilingual reference.
+    if primary and kor and primary != kor:
+        return f"{primary} ({kor})"
+    return primary
+
+
+def _rebuild_vector_prov_label(prov: dict, language: str) -> str:
+    """Render one vector-provenance line in the locked response language.
+
+    Uses `Provenance.work_name_kor/eng/chi` and `entry_position` when
+    present; falls back to the retrieval-time `label` string otherwise.
+    """
+    from tools.evidence import _linked_id
+
+    work_name = _work_name_bilingual(prov, language)
+    if not work_name:
+        return prov.get("label") or ""
+    work_id = prov.get("work_id")
+    entry_id = prov.get("entry_id")
+    entry_position = prov.get("entry_position")
+
+    parts = []
+    if work_id:
+        parts.append(f"{work_name} ({_linked_id(work_id)})")
+    else:
+        parts.append(work_name)
+    if entry_position is not None or entry_id:
+        pos = "" if entry_position is None else str(entry_position)
+        parts.append(f"Entry {pos} ({_linked_id(entry_id)})".strip())
+    return " > ".join(parts)
+
 _MAX_BLOCK_CHARS = 4000
 _MAX_TOTAL_CHARS = 14000
 _MAX_DOCS = 8
@@ -271,6 +335,36 @@ the only step that writes user-facing prose. Obey these rules strictly:
         collapse it into another group; never rename it. This rule takes
         priority over all formatting preferences.
 
+7b. VERBATIM CITATION REPRODUCTION — CRITICAL. The "recommended citation
+    lines" delivered in the human message ARE the finalized Sources
+    content. You MUST copy each bullet EXACTLY into your final answer:
+      * Preserve every `[id](url)` markdown link INTACT — never strip the
+        `(url)` part, never omit the id, never replace the link with plain
+        text like the group name.
+      * Preserve the leading `- ` (dash + space) so Streamlit renders each
+        line as an individual bullet — do NOT convert them into markdown
+        sub-headers (`### poetrytalks wikidata`).
+      * Preserve every distinct bullet — do NOT collapse multiple bullets
+        with the same group prefix into a single header.
+
+    ✓ CORRECT rendering (identical to what the pre-built lines look like):
+    ---
+    ## Sources
+    - poetrytalks wikidata: [P553](https://poetrytalks.org/P553)
+    - poetrytalks wikidata: [E031](https://poetrytalks.org/E031)
+    - Sihwa Ch'ongnim Graph: Paegwan Chapki (패관잡기) > Entry 31 ([E031](https://poetrytalks.org/E031))
+    ---
+
+    ✗ WRONG (this is what a previous response looked like — never do this):
+    ---
+    ## Sources
+    poetrytalks wikidata
+    Sihwa Ch'ongnim Graph
+    Sihwa Ch'ongnim Graph: 패관잡기 > Entry 31
+    ---
+    (URLs stripped, bullets collapsed into headers, ids omitted, Korean
+    work name leaking into an English answer.)
+
 7b. ENTITY-TYPE SEPARATION: every external record is tagged [Person] or
    [Place]. Use a [Person] record only for that person and a [Place] record
    only for that place. Never cite a Person authority record in a Place answer
@@ -382,7 +476,8 @@ def _format_graph_block(graph: dict, outcome: str = "ok") -> str:
     return _truncate("\n".join(lines))
 
 
-def _format_vector_block(vector: dict, outcome: str = "ok") -> str:
+def _format_vector_block(vector: dict, outcome: str = "ok",
+                          language: str = "ko") -> str:
     lines = ["## Vector Evidence (Neo4j text retrieval — authoritative source texts)"]
     docs = vector.get("documents", [])
     if not docs:
@@ -391,7 +486,10 @@ def _format_vector_block(vector: dict, outcome: str = "ok") -> str:
         else:
             lines.append("(no vector documents)")
     for d in docs[:_MAX_DOCS]:
-        work = d.get("work_name_kor") or d.get("work_name_eng") or "Work"
+        # Pick the work name matching the locked response language and, when
+        # the answer isn't Korean, append the Korean original in parens so
+        # non-Korean readers can still cross-reference the original title.
+        work = _work_name_bilingual(d, language) or "Work"
         # NOTE: "source:" is a language-neutral evidence-block metadata label —
         # kept in English so the LLM does not mirror a Korean prefix into the
         # user-facing Sources section. Final citation labels are enforced by
@@ -543,7 +641,7 @@ def format_evidence_for_prompt(evidence: dict, language: str = "ko") -> str:
     parts = [
         "\n".join(ent_lines),
         _format_graph_block(graph, graph_outcome),
-        _format_vector_block(vector, vector_outcome),
+        _format_vector_block(vector, vector_outcome, language),
         _format_external_block(external),
     ]
     status_block = _format_status_block(statuses, language)
@@ -595,13 +693,17 @@ def build_citations(evidence: dict, language: str = "ko") -> list:
             continue
         _add(f"- {ptw_prefix}: [{node_id}]({url})")
 
-    # (b) Legacy per-provenance rendering — kept so the LLM still sees the
-    # human-oriented breadcrumb (지봉유설 > Entry 3 (E003)). Every embedded
-    # node id inside these labels is already surfaced above under the
-    # "poetrytalks wikidata" group, but the breadcrumb adds provenance
-    # context (work name, entry position) that the raw id list lacks.
-    for prov in graph.get("provenance", []) + vector.get("provenance", []):
+    # (b) Per-provenance breadcrumb rendered in the LOCKED response language.
+    # Graph-provenance labels are ID-only (already language-neutral) so we
+    # keep their static label. Vector-provenance labels are REBUILT from raw
+    # `work_name_kor/eng/chi` + `entry_position` so an English or Chinese
+    # answer doesn't leak the Korean work name into the Sources section.
+    for prov in graph.get("provenance", []):
         _add(f"- {graph_prefix}: {prov.get('label')}")
+    for prov in vector.get("provenance", []):
+        rendered = _rebuild_vector_prov_label(prov, language)
+        if rendered:
+            _add(f"- {graph_prefix}: {rendered}")
 
     for c in external.get("claims", []):
         url = c.get("url")

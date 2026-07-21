@@ -626,10 +626,13 @@ synthesis_prompt = ChatPromptTemplate.from_messages(
             "Use ONLY these blocks as factual sources:\n"
             "{evidence_blocks}\n\n"
             "Write the final answer following every rule above, ending with a "
-            "Sources section whose header AND group labels are in the LOCKED "
-            "response language (see rule 9 for the exact label set per language). "
-            "Recommended citation lines (already pre-composed in the locked "
-            "language — reuse verbatim, do not fabricate URLs):\n"
+            "Sources section whose header is in the LOCKED response language.\n\n"
+            "The lines below are the FINAL, COMPLETE Sources content. Copy "
+            "every bullet EXACTLY into your Sources section — preserve the "
+            "leading `- `, preserve every `[id](url)` markdown link with its "
+            "URL intact, keep each bullet on its own line, and do NOT collapse "
+            "bullets that share a group prefix into a single markdown header. "
+            "See rule 7b for correct vs incorrect examples.\n"
             "{suggested_citations}",
         ),
     ]
