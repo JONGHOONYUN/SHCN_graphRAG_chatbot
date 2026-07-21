@@ -447,13 +447,45 @@ _ROW_ID_SUFFIXES = {
 
 
 def _looks_like_node_id(value: Any) -> Optional[str]:
-    """Return the id-kind for a value like 'B016'/'E003'/'P027', else None."""
+    """Return the id-kind for a value like 'B016'/'E003'/'P027', else None.
+
+    Real node IDs in this project are 1–4 digit numeric suffixes, typically
+    zero-padded (e.g. P001, E921, P1249, H044) — no node type has more than
+    ~2,000 members, so 4 digits is a hard ceiling.
+
+    External authority IDs stored on nodes SOMETIMES share the same first
+    letter but have a much longer digit run — most notably `idAKSency` values
+    like 'E0063034' or 'E0043772' (Encyclopedia of Korean Culture IDs).
+    Rejecting values with 5+ digit suffixes prevents those external IDs from
+    being mistaken for graph nodes and turned into broken Poetry Talks URLs
+    such as `https://poetrytalks.org/E0063034`. The correct URL for a Person
+    entity is derived from its OWN `id` field (e.g. `P553`)."""
     if not isinstance(value, str) or len(value) < 2:
         return None
     prefix, rest = value[0], value[1:]
-    if prefix in _ID_PREFIX_TO_KIND and rest.isdigit():
-        return _ID_PREFIX_TO_KIND[prefix]
-    return None
+    if prefix not in _ID_PREFIX_TO_KIND:
+        return None
+    if not rest.isdigit():
+        return None
+    if len(rest) > 4:               # external-ID length band — never a node
+        return None
+    return _ID_PREFIX_TO_KIND[prefix]
+
+
+def _is_external_id_key(key: str) -> bool:
+    """True if `key` names an external-authority ID column.
+
+    In this schema, external-reference columns are `id` immediately followed
+    by an uppercase letter (idAKSency, idAKSdigerati, idWikidata, idLOC,
+    idOpenLibrary, idCBDB, idYaleLux, idBritannica, idBnF, ...). Node-own ID
+    columns are either exactly `id` or `<role>_id` (person_id, entry_id,
+    work_id, creator_person_id, ...) — never rejected here.
+
+    Even with the digit-length guard in `_looks_like_node_id`, keeping this
+    key-level guard makes the intent explicit: idAKS* / idWiki* / idLOC etc.
+    are references OUT of the graph, not identifiers of the current row's
+    node. Renders as `entry=E0063034` never make sense."""
+    return len(key) >= 3 and key.startswith("id") and key[2].isupper()
 
 
 def _allowed_authority_keys(node_type: str) -> Optional[set]:
@@ -555,7 +587,14 @@ def provenance_from_graph_row(row: dict) -> list:
     if not isinstance(row, dict):
         return []
     ids: dict = {}
-    for value in row.values():
+    for key, value in row.items():
+        # External-authority columns (idAKSency, idWikidata, ...) sometimes
+        # hold values whose first letter matches a node-type prefix
+        # (e.g. 'E0063034' starts with 'E'). Skipping those keys entirely
+        # keeps a row's OWN id (`person_id`, `entry_id`, ...) as the sole
+        # source for Poetry Talks URLs.
+        if isinstance(key, str) and _is_external_id_key(key):
+            continue
         kind = _looks_like_node_id(value)
         if kind and kind not in ids:
             ids[kind] = value
