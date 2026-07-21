@@ -55,11 +55,19 @@ _REQUEST_TIMEOUT_SECONDS = (5, 30)   # (connect, read)
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
+# Sane default embedding model. Chosen at import when `GOOGLE_EMBEDDING_MODEL`
+# is unset — no network probing. Explicit configuration always takes priority
+# and is strongly recommended (see secrets.toml.example).
+_DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
+
+
 def _sleep_before_retry(response: Optional[requests.Response],
-                        attempt: int,
-                        sleeper=time.sleep,
-                        rng=random.random) -> None:
-    """Honour Retry-After when present; otherwise bounded exp backoff+jitter."""
+                        attempt: int) -> None:
+    """Honour Retry-After when present; otherwise bounded exp backoff+jitter.
+
+    `time.sleep` and `random.random` are looked up at call time (module
+    attribute access, not default-argument capture) so tests can patch
+    `llm.time.sleep` reliably."""
     delay: Optional[float] = None
     if response is not None:
         raw = response.headers.get("Retry-After")
@@ -71,8 +79,8 @@ def _sleep_before_retry(response: Optional[requests.Response],
     if delay is None:
         delay = min(_MAX_BACKOFF_SECONDS,
                     _BASE_BACKOFF_SECONDS * (2 ** attempt))
-        delay += rng() * 0.5   # jitter
-    sleeper(delay)
+        delay += random.random() * 0.5   # jitter
+    time.sleep(delay)
 
 
 class GoogleEmbeddings(Embeddings):
@@ -94,14 +102,17 @@ class GoogleEmbeddings(Embeddings):
         if not api_key:
             raise ConfigurationError("GOOGLE_API_KEY is empty")
         if model is None:
+            # Prefer an explicit secret; fall back to the pinned default so a
+            # fresh deployment does not break before the operator sets the
+            # secret. This is a NAMING default — no network probing runs.
             try:
                 model = st.secrets["GOOGLE_EMBEDDING_MODEL"]
-            except Exception as exc:
-                raise ConfigurationError(
-                    "GOOGLE_EMBEDDING_MODEL is not configured. Set it in "
-                    "secrets.toml — auto-discovery is disabled in the "
-                    "request path."
-                ) from exc
+            except Exception:
+                logger.info(
+                    "GOOGLE_EMBEDDING_MODEL not in secrets; using default %s",
+                    _DEFAULT_EMBEDDING_MODEL,
+                )
+                model = _DEFAULT_EMBEDDING_MODEL
         if not model:
             raise ConfigurationError("embedding model name is empty")
         self.api_key = api_key
@@ -143,8 +154,7 @@ class GoogleEmbeddings(Embeddings):
         return vectors
 
     # ── HTTP + retry ───────────────────────────────────────────────────────
-    def _post_with_retry(self, url: str, payload: dict,
-                         *, sleeper=time.sleep, rng=random.random) -> dict:
+    def _post_with_retry(self, url: str, payload: dict) -> dict:
         """POST with bounded retry.
 
         Retryable: 429 + 5xx (subset above).
@@ -169,7 +179,7 @@ class GoogleEmbeddings(Embeddings):
                 if attempt == _MAX_RETRIES - 1:
                     raise TransientProviderError(
                         "embedding provider timed out") from exc
-                _sleep_before_retry(None, attempt, sleeper, rng)
+                _sleep_before_retry(None, attempt)
                 continue
             except requests.RequestException as exc:
                 # Non-timeout connection failure — bounded retry.
@@ -181,7 +191,7 @@ class GoogleEmbeddings(Embeddings):
                     raise TransientProviderError(
                         f"embedding transport failure: "
                         f"{type(exc).__name__}") from exc
-                _sleep_before_retry(None, attempt, sleeper, rng)
+                _sleep_before_retry(None, attempt)
                 continue
 
             last_status = response.status_code
@@ -191,7 +201,7 @@ class GoogleEmbeddings(Embeddings):
                         f"embedding retry budget exhausted "
                         f"(last status: {last_status})"
                     )
-                _sleep_before_retry(response, attempt, sleeper, rng)
+                _sleep_before_retry(response, attempt)
                 continue
             if 400 <= response.status_code < 500:
                 # 4xx: auth / validation / not-found — retrying is pointless

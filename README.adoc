@@ -38,3 +38,49 @@ pip install pytest
 +
 [source,sh]
 pytest
+
+The project's own hardening tests use only stdlib `unittest` and require no
+network, Neo4j, or Gemini access:
+
+[source,sh]
+python -m unittest discover -s tests
+
+== Deployment configuration
+
+Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill
+in real values. Required keys: `APP_PASSWORD`, `GOOGLE_API_KEY`,
+`GOOGLE_MODEL`, `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`,
+`NEO4J_DATABASE`. Optional: `GOOGLE_EMBEDDING_MODEL` (default
+`models/gemini-embedding-001`, 3072-dim), `EMBEDDING_DIMENSION`,
+authority-lookup caps. The real `secrets.toml` must never be committed.
+
+=== Neo4j read-only account
+
+The chatbot pipeline enforces application-layer read-only Cypher
+(`tools/cypher_safety.py`) — every LLM-generated query is stripped of
+comments and string literals, tokenised, and rejected if it contains a
+write / schema / permission / dynamic keyword or an un-allowlisted CALL.
+A trailing `LIMIT` is added or lowered to a safe cap.
+
+Application defence is not a substitute for a proper least-privilege DB
+role. The Neo4j account whose credentials are stored in `secrets.toml`
+SHOULD be a read-only role. `Neo4jChatMessageHistory` writes chat history
+nodes — if you want a hard write ban at the DB level, either grant write
+permission only for the history namespace, or split into two accounts
+(read-only for chains, writer for history).
+
+=== Embedding-index compatibility
+
+Vector indexes `EntryTextsKor` / `EntryTextsEng` / `EntryTextsChi` on
+`Entry.textEmbedding_{Kor,Eng,Chi}` must have been built with the same
+embedding model that `GOOGLE_EMBEDDING_MODEL` names. A silent model swap
+will produce vectors of a different dimension; setting `EMBEDDING_DIMENSION`
+in secrets makes every response check the dimension so a swap is caught
+before it poisons the index. If the check fails, reindex the affected
+property before continuing.
+
+=== Rate-limiting policy
+
+`APP_PASSWORD` is compared with `hmac.compare_digest` (constant-time). The
+application does NOT implement brute-force protection — configure IP-based
+throttling at Streamlit Cloud or the reverse proxy layer.

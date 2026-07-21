@@ -31,25 +31,11 @@ from utils import get_session_id
 
 
 # ──────────────────────────────────────────────
-# 언어별 인덱스 라우팅 (tools/vector.py의 INDEX_BY_LANG와 동일)
+# 언어별 인덱스 라우팅
+# `rag_config` 모듈이 유일한 소유자. 텍스트RAG와 그래프RAG(tools/vector.py) 모두
+# 같은 dict를 참조하므로 라벨/인덱스명 변경 시 rag_config 한 곳만 편집한다.
 # ──────────────────────────────────────────────
-INDEX_BY_LANG = {
-    "ko": {
-        "index_name": "EntryTextsKor",
-        "text_property": "textKor",
-        "embedding_property": "textEmbedding_Kor",
-    },
-    "en": {
-        "index_name": "EntryTextsEng",
-        "text_property": "textEng",
-        "embedding_property": "textEmbedding_Eng",
-    },
-    "zh": {
-        "index_name": "EntryTextsChi",
-        "text_property": "textChi",
-        "embedding_property": "textEmbedding_Chi",
-    },
-}
+from rag_config import index_config_for
 
 TOP_K = 10  # 그래프 메타 확장이 없으므로 다양한 후보 확보 위해 상향
 
@@ -88,7 +74,7 @@ _retrievers: dict = {}
 
 
 def _get_text_retriever_for_lang(lang: str):
-    cfg = INDEX_BY_LANG.get(lang, INDEX_BY_LANG["ko"])
+    cfg = index_config_for(lang)
     if lang not in _retrievers:
         neo4jvector = Neo4jVector.from_existing_index(
             embeddings,

@@ -169,23 +169,11 @@ def _build_prompt():
 # 생성해 두었으므로(EntryTextsKor / EntryTextsChi / EntryTextsEng), 사용자 질문
 # 언어(effective_language)에 맞는 in-language 인덱스로 매칭하여 검색 정확도를 높임.
 # ──────────────────────────────────────────────
-INDEX_BY_LANG = {
-    "ko": {
-        "index_name": "EntryTextsKor",
-        "text_property": "textKor",
-        "embedding_property": "textEmbedding_Kor",
-    },
-    "en": {
-        "index_name": "EntryTextsEng",
-        "text_property": "textEng",
-        "embedding_property": "textEmbedding_Eng",
-    },
-    "zh": {
-        "index_name": "EntryTextsChi",
-        "text_property": "textChi",
-        "embedding_property": "textEmbedding_Chi",
-    },
-}
+# INDEX_BY_LANG is now owned by `rag_config` — re-exported for backward
+# compatibility so downstream imports keep working. Any change to the index
+# map must be made in `rag_config.INDEX_BY_LANG` only.
+from rag_config import INDEX_BY_LANG as INDEX_BY_LANG  # re-export
+from rag_config import index_config_for
 
 
 def _build_retrieval_query(text_property: str) -> str:
@@ -303,7 +291,7 @@ _retrievers: dict = {}
 
 
 def _get_retriever_for_lang(lang: str):
-    cfg = INDEX_BY_LANG.get(lang, INDEX_BY_LANG["ko"])
+    cfg = index_config_for(lang)
     if lang not in _retrievers:
         neo4jvector = Neo4jVector.from_existing_index(
             embeddings,

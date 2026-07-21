@@ -217,3 +217,121 @@ never in the prompt, no_results vs failure, both-failed safe message,
 log-only diagnostics); coverage counts/truncation notes and cap configuration.
 Mutation-checked (removing a registry entry fails the coverage test). No test
 requires live Neo4j, Gemini, or external API access.
+
+---
+
+## Security & reliability hardening (2026-07-21)
+
+Work order: `CLAUDE_CODE_SECURITY_RELIABILITY_HARDENING.md`.
+
+### Phase 1 — Cypher read-only defence
+
+- New module `tools/cypher_safety.py`.
+- `validate_read_only_cypher(query)` strips comments / string / backtick
+  literals, tokenises, and rejects any occurrence of `CREATE`, `MERGE`,
+  `DELETE`, `DETACH`, `SET`, `REMOVE`, `DROP`, `ALTER`, `RENAME`, `GRANT`,
+  `DENY`, `REVOKE`, `LOAD`, `FOREACH`, `USE`, multi-statement `;`, or any
+  `CALL` (procedure OR subquery) that is not in a small allowlist. Adds or
+  lowers a trailing `LIMIT` to the configured max_rows cap.
+- `SafeNeo4jGraph` proxy validates every `.query()` before the driver call.
+  Two variants: a plain-Python proxy for tests / mocks, and a `Neo4jGraph`
+  subclass that pydantic accepts on `GraphCypherQAChain(graph=…)` and
+  reuses the connected inner instance (no second Bolt driver).
+- Both `cypher_qa` and `cypher_qa_structured` in `tools/cypher.py` are now
+  built with `graph=safe_graph(graph)`; `Neo4jChatMessageHistory` still
+  writes through the plain graph.
+- `UnsafeCypherError` carries a correlation id but NOT the offending query;
+  callers log the id and return `invalid_query` status to synthesis.
+- 39 unit tests in `tests/test_cypher_safety.py` cover legitimate reads,
+  every forbidden keyword, case / whitespace / comment / backtick bypasses,
+  multi-statement, CALL, missing RETURN, LIMIT enforcement, correlation
+  id secrecy, and the proxy's mock-friendly path.
+
+### Phase 2 — Auth-gated lazy initialization
+
+- `bot.py` top-level imports no longer touch `agent`, `text_rag`, `llm`,
+  `graph`, or `tools.*`. `from agent import generate_response` moved into
+  `handle_submit()` so `sys.modules` handles caching after the first
+  post-auth call. AST-level regression test in `tests/test_phase2_auth_init.py`
+  fails if any of those roots are re-added at top level.
+- `hmac.compare_digest` replaces the naive `==` password check. Rate-
+  limiting policy is documented as a deployment-layer concern.
+- `utils.get_session_id()` gains a stable-per-process `fallback-<uuid>`
+  return value when `get_script_run_ctx()` returns None (tests / CLI).
+
+### Phase 3 — Exception taxonomy and fallback policy
+
+- New module `errors.py` with `ConfigurationError`, `TransientProviderError`,
+  `UnsafeQueryError`, `RetrievalError`, `ModelResponseError` and an
+  `is_fallback_eligible(exc)` predicate. Every class carries a
+  `correlation_id`.
+- `agent.generate_response`'s "swallow any Exception → ReAct fallback"
+  pattern is gone. Only `TransientProviderError` triggers the ReAct path.
+  `UnsafeCypherError`, `UnsafeQueryError`, `ConfigurationError`,
+  `RetrievalError`, the Gemini empty-stream `ValueError`, and unclassified
+  exceptions all produce the localized safe message with a correlation id
+  logged server-side.
+- `handle_submit()` wraps the whole call in a try/except and shows a
+  language-aware safe message with the correlation id — no raw stack
+  trace ever surfaces on the Streamlit page.
+- 16 tests in `tests/test_phase3_fallback_policy.py` verify that only
+  transient failures fall back, no_results doesn't fall back, and every
+  error path emits one correlation id.
+
+### Phase 4 — Introspection-based arity dispatch
+
+- `tools/orchestrator._safe_retrieve` and `_call_fetcher` no longer use
+  `try: fn(3-args) except TypeError: fn(2-args)`. New helper
+  `_fn_accepts_arity` uses `inspect.signature` to pick the right arity
+  BEFORE calling. `*args` callables (MagicMock) are treated as compatible
+  with any arity.
+- A `TypeError` raised INSIDE the callable is no longer interpreted as an
+  arity mismatch — it is a retrieval failure. Side-effectful mocks and
+  fetchers are guaranteed to be invoked at most once.
+- 12 tests in `tests/test_phase4_signature_dispatch.py` cover canonical /
+  legacy dispatch, body-`TypeError` non-retry, and the end-to-end
+  orchestrator behaviour.
+
+### Phase 5 — Embedding client hardening
+
+- `llm.GoogleEmbeddings` now:
+  * Pins the model via `GOOGLE_EMBEDDING_MODEL` in secrets (safe fallback
+    `models/gemini-embedding-001`), never auto-discovers in the request
+    path. `discover_available_model()` is kept as an admin-only helper.
+  * Uses a bounded retry policy: 3 attempts, exponential backoff capped at
+    8s + jitter, honours `Retry-After`, never blocks a live session for
+    60s. 4xx responses raise `ConfigurationError` (no retry). 429/5xx
+    exhaustion raises `TransientProviderError`.
+  * Validates every response: HTTP status, JSON content-type, `embedding`
+    schema, numeric vector, batch-count match. Malformed responses raise
+    `ModelResponseError`.
+  * `embed_documents([])` returns `[]` with ZERO network calls.
+  * Optional `expected_dim` catches silent server-side model swaps. Not
+    supplied → first successful response pins the dimension.
+- HTTP client is injectable (`requests.Session`) so 16 unit tests exercise
+  every branch without a network.
+
+### Phase 6 — Single-source `INDEX_BY_LANG`
+
+- New module `rag_config.py` owns the per-language vector-index config.
+  `tools/vector.py` re-exports from it; `text_rag.py` imports from it.
+  Neither module carries a literal `INDEX_BY_LANG = {...}` block.
+- `index_config_for(lang)` centralises the fallback to Korean when a
+  language key is unknown.
+- 8 regression tests (`tests/test_phase6_rag_config.py`) fail if either
+  module reintroduces a local dict definition.
+
+### Phase 7 — Documentation
+
+- `.streamlit/secrets.toml.example` created listing every required key
+  (APP_PASSWORD, GOOGLE_*, NEO4J_*) and every optional cap knob. The
+  real `secrets.toml` is untouched.
+- README (README.adoc) documents Neo4j read-only account requirement,
+  embedding-model / dimension contract, and how to run `unittest` /
+  Streamlit.
+
+### Test totals
+
+Baseline: 79 tests. After hardening: 175 tests, all passing on
+`python -m unittest discover -s tests`. No live Neo4j / Gemini / network
+access is required to run the suite.

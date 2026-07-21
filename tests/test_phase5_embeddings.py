@@ -172,7 +172,7 @@ class TestRetryPolicy(unittest.TestCase):
             self._resp(429, headers={"Retry-After": "0"}),
             good,
         ])
-        with patch("time.sleep") as ts:
+        with patch("llm.time.sleep") as ts:
             v = client.embed_query("hi")
         self.assertEqual(len(v), 3)
         self.assertEqual(session.post.call_count, 3)
@@ -187,7 +187,7 @@ class TestRetryPolicy(unittest.TestCase):
             good,
         ])
         recorded = []
-        with patch("time.sleep", side_effect=lambda d: recorded.append(d)):
+        with patch("llm.time.sleep", side_effect=lambda d: recorded.append(d)):
             client.embed_query("hi")
         self.assertEqual(recorded, [0.05])   # exact value from header
 
@@ -196,7 +196,7 @@ class TestRetryPolicy(unittest.TestCase):
             self._resp(503) for _ in range(5)
         ])
         from errors import TransientProviderError
-        with patch("time.sleep"):
+        with patch("llm.time.sleep"):
             with self.assertRaises(TransientProviderError):
                 client.embed_query("hi")
         # Retries capped at _MAX_RETRIES.
