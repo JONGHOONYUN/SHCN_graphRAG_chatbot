@@ -21,8 +21,12 @@ from a name.
 
 from __future__ import annotations
 
+import logging
+import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 ENTITY_TYPES = (
@@ -94,11 +98,34 @@ def poetrytalks_url(node_id: Any) -> Optional[str]:
 
 def _linked_id(node_id: Optional[str]) -> str:
     """Format a node ID as a markdown link if it fits the node-id shape,
-    else return it verbatim. Empty/None becomes '?'."""
+    else return it verbatim.
+
+    CONTRACT (work order Phase 2): empty/None returns '' — NEVER a user-facing
+    '?' placeholder. Callers must omit the ID portion entirely when this
+    returns an empty string; `(?)`, `(None)`, `[?](...)` must not exist in any
+    user-visible provenance or citation."""
     if not node_id:
-        return "?"
+        return ""
     url = poetrytalks_url(node_id)
-    return f"[{node_id}]({url})" if url else node_id
+    return f"[{node_id}]({url})" if url else str(node_id)
+
+
+def normalize_entry_position(value: Any) -> Optional[int]:
+    """Normalize a retrieved Entry position to a positive int, else None.
+
+    None / 0 / negative / bool / non-numeric values are all treated as
+    'position unknown' — a position of 0 is not a valid ordinal in this
+    corpus, and `Entry 0` must never render as normal provenance."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            iv = int(stripped)
+            return iv if iv > 0 else None
+    return None
 
 
 @dataclass
@@ -416,36 +443,62 @@ def document_to_parts(doc: Any) -> tuple:
     document = {k: v for k, v in document.items() if v not in (None, [], {})}
 
     entities = entities_from_vector_meta(meta)
-    entry_id = meta.get("entry_id")
-    work_id = meta.get("source_work_id")
-    entry_position = meta.get("entry_position")
-    # Prefer the deterministic URL built from the entry_id; fall back to the
-    # Cypher-provided poetrytalks_link if the id shape is unrecognized.
-    entry_url = poetrytalks_url(entry_id) or meta.get("poetrytalks_link")
-    work_ref = _linked_id(work_id) if work_id else None
+
+    # ── Provenance validity policy (work order Phase 2) ──────────────────
+    # Only shape-valid internal node IDs may anchor a user-facing breadcrumb:
+    #   1. valid entry_id            → Entry citation (position only if > 0)
+    #   2. valid work_id only        → work-only citation (no faked position)
+    #   3. neither valid internal ID → NO user-facing provenance; diagnostic
+    #      log only (metadata contract violation — the retrieval query
+    #      projects node.id / position / work id, so absence is a bug).
+    # `(?)`, `(None)`, `Entry 0`, `Entry None` must never be produced.
+    raw_entry_id = meta.get("entry_id")
+    raw_work_id = meta.get("source_work_id")
+    entry_id = raw_entry_id if is_valid_node_id(raw_entry_id) else None
+    work_id = raw_work_id if is_valid_node_id(raw_work_id) else None
+    entry_position = normalize_entry_position(meta.get("entry_position"))
+
     # Retrieval-time default label — Korean-first for backward compatibility.
-    # Synthesis code should rebuild a language-appropriate label from the raw
+    # Synthesis code rebuilds a language-appropriate label from the raw
     # `work_name_*` components on the Provenance record.
     work_name = (
         meta.get("source_work_kor") or meta.get("source_work_eng") or "Work"
     )
-    work_label = f"{work_name} ({work_ref})" if work_ref else work_name
-    provenance = [
-        Provenance(
-            source_type="neo4j_vector",
-            label=(
-                f"{work_label} > Entry {entry_position} "
-                f"({_linked_id(entry_id)})"
-            ),
-            source_url=entry_url,
-            work_id=work_id,
-            entry_id=entry_id,
-            work_name_kor=meta.get("source_work_kor"),
-            work_name_eng=meta.get("source_work_eng"),
-            work_name_chi=meta.get("source_work_chi"),
-            entry_position=entry_position,
+    work_ref = _linked_id(work_id)
+    work_label = f"{work_name} {work_ref}" if work_ref else work_name
+
+    provenance: list = []
+    if entry_id:
+        entry_part = (
+            f"Entry {entry_position} {_linked_id(entry_id)}"
+            if entry_position else f"Entry {_linked_id(entry_id)}"
         )
-    ]
+        label = f"{work_label} > {entry_part}"
+    elif work_id:
+        label = work_label            # work-only; no position faking
+    else:
+        code = uuid.uuid4().hex[:8]
+        logger.warning(
+            "vector provenance skipped [%s]: no valid internal work/entry id "
+            "(entry_id=%r, work_id=%r) — metadata contract violation",
+            code, raw_entry_id, raw_work_id,
+        )
+        label = None
+
+    if label:
+        provenance.append(
+            Provenance(
+                source_type="neo4j_vector",
+                label=label,
+                source_url=poetrytalks_url(entry_id) or poetrytalks_url(work_id),
+                work_id=work_id,
+                entry_id=entry_id,
+                work_name_kor=meta.get("source_work_kor"),
+                work_name_eng=meta.get("source_work_eng"),
+                work_name_chi=meta.get("source_work_chi"),
+                entry_position=entry_position,
+            )
+        )
     return document, entities, provenance
 
 

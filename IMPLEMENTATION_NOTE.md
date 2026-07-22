@@ -12,6 +12,59 @@ Covers four work orders, applied in sequence:
    — bounded conversation history on the normal graphRAG path, user-safe
    retrieval statuses, accurate textRAG wording, and transparent 10/5 authority
    caps with coverage notes.
+5. **Deterministic Sources & provenance validity**
+   (`CLAUDE_CODE_DETERMINISTIC_SOURCES_AND_PROVENANCE_FIX.md`) — the Sources
+   section is assembled in CODE, not by the LLM; `(?)` / `Entry 0` /
+   `Entry None` placeholders are structurally impossible; structured citation
+   de-duplication; deterministic body entity links; P553/P1227 internal-ID
+   identity invariant.
+
+## Deterministic Sources assembly (work order 5)
+
+- **Assembly boundary** (`tools/answer_renderer.py`, new): the synthesis LLM
+  writes the answer BODY only. `assemble_final_answer()` then (a) strips any
+  model-authored Sources/References/출처/참고문헌/来源/參考資料 section (full-line
+  header match at any markdown depth, bold, or bare keyword+colon — mid-sentence
+  "source" words are never cut), (b) deterministically links the first mention
+  of each evidence entity name to its Poetry Talks URL, and (c) appends the
+  code-rendered, localized Sources section built from `build_citations()`.
+  The assembled result is the only shape shown to the user and saved to the
+  `::graphRAG` history. Retrieval-failure safe messages return before assembly
+  and carry no Sources. Empty citations → no orphan header.
+- **Provenance validity** (`tools/evidence.py`): `_linked_id(None)` now returns
+  `''` (never `?`); `normalize_entry_position()` maps 0/negative/None/non-numeric
+  to unknown. Vector provenance policy: valid `entry_id` → Entry citation
+  (position only when > 0); valid `work_id` only → work-only citation (no faked
+  position); neither → NO user-facing breadcrumb, only a correlation-ID
+  diagnostic log (metadata contract violation). Graph aggregation rows keep
+  `person_id`-anchored provenance even without an Entry breadcrumb.
+- **Citation format & dedup** (`tools/synthesis.py`): breadcrumbs render as
+  `Work name [B023](url) > Entry 31 [E031](url)` (no `)(` double parens);
+  structured dedup keys `source_type + entry_id / poem_or_critique_id /
+  entity_id / work_id / source_url` with a rendered-line fallback — the same
+  Entry retrieved repeatedly yields one bullet while distinct node ids never
+  collapse. Dirty fallback labels (containing `(?)`, `Entry 0`, …) are skipped.
+- **Body entity links** (`link_entities_in_body`): only evidence entity names
+  map to links; a name claimed by two node ids (동명이인) is never linked; only
+  shape-valid node ids produce URLs; existing markdown links/code/URLs are
+  never rewritten; failures degrade to the unlinked body.
+- **Identity invariant**: `P553` 허초희 and `P1227` 허난설헌 share
+  `idWikidata=Q464558` but are distinct graph nodes — `merge_entities()` /
+  `collect_entities()` keep them separate (regression-tested, including the
+  anonymous-bridge case), counts are never summed, and the Cypher prompt now
+  contains a GENERAL rule (no question-specific text) that aggregation/ranking
+  queries must return each subject's internal node id and must group by node,
+  never by external identifier.
+- **Live smoke finding (data-layer limitation, out of scope here)**: on the
+  live Neo4j instance the vector retrieval projects `entry_position` correctly
+  but `node.id` / Work `id` come back **null** (`entry_id=None`,
+  `source_work_id=None`) — the live DB's nodes are missing the `id` property
+  values that the local JSONL export carries. This was the true origin of the
+  observed `Entry 31 (?)` citations. The pipeline now suppresses such
+  breadcrumbs and logs `vector provenance skipped [<correlation>] … metadata
+  contract violation`; restoring `id` properties on the live DB will
+  automatically re-enable full citations. Fixing the DB is explicitly a
+  non-goal of this work order.
 
 ## Architecture
 
@@ -201,7 +254,7 @@ AKS Digerati). Any future key (e.g. NLK) must live in Streamlit secrets/env only
 ## Tests
 
 ```
-python -m unittest tests.test_pipeline -v     # 79 tests, all passing
+python -m unittest discover -s tests -v       # 263 tests, all passing
 ```
 
 Covers: JSONL schema + full registry coverage of stored properties; ID

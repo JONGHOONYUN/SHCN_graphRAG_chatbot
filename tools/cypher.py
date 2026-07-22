@@ -160,6 +160,8 @@ In MULTI-HOP results where several people/places appear in one row, PREFIX the a
 
 NOTE — Person vs Place IDs are NOT interchangeable: `idAKSdigerati` is `koreanPerson_<n>` on a Person and `koreanPlace_<n>` on a Place, and they resolve against different endpoints. Always return a Place's ID under the `place_*`/`aks_map_id` aliases, never under `person_*`.
 
+AGGREGATION / RANKING RESULTS — ALWAYS RETURN THE INTERNAL NODE ID: whenever a query aggregates or ranks entities (count(), collect(), ORDER BY ... DESC, "most/least/top N" questions), RETURN the internal Neo4j `id` property of each aggregated subject alongside the aggregate value, using the standardized alias (e.g. `p.id AS person_id, count(e) AS mention_count`). Group and count BY THE NODE, never by an external identifier — two distinct Person nodes that share an external ID (such as the same idWikidata) are STILL two separate rows with separate counts; do not merge or sum them. Without the internal id the answer cannot be cited.
+
 
 
 # Search Rules and Strategies

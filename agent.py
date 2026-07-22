@@ -43,6 +43,7 @@ def _build_language_directive(user_language: str) -> str:
 from tools.vector import get_poetry_plot
 from tools.cypher import cypher_qa_safe
 from tools.external_authority import external_authority_lookup
+from tools.answer_renderer import assemble_final_answer
 from tools.orchestrator import gather_graphrag_evidence
 from tools.synthesis import (
     HISTORY_RULES,
@@ -625,15 +626,14 @@ synthesis_prompt = ChatPromptTemplate.from_messages(
             "Below are the structured evidence blocks retrieved for this question. "
             "Use ONLY these blocks as factual sources:\n"
             "{evidence_blocks}\n\n"
-            "Write the final answer following every rule above, ending with a "
-            "Sources section whose header is in the LOCKED response language.\n\n"
-            "The lines below are the FINAL, COMPLETE Sources content. Copy "
-            "every bullet EXACTLY into your Sources section — preserve the "
-            "leading `- `, preserve every `[id](url)` markdown link with its "
-            "URL intact, keep each bullet on its own line, and do NOT collapse "
-            "bullets that share a group prefix into a single markdown header. "
-            "See rule 7b for correct vs incorrect examples.\n"
-            "{suggested_citations}",
+            "Write ONLY the answer body, following every rule above. Do NOT "
+            "write a Sources/References/출처/来源 section in any language — "
+            "the system appends the finalized Sources deterministically after "
+            "your text, and anything you write there will be discarded. "
+            "When you mention entities or quote node ids in the body, preserve "
+            "the markdown links provided in the evidence (e.g. "
+            "[P553](https://poetrytalks.org/P553)) intact, and keep distinct "
+            "node ids separate even when they share an external identifier.",
         ),
     ]
 )
@@ -678,20 +678,35 @@ def synthesize_answer(user_input: str, user_language: str) -> str:
 
     evidence_blocks = format_evidence_for_prompt(evidence, user_language)
     citations = build_citations(evidence, user_language)
-    suggested = "\n".join(citations) if citations else "(no pre-computed citations)"
 
-    output = synthesis_chain.invoke(
+    body = synthesis_chain.invoke(
         {
             "language_directive": _build_language_directive(user_language),
             "chat_history": history_text or "(이전 대화 없음)",
             "question": user_input,
             "evidence_blocks": evidence_blocks,
-            "suggested_citations": suggested,
         }
     )
 
+    # ── Deterministic final assembly (Sources는 LLM이 아니라 코드가 조립) ──
+    # LLM이 Sources를 생략·축약·URL 제거해도 최종 응답에는 build_citations()의
+    # 검증된 bullet 전체가 그대로 붙는다. 본문 entity 링크도 코드 수준에서 보장.
+    correlation_id = _uuid.uuid4().hex[:8]
+    entity_dicts = [
+        e.to_dict() if hasattr(e, "to_dict") else e
+        for e in (evidence.get("entities") or [])
+    ]
+    output = assemble_final_answer(
+        body, citations, user_language,
+        entities=entity_dicts, correlation_id=correlation_id,
+    )
+    _logger.debug(
+        "graphRAG synthesis [%s]: body_chars=%d citations=%d",
+        correlation_id, len(body or ""), len(citations),
+    )
+
     if output and output.strip():
-        # 성공 답변만 저장. 저장 실패는 답변을 막지 않는다.
+        # 조립 완료된 최종 응답만 저장. 저장 실패는 답변을 막지 않는다.
         try:
             hist = _graphrag_history(session_id)
             hist.add_user_message(user_input)

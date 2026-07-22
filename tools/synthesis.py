@@ -59,30 +59,56 @@ def _work_name_bilingual(prov: dict, language: str) -> Optional[str]:
     return primary
 
 
+# Placeholder patterns that must never surface in a user-facing citation.
+_PLACEHOLDER_RE = __import__("re").compile(
+    r"\(\?\)|\[\?\]|\(None\)|/None\b|\bEntry (?:None|0|-\d+)\b"
+)
+
+
+def _label_is_clean(label: str) -> bool:
+    """True when a pre-built label carries none of the forbidden placeholder
+    shapes ('(?)', 'Entry 0', 'Entry None', '(None)', '/None')."""
+    return bool(label) and not _PLACEHOLDER_RE.search(label)
+
+
 def _rebuild_vector_prov_label(prov: dict, language: str) -> str:
     """Render one vector-provenance line in the locked response language.
 
-    Uses `Provenance.work_name_kor/eng/chi` and `entry_position` when
-    present; falls back to the retrieval-time `label` string otherwise.
+    Validity policy (work order Phase 2/3):
+      * a Poetry Talks link is rendered only for a shape-valid internal id;
+      * position renders only when it normalizes to a positive int;
+      * valid entry → `Work [B023](url) > Entry 31 [E031](url)` (slash-free
+        square links, no `)(` double parens);
+      * valid work only → work-only citation;
+      * neither valid id → fall back to the retrieval-time `label` ONLY when
+        it is placeholder-free; otherwise return '' so the caller skips it.
     """
-    from tools.evidence import _linked_id
+    from tools.evidence import _linked_id, is_valid_node_id, normalize_entry_position
 
-    work_name = _work_name_bilingual(prov, language)
-    if not work_name:
-        return prov.get("label") or ""
     work_id = prov.get("work_id")
     entry_id = prov.get("entry_id")
-    entry_position = prov.get("entry_position")
+    work_ok = is_valid_node_id(work_id)
+    entry_ok = is_valid_node_id(entry_id)
+    pos = normalize_entry_position(prov.get("entry_position"))
+    work_name = _work_name_bilingual(prov, language)
+
+    if not (work_ok or entry_ok):
+        label = prov.get("label") or ""
+        return label if _label_is_clean(label) else ""
 
     parts = []
-    if work_id:
-        parts.append(f"{work_name} ({_linked_id(work_id)})")
-    else:
+    if work_name and work_ok:
+        parts.append(f"{work_name} {_linked_id(work_id)}")
+    elif work_name:
         parts.append(work_name)
-    if entry_position is not None or entry_id:
-        pos = "" if entry_position is None else str(entry_position)
-        parts.append(f"Entry {pos} ({_linked_id(entry_id)})".strip())
-    return " > ".join(parts)
+    elif work_ok:
+        parts.append(_linked_id(work_id))
+    if entry_ok:
+        parts.append(
+            f"Entry {pos} {_linked_id(entry_id)}" if pos
+            else f"Entry {_linked_id(entry_id)}"
+        )
+    return " > ".join(p for p in parts if p)
 
 _MAX_BLOCK_CHARS = 4000
 _MAX_TOTAL_CHARS = 14000
@@ -314,58 +340,24 @@ the only step that writes user-facing prose. Obey these rules strictly:
    Exception — POETRY TALKS WIKIDATA URLs: EVERY graph node ID, regardless
    of the node's class (Person, Entry, Poem, Critique, Work, Place, Topic,
    Era, CriticalTerm, ...), resolves deterministically to
-   `https://poetrytalks.org/<ID>`. Evidence and pre-computed citation lines
-   ALREADY embed these as markdown links, e.g.
-   `[E003](https://poetrytalks.org/E003)`,
+   `https://poetrytalks.org/<ID>`. The evidence blocks ALREADY embed these
+   as markdown links, e.g. `[E003](https://poetrytalks.org/E003)`,
    `[P553](https://poetrytalks.org/P553)`. Use them verbatim; never rewrite
    the base URL; never drop the link; never construct one for anything that
    is not a graph node id present in the evidence.
 
-7a. MANDATORY "poetrytalks wikidata" GROUP — apply to EVERY response that
-    cites any graph node, without exception:
-      * The Sources section MUST begin with a group whose label is the
-        proper name "poetrytalks wikidata" (kept as-is in Korean, English,
-        and Chinese — DO NOT translate this proper name).
-      * Under that group, list ONE bullet per referenced node id, in the
-        form `- poetrytalks wikidata: [<ID>](https://poetrytalks.org/<ID>)`.
-      * Include every distinct node id you actually cited or relied on in
-        the answer body. If the answer references N nodes, the group has
-        N bullets — no fewer.
-      * Never omit this group when the answer references nodes; never
-        collapse it into another group; never rename it. This rule takes
-        priority over all formatting preferences.
+7b. BODY LINKS — VERBATIM. When you mention an entity or quote a node id in
+    the answer BODY, keep the evidence-provided `[id](url)` markdown links
+    INTACT:
+      * never strip the `(url)` part or reduce a link to plain text;
+      * never collapse distinct ids into one mention — `P553` and `P1227`
+        are different graph nodes even when they share an external
+        identifier such as a Wikidata Q-id; report them separately and
+        never sum their counts;
+      * never link a name that the evidence maps to multiple different
+        node ids — leave it unlinked instead of guessing.
 
-7b. VERBATIM CITATION REPRODUCTION — CRITICAL. The "recommended citation
-    lines" delivered in the human message ARE the finalized Sources
-    content. You MUST copy each bullet EXACTLY into your final answer:
-      * Preserve every `[id](url)` markdown link INTACT — never strip the
-        `(url)` part, never omit the id, never replace the link with plain
-        text like the group name.
-      * Preserve the leading `- ` (dash + space) so Streamlit renders each
-        line as an individual bullet — do NOT convert them into markdown
-        sub-headers (`### poetrytalks wikidata`).
-      * Preserve every distinct bullet — do NOT collapse multiple bullets
-        with the same group prefix into a single header.
-
-    ✓ CORRECT rendering (identical to what the pre-built lines look like):
-    ---
-    ## Sources
-    - poetrytalks wikidata: [P553](https://poetrytalks.org/P553)
-    - poetrytalks wikidata: [E031](https://poetrytalks.org/E031)
-    - Sihwa Ch'ongnim Graph: Paegwan Chapki (패관잡기) > Entry 31 ([E031](https://poetrytalks.org/E031))
-    ---
-
-    ✗ WRONG (this is what a previous response looked like — never do this):
-    ---
-    ## Sources
-    poetrytalks wikidata
-    Sihwa Ch'ongnim Graph
-    Sihwa Ch'ongnim Graph: 패관잡기 > Entry 31
-    ---
-    (URLs stripped, bullets collapsed into headers, ids omitted, Korean
-    work name leaking into an English answer.)
-
-7b. ENTITY-TYPE SEPARATION: every external record is tagged [Person] or
+7c. ENTITY-TYPE SEPARATION: every external record is tagged [Person] or
    [Place]. Use a [Person] record only for that person and a [Place] record
    only for that place. Never cite a Person authority record in a Place answer
    or a Place record in a Person answer, even if names or numbers look similar.
@@ -374,47 +366,20 @@ the only step that writes user-facing prose. Obey these rules strictly:
    given — never translate, summarize, or alter them. Your commentary is in the
    locked response language; quoted source text keeps its original characters.
 
-9. CITATIONS: end with a source-separated Sources section. Order (top-down):
-     (1) MANDATORY "poetrytalks wikidata" group (rule 7a) — one bullet per
-         referenced graph node id, kept as the literal proper name
-         "poetrytalks wikidata" in every language.
-     (2) Graph-provenance breadcrumbs (localized group label).
-     (3) External authority references (Wikidata / AKS Digerati / ...).
-     (4) Link-only reference URLs.
+9. SOURCES ARE SYSTEM-OWNED — WRITE THE ANSWER BODY ONLY.
+   Do NOT write a Sources / References / 출처 / 참고문헌 / 来源 / 參考資料
+   section, in any language, at any markdown depth. After your text, the
+   system deterministically appends the finalized Sources section itself —
+   including the MANDATORY "poetrytalks wikidata" group (one bullet per
+   referenced node id; this proper name is never translated), the localized
+   graph-provenance breadcrumbs, external authority references, and
+   link-only reference URLs. Anything you write in a Sources-style section
+   will be discarded and replaced, so spend your output on the body.
 
-   The Sources HEADER and the group labels for (2) and (4) MUST be written
-   in the LOCKED response language above (never mix languages). Use exactly
-   these localized labels — do not translate them yourself, do not
-   substitute synonyms:
-     Korean → header "출처"
-         · "poetrytalks wikidata"                 (unchanged proper name)
-         · graph group prefix:      "시화총림 그래프"
-         · link-only group prefix:  "참고 링크 (내용 미조회)"
-     English → header "Sources"
-         · "poetrytalks wikidata"                 (unchanged proper name)
-         · graph group prefix:      "Sihwa Ch'ongnim Graph"
-         · link-only group prefix:  "Reference Link (not fetched)"
-     Chinese → header "来源"
-         · "poetrytalks wikidata"                 (unchanged proper name)
-         · graph group prefix:      "诗话丛林图谱"
-         · link-only group prefix:  "参考链接（内容未获取）"
-   External authority proper names (Wikidata, AKS Digerati, Library of
-   Congress, ...) stay in their original form in every language.
-   Every quoted source text must carry full graph provenance from the graph
-   evidence block. The recommended-citation lines you receive are pre-built
-   in the same locked language — you may reuse them verbatim.
-
-   POETRY TALKS LINKS IN THE ANSWER BODY: provenance labels and citation
-   lines already embed every referenced node ID as a markdown link
-   (e.g. `[E003](https://poetrytalks.org/E003)`,
-   `[P027](https://poetrytalks.org/P027)`,
-   `[B016](https://poetrytalks.org/B016)`,
-   `[K123](https://poetrytalks.org/K123)` for a CriticalTerm-shape id).
-   Keep those markdown links intact AND, whenever you mention a specific
-   entity in the body of the answer, wrap its ID with the same markdown
-   link so the reader can jump straight to that node's Poetry Talks page.
-   The URL is always `https://poetrytalks.org/<ID>` — never invent a
-   different base URL, never omit the link for any cited node.
+   In the BODY: every quoted source text must still be attributed inline
+   with its graph provenance (work / entry as given in the evidence), and
+   entity mentions should keep their `[id](https://poetrytalks.org/<ID>)`
+   links per rule 7b. Never invent a different base URL.
 
 10. RETRIEVAL STATUS: if a "Retrieval Status" block is present, relay its
    message briefly in the locked language. "No results" and "temporarily
@@ -486,6 +451,9 @@ def _format_vector_block(vector: dict, outcome: str = "ok",
         else:
             lines.append("(no vector documents)")
     for d in docs[:_MAX_DOCS]:
+        from tools.evidence import is_valid_node_id as _valid, \
+            normalize_entry_position as _norm_pos
+
         # Pick the work name matching the locked response language and, when
         # the answer isn't Korean, append the Korean original in parens so
         # non-Korean readers can still cross-reference the original title.
@@ -494,7 +462,18 @@ def _format_vector_block(vector: dict, outcome: str = "ok",
         # kept in English so the LLM does not mirror a Korean prefix into the
         # user-facing Sources section. Final citation labels are enforced by
         # CITATION_LABELS + rule 9 in SYNTHESIS_SYSTEM_RULES.
-        lines.append(f"- source: {work} > Entry {d.get('entry_position')} ({d.get('entry_id')})")
+        # Invalid/absent entry ids or positions are OMITTED (never `Entry None`
+        # / `Entry 0` — the LLM must not see placeholder shapes it could copy).
+        head = f"- source: {work}"
+        eid = d.get("entry_id") if _valid(d.get("entry_id")) else None
+        pos = _norm_pos(d.get("entry_position"))
+        if eid and pos:
+            head += f" > Entry {pos} ({eid})"
+        elif eid:
+            head += f" > Entry ({eid})"
+        elif pos:
+            head += f" > Entry {pos}"
+        lines.append(head)
         for f in ("textChi", "textKor", "textEng", "descEng"):
             if d.get(f):
                 lines.append(f"    {f}: {d[f]}")
@@ -698,12 +677,26 @@ def build_citations(evidence: dict, language: str = "ko") -> list:
     # keep their static label. Vector-provenance labels are REBUILT from raw
     # `work_name_kor/eng/chi` + `entry_position` so an English or Chinese
     # answer doesn't leak the Korean work name into the Sources section.
+    #
+    # De-duplication uses STRUCTURED keys (work order Phase 3) — stable
+    # internal ids first, so the same Entry retrieved twice yields one
+    # breadcrumb while distinct node ids (e.g. P553 vs P1227 sharing an
+    # external Wikidata id) always stay separate.
+    seen_prov_keys: set = set()
+
+    def _add_prov(prov: dict, rendered: str) -> None:
+        if not rendered or not _label_is_clean(rendered):
+            return
+        key = _prov_dedup_key(prov, rendered)
+        if key in seen_prov_keys:
+            return
+        seen_prov_keys.add(key)
+        _add(f"- {graph_prefix}: {rendered}")
+
     for prov in graph.get("provenance", []):
-        _add(f"- {graph_prefix}: {prov.get('label')}")
+        _add_prov(prov, prov.get("label") or "")
     for prov in vector.get("provenance", []):
-        rendered = _rebuild_vector_prov_label(prov, language)
-        if rendered:
-            _add(f"- {graph_prefix}: {rendered}")
+        _add_prov(prov, _rebuild_vector_prov_label(prov, language))
 
     for c in external.get("claims", []):
         url = c.get("url")
@@ -717,6 +710,33 @@ def build_citations(evidence: dict, language: str = "ko") -> list:
         elif status == "link_only":
             _add(f"- {link_only_prefix} — {label}: [{who}]({url})")
     return citations
+
+
+def _prov_dedup_key(prov: dict, rendered: str) -> tuple:
+    """Structured de-duplication key for one provenance record.
+
+    Priority (work order Phase 3):
+        source_type + entry_id
+        source_type + poem_or_critique_id
+        source_type + entity_id
+        source_type + work_id            (work-only citation)
+        verified source_url
+        (fallback) rendered line
+
+    Distinct internal node ids always produce distinct keys — shared external
+    ids play no role here, so P553 / P1227 can never collapse."""
+    st = prov.get("source_type") or ""
+    for field_name in ("entry_id", "poem_or_critique_id", "entity_id"):
+        value = prov.get(field_name)
+        if is_valid_node_id(value):
+            return (st, field_name, value)
+    value = prov.get("work_id")
+    if is_valid_node_id(value):
+        return (st, "work_only", value)
+    url = prov.get("source_url")
+    if url:
+        return (st, "url", url)
+    return (st, "line", rendered)
 
 
 def _collect_all_node_ids(graph: dict, vector: dict) -> list:
