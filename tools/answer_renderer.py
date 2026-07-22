@@ -113,16 +113,49 @@ def _entity_node_id(entity: Any) -> Optional[str]:
     return node_id if isinstance(node_id, str) else None
 
 
+# Names made up ENTIRELY of ASCII letters/digits/space/apostrophe/hyphen/comma
+# (romanized names like "Yi Kyubo", "Hŏ Ch'ohŭi" contain non-ASCII macron/
+# breve marks and so do NOT match this — they keep the substring-search path,
+# since Korean/Chinese text attaches grammatical particles directly with no
+# separating space and a strict word-boundary would break linking for the
+# common case, e.g. "허난설헌은", "허초희가").
+_ASCII_NAME_RE = re.compile(r"^[A-Za-z0-9 ,.'\-]+$")
+
+
+def _find_name_span(body: str, name: str, start: int) -> tuple:
+    """Locate the next occurrence of `name` at/after `start`.
+
+    Pure-ASCII names use a `\\b...\\b` word-boundary match (work order Phase 5
+    rule 7) so a short English name is never matched inside a longer word
+    (e.g. "Yi" inside "Yield"). Names containing CJK or diacritics use a plain
+    substring search, since those scripts attach particles/punctuation with no
+    delimiting boundary. Returns (-1, -1) when not found."""
+    if _ASCII_NAME_RE.match(name):
+        m = re.compile(r"\b" + re.escape(name) + r"\b").search(body, start)
+        return (m.start(), m.end()) if m else (-1, -1)
+    idx = body.find(name, start)
+    return (idx, idx + len(name)) if idx >= 0 else (-1, -1)
+
+
 def link_entities_in_body(body: str, entities: Any) -> str:
-    """Deterministically link the FIRST mention of each evidence entity name to
+    """Deterministically link the FIRST mention of each evidence node's name to
     its Poetry Talks node URL.
 
-    Guarantees (work order Phase 4):
-      * only names present in the evidence entity list are ever linked;
-      * a name mapping to MORE THAN ONE node id (동명이인) is never linked —
-        no arbitrary pick;
+    `entities` accepts any mix of Entity dicts (Person/Place, from
+    authority-enrichment evidence) and NodeReference dicts (ALL node classes —
+    Work/Entry/Poem/Critique/Person/Place/Topic/Era/CriticalTerm) since both
+    share the same `node_id`/`name_kor`/`name_chi`/`name_eng` shape. This is
+    how body linking covers every node class (work order Phase 5), not just
+    Person/Place.
+
+    Guarantees:
+      * only names present in the evidence list are ever linked;
+      * a name mapping to MORE THAN ONE node id (동명이인 / same title reused)
+        is never linked — no arbitrary pick;
       * only shape-valid node ids produce URLs (`poetrytalks_url`), so external
         Q-ids etc. can never become Poetry Talks links;
+      * a pure-ASCII name only matches on a word boundary, so a short English
+        name is never matched inside a longer word;
       * existing markdown links, code spans/blocks, and raw URLs are never
         rewritten (no double-linking);
       * any internal error leaves the body unchanged — linking can never fail
@@ -154,10 +187,9 @@ def link_entities_in_body(body: str, entities: Any) -> str:
             spans = _protected_spans(body)
             start = 0
             while True:
-                idx = body.find(name, start)
+                idx, end = _find_name_span(body, name, start)
                 if idx < 0:
                     break
-                end = idx + len(name)
                 # Skip occurrences inside links/code/URLs or link-text brackets.
                 if _in_spans(idx, end, spans) or \
                         (idx > 0 and body[idx - 1] == "[") or \
@@ -171,6 +203,62 @@ def link_entities_in_body(body: str, entities: Any) -> str:
         logger.warning("body entity linking failed — returning unlinked body",
                        exc_info=True)
         return body
+
+
+# ── Referenced-node derivation (work order Phase 4) ──────────────────────────
+# Rather than adding a structured JSON output contract to the synthesis LLM
+# call (a new parsing-failure surface that would itself need a safe fallback —
+# see acceptance test 5), `referenced_node_ids` is derived deterministically
+# from the ALREADY-ASSEMBLED body text. This IS the "안전한 fallback" the work
+# order describes as acceptable: it never raises, never invents an id, and
+# only resolves names that map uniquely to one evidence node.
+_NODE_ID_TOKEN_RE = re.compile(r"\b([A-Z]{1,2}\d{1,4})\b")
+
+
+def derive_referenced_node_ids(body: str, node_references: Any) -> list:
+    """Return the node ids from `node_references` that are ACTUALLY present in
+    `body` — either as an explicit id-shaped token (plain or already linked,
+    e.g. 'P553' or '[P553](...)') or via a name that maps uniquely to one
+    node id. Ids not backed by evidence are never returned (an unknown id the
+    model wrote, e.g. 'P9999', or an external id like 'Q464558', can never
+    appear here). Ambiguous names (mapping to 2+ ids) are skipped, never
+    guessed. Never raises — an internal error yields an empty list."""
+    if not body or not node_references:
+        return []
+    try:
+        refs = [r if isinstance(r, dict) else r.to_dict() for r in node_references]
+        valid_ids = {r.get("node_id") for r in refs if r.get("node_id")}
+
+        found: list = []
+        seen: set = set()
+        for m in _NODE_ID_TOKEN_RE.finditer(body):
+            nid = m.group(1)
+            if nid in valid_ids and nid not in seen:
+                seen.add(nid)
+                found.append(nid)
+
+        claims: dict = {}
+        for r in refs:
+            nid = r.get("node_id")
+            if not nid:
+                continue
+            for name in _entity_names(r):
+                claims.setdefault(name, set()).add(nid)
+        linkable = {name: next(iter(ids))
+                    for name, ids in claims.items() if len(ids) == 1}
+        for name in sorted(linkable, key=len, reverse=True):
+            nid = linkable[name]
+            if nid in seen:
+                continue
+            idx, _end = _find_name_span(body, name, 0)
+            if idx >= 0:
+                seen.add(nid)
+                found.append(nid)
+        return found
+    except Exception:
+        logger.warning("referenced-node derivation failed — returning empty set",
+                       exc_info=True)
+        return []
 
 
 # ── Deterministic Sources rendering + final assembly ─────────────────────────

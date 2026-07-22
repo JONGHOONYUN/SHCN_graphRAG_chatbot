@@ -632,7 +632,8 @@ def format_evidence_for_prompt(evidence: dict, language: str = "ko") -> str:
     return _truncate("\n\n".join(parts), _MAX_TOTAL_CHARS)
 
 
-def build_citations(evidence: dict, language: str = "ko") -> list:
+def build_citations(evidence: dict, language: str = "ko",
+                    referenced_node_ids: Optional[list] = None) -> list:
     """Build source-separated citation lines from provenance/claims.
 
     Every referenced graph node — regardless of class — carries a canonical
@@ -640,6 +641,21 @@ def build_citations(evidence: dict, language: str = "ko") -> list:
     single **"poetrytalks wikidata"** group that MUST appear whenever any
     graph node is cited. The group name is a proper noun and is NOT
     translated between languages.
+
+    `referenced_node_ids` (work order Phase 4, optional for backward
+    compatibility): when given, restricts the "poetrytalks wikidata" group to
+    ONLY these ids — the ones the finished answer actually mentions or relies
+    on — instead of every id merely retrieved into evidence. When `None`
+    (legacy default, and every pre-existing caller), the group includes every
+    node id found anywhere in the evidence, exactly as before.
+
+    Work/Entry/Poem/Critique PROVENANCE breadcrumbs are intentionally NOT
+    filtered by `referenced_node_ids`: every such breadcrumb corresponds to a
+    document that was actually retrieved and placed in the evidence blocks
+    the LLM was given, so its source citation must remain available even if
+    the model's prose didn't literally repeat the id — dropping it would
+    regress the "answers must be citable" guarantee for a much smaller (and
+    much riskier) gain than filtering the entity-mention group.
 
     Never fabricates a link — only emits URLs derivable from ids present in
     the evidence. Graph and link-only group labels come from
@@ -664,8 +680,12 @@ def build_citations(evidence: dict, language: str = "ko") -> list:
 
     # (a) Collect every node id referenced anywhere in the evidence bundle,
     # in insertion order (which mirrors the order the LLM will see them).
-    # These become the mandatory "poetrytalks wikidata" citations.
+    # These become the mandatory "poetrytalks wikidata" citations — narrowed
+    # to `referenced_node_ids` when the caller supplies it.
     ptw_ids = _collect_all_node_ids(graph, vector)
+    if referenced_node_ids is not None:
+        allowed = set(referenced_node_ids)
+        ptw_ids = [nid for nid in ptw_ids if nid in allowed]
     for node_id in ptw_ids:
         url = poetrytalks_url(node_id)
         if not url:
@@ -741,12 +761,18 @@ def _prov_dedup_key(prov: dict, rendered: str) -> tuple:
 
 def _collect_all_node_ids(graph: dict, vector: dict) -> list:
     """Return every distinct node id referenced in graph + vector evidence,
-    preserving first-seen order. Sources:
+    preserving first-seen order. Sources (highest-coverage first):
 
+      * `Evidence.node_references` — the complete, all-node-class inventory
+        (Work/Entry/Poem/Critique/Person/Place/Topic/Era/CriticalTerm),
+        including ids nested inside collect()/map results and multiple ids
+        of the same class in one row;
       * `Provenance.work_id / entry_id / poem_or_critique_id / entity_id`
-        stored on the provenance record for named kinds;
-      * Any `E###` `M###` `C###` `P###` etc. embedded in a provenance label
-        (covers unknown-prefix / additional ids the row exposed);
+        for named kinds (backward compatible with older Evidence payloads
+        that predate `node_references`);
+      * Any id embedded in a provenance label as a markdown link (covers
+        two-letter prefixes like CriticalTerm's `CT###` and any class not
+        otherwise structurally represented);
       * `Entity.node_id` for resolved Person / Place entities;
       * `document['entry_id']` on each vector document.
 
@@ -767,6 +793,9 @@ def _collect_all_node_ids(graph: dict, vector: dict) -> list:
         seen.add(candidate)
         order.append(candidate)
 
+    for ref in graph.get("node_references", []) + vector.get("node_references", []):
+        _push(ref.get("node_id") if isinstance(ref, dict) else None)
+
     for prov in graph.get("provenance", []) + vector.get("provenance", []):
         for k in ("work_id", "entry_id", "poem_or_critique_id", "entity_id"):
             _push(prov.get(k))
@@ -784,11 +813,17 @@ def _collect_all_node_ids(graph: dict, vector: dict) -> list:
     return order
 
 
-# Extract the `<id>` from any `[<id>](https://poetrytalks.org/<id>)` markdown
-# link embedded in provenance labels — recovers unknown-prefix ids that
-# `Provenance.*_id` fields don't structurally represent.
-_MD_LINK_ID_RE = __import__("re").compile(
-    r"\[([A-Z]\d{1,4})\]\(https://poetrytalks\.org/[A-Z]\d{1,4}\)"
+# Extract the `<id>` from any `[<id>](<POETRYTALKS_BASE_URL><id>)` markdown
+# link embedded in provenance labels — recovers ids (including two-letter
+# prefixes like CriticalTerm's `CT###`) that `Provenance.*_id` fields don't
+# structurally represent. Built from the single base-URL constant so this
+# regex can never drift from the domain actually used to build links.
+import re as _re
+
+from tools.evidence import POETRYTALKS_BASE_URL as _PTW_BASE
+
+_MD_LINK_ID_RE = _re.compile(
+    r"\[([A-Z]{1,2}\d{1,4})\]\(" + _re.escape(_PTW_BASE) + r"[A-Z]{1,2}\d{1,4}\)"
 )
 
 

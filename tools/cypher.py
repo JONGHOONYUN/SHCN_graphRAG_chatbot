@@ -103,6 +103,7 @@ NOTE: descKor and descChi are not currently in use. Do not reference them.
                 L### = Place
                 H### = Era
                 T### = Topic
+                CT### = CriticalTerm (TWO-letter prefix — do not confuse with C### Critique)
 
                 
 ## Date Properties
@@ -161,6 +162,16 @@ In MULTI-HOP results where several people/places appear in one row, PREFIX the a
 NOTE — Person vs Place IDs are NOT interchangeable: `idAKSdigerati` is `koreanPerson_<n>` on a Person and `koreanPlace_<n>` on a Place, and they resolve against different endpoints. Always return a Place's ID under the `place_*`/`aks_map_id` aliases, never under `person_*`.
 
 AGGREGATION / RANKING RESULTS — ALWAYS RETURN THE INTERNAL NODE ID: whenever a query aggregates or ranks entities (count(), collect(), ORDER BY ... DESC, "most/least/top N" questions), RETURN the internal Neo4j `id` property of each aggregated subject alongside the aggregate value, using the standardized alias (e.g. `p.id AS person_id, count(e) AS mention_count`). Group and count BY THE NODE, never by an external identifier — two distinct Person nodes that share an external ID (such as the same idWikidata) are STILL two separate rows with separate counts; do not merge or sum them. Without the internal id the answer cannot be cited.
+
+## General rule — EVERY returned node carries its internal id (REQUIRED, all node classes)
+
+This applies to Work, Entry, Poem, Critique, Person, Place, Topic, Era, and CriticalTerm alike — not only Person/Place — and to every query shape, not only aggregations:
+
+- Whenever a node is meaningful to the answer (named in the question, quoted as source text, or listed as a result), RETURN that node's own `id` property alongside its name/text fields, using a `<role>_id` alias (e.g. `poem.id AS poem_id`, `ct.id AS critical_term_id`, `e.id AS era_id`, `w.id AS work_id`).
+- For a COLLECTION of same-type results (`collect(...)`), return a list of maps where EACH map includes that node's own `id` field (and, where useful, its name fields) — e.g. `collect({{id: poem.id, nameKor: poem.nameKor, nameChi: poem.nameChi}}) AS poems`. Every element must carry its own id; do not collect names/text without the id.
+- Do not omit the id just because the question does not explicitly ask for a link — the citation layer downstream needs it to build the "poetrytalks wikidata" reference for every node mentioned in the answer.
+- A poem-list or simple lookup query still needs the listed nodes' own ids; only truly irrelevant nodes (e.g. an intermediate relationship hop not itself discussed) may be left unreturned.
+- This is a structural rule about what to RETURN — it does not change how you interpret or compute the answer to any specific question.
 
 
 
@@ -640,6 +651,18 @@ Cypher Query:
 #For movie titles that begin with "The", move "the" to the end. For example "The 39 Steps" becomes "39 Steps, The" or "the matrix" becomes "Matrix, The".
 
 
+
+# Poetry Talks base URL: single source of truth is tools.evidence.
+# The template literal above hardcodes the default spelling for readability;
+# this substitution makes the RUNTIME prompt follow POETRYTALKS_BASE_URL
+# (including any POETRYTALKS_BASE_URL env override) rather than drifting from
+# it. AST-based tests that read the raw literal are unaffected — this is a
+# second, non-constant assignment executed only when the module is imported.
+from tools.evidence import POETRYTALKS_BASE_URL as _PTW_BASE_URL
+
+CYPHER_GENERATION_TEMPLATE = CYPHER_GENERATION_TEMPLATE.replace(
+    "https://poetrytalks.org/", _PTW_BASE_URL
+)
 
 #프롬프트 객체 생성
 #문자열 템플릿을 Langchain 프롬프트 템플릿 객체로 변환

@@ -43,7 +43,12 @@ def _build_language_directive(user_language: str) -> str:
 from tools.vector import get_poetry_plot
 from tools.cypher import cypher_qa_safe
 from tools.external_authority import external_authority_lookup
-from tools.answer_renderer import assemble_final_answer
+from tools.answer_renderer import (
+    assemble_final_answer,
+    derive_referenced_node_ids,
+    strip_model_sources,
+)
+from tools.evidence import collect_node_references
 from tools.orchestrator import gather_graphrag_evidence
 from tools.synthesis import (
     HISTORY_RULES,
@@ -677,7 +682,6 @@ def synthesize_answer(user_input: str, user_language: str) -> str:
         return retrieval_failure_message(user_language)
 
     evidence_blocks = format_evidence_for_prompt(evidence, user_language)
-    citations = build_citations(evidence, user_language)
 
     body = synthesis_chain.invoke(
         {
@@ -690,19 +694,32 @@ def synthesize_answer(user_input: str, user_language: str) -> str:
 
     # ── Deterministic final assembly (Sources는 LLM이 아니라 코드가 조립) ──
     # LLM이 Sources를 생략·축약·URL 제거해도 최종 응답에는 build_citations()의
-    # 검증된 bullet 전체가 그대로 붙는다. 본문 entity 링크도 코드 수준에서 보장.
+    # 검증된 bullet 전체가 그대로 붙는다. 본문 entity 링크도 코드 수준에서 보장하며,
+    # Person/Place뿐 아니라 Work/Entry/Poem/Critique/Topic/Era/CriticalTerm까지
+    # NodeReference로 커버한다.
     correlation_id = _uuid.uuid4().hex[:8]
-    entity_dicts = [
+    all_node_refs = collect_node_references(evidence["graph"], evidence["vector"])
+    node_ref_dicts = [r.to_dict() for r in all_node_refs]
+    link_targets = [
         e.to_dict() if hasattr(e, "to_dict") else e
         for e in (evidence.get("entities") or [])
-    ]
+    ] + node_ref_dicts
+
+    # referenced_node_ids: 모델이 실제로 언급/사용한 id만 "poetrytalks wikidata"
+    # 그룹에 남긴다 (검색만 되고 답변에서 쓰이지 않은 node는 제외). 이력에 남을
+    # 모델 Sources를 먼저 제거한 sanitized body를 기준으로 판단한다.
+    sanitized_body, _ = strip_model_sources(body or "")
+    referenced_ids = derive_referenced_node_ids(sanitized_body, node_ref_dicts)
+    citations = build_citations(evidence, user_language,
+                                referenced_node_ids=referenced_ids)
+
     output = assemble_final_answer(
         body, citations, user_language,
-        entities=entity_dicts, correlation_id=correlation_id,
+        entities=link_targets, correlation_id=correlation_id,
     )
     _logger.debug(
-        "graphRAG synthesis [%s]: body_chars=%d citations=%d",
-        correlation_id, len(body or ""), len(citations),
+        "graphRAG synthesis [%s]: body_chars=%d citations=%d referenced_ids=%d",
+        correlation_id, len(body or ""), len(citations), len(referenced_ids),
     )
 
     if output and output.strip():

@@ -25,11 +25,16 @@ from tools.synthesis import (
 )
 
 
-# ── (1) All node classes generate URLs ───────────────────────────────────────
+# ── (1) All 9 real node classes generate URLs ────────────────────────────────
 class TestAllNodeClassesGetUrl(unittest.TestCase):
-    """The user's requirement: any node id (regardless of class) gets a URL.
-    We validate the enumerated 8 classes AND a hypothetical unknown-prefix
-    class (K123, R042) as proxies for CriticalTerm / other future kinds."""
+    """The user's requirement: any node id, across all 9 real node classes,
+    gets a URL. CriticalTerm's REAL id shape is the two-letter prefix `CT###`
+    (692 ids in the source data) — a prior test generation used a fictional
+    single-letter `K123` placeholder instead, which is exactly why the CT###
+    gap went undetected (see CLAUDE_CODE_ALL_NODE_SOURCE_LINK_COVERAGE.md,
+    defect 1). Ids with a prefix that is NOT in the registry — including the
+    fictional placeholders this suite used to check — must be REJECTED
+    (fail-closed), the same policy that correctly rejects Wikidata Q-ids."""
 
     def test_known_prefixes(self):
         cases = {
@@ -41,6 +46,7 @@ class TestAllNodeClassesGetUrl(unittest.TestCase):
             "L100": "place",
             "T042": "topic",
             "H044": "era",
+            "CT017": "critical_term",
         }
         for node_id, kind in cases.items():
             with self.subTest(node_id=node_id):
@@ -50,16 +56,24 @@ class TestAllNodeClassesGetUrl(unittest.TestCase):
                     f"https://poetrytalks.org/{node_id}",
                 )
 
-    def test_unknown_prefix_still_gets_url(self):
-        """CriticalTerm and any hypothetical future node class must NOT be
-        dropped just because we haven't hard-coded the letter."""
+    def test_critical_term_and_critique_do_not_collide(self):
+        # CT017 (CriticalTerm) and C017 (Critique) share the letter 'C' but
+        # must resolve to distinct URLs and never be confused.
+        from tools.evidence import node_type_for_id
+
+        self.assertEqual(node_type_for_id("CT017"), "CriticalTerm")
+        self.assertEqual(node_type_for_id("C017"), "Critique")
+        self.assertEqual(poetrytalks_url("CT017"), "https://poetrytalks.org/CT017")
+        self.assertEqual(poetrytalks_url("C017"), "https://poetrytalks.org/C017")
+
+    def test_unregistered_prefix_is_rejected(self):
+        """Fail-closed: a shape that merely LOOKS like a node id, but whose
+        prefix is not in the registry, must not resolve to a URL — the same
+        protection that rejects Wikidata Q-ids and idAKSency values."""
         for node_id in ("K123", "R042", "V007", "Y1234"):
             with self.subTest(node_id=node_id):
-                self.assertTrue(is_valid_node_id(node_id))
-                self.assertEqual(
-                    poetrytalks_url(node_id),
-                    f"https://poetrytalks.org/{node_id}",
-                )
+                self.assertFalse(is_valid_node_id(node_id))
+                self.assertIsNone(poetrytalks_url(node_id))
 
 
 # ── (2) The group's name is "poetrytalks wikidata" in every language ─────────
@@ -116,17 +130,29 @@ class TestGroupIsAlwaysPresent(unittest.TestCase):
             self.assertIn(f"poetrytalks wikidata: [{node_id}]", joined)
             self.assertIn(f"https://poetrytalks.org/{node_id}", joined)
 
-    def test_unknown_prefix_still_grouped(self):
-        # Simulate a row containing a CriticalTerm-like id (letter not in the
-        # prefix map). It MUST still surface under the mandatory group.
+    def test_critical_term_id_is_grouped(self):
+        # CT017's real two-letter prefix must resolve and be grouped —
+        # covers the CT### gap described in defect 1 of the all-node-coverage
+        # work order.
+        provs = provenance_from_graph_row({
+            "person_id": "P027",
+            "critical_term_id": "CT017",
+        })
+        cites = self._run(provs, "en")
+        joined = "\n".join(cites)
+        self.assertIn("poetrytalks wikidata: [CT017]", joined)
+        self.assertIn("https://poetrytalks.org/CT017", joined)
+
+    def test_truly_unregistered_prefix_is_never_grouped(self):
+        # A shape that merely looks like an id but isn't a registered prefix
+        # must never appear as a "poetrytalks wikidata" bullet.
         provs = provenance_from_graph_row({
             "person_id": "P027",
             "critical_term_id": "K123",
         })
         cites = self._run(provs, "en")
         joined = "\n".join(cites)
-        self.assertIn("poetrytalks wikidata: [K123]", joined)
-        self.assertIn("https://poetrytalks.org/K123", joined)
+        self.assertNotIn("K123", joined)
 
     def test_chinese_language_keeps_proper_name(self):
         provs = provenance_from_graph_row({"person_id": "P553"})

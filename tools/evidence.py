@@ -45,54 +45,104 @@ ENRICHABLE_TYPES = ("Person", "Place")
 # ──────────────────────────────────────────────
 # Poetry Talks wiki URL scheme  ("poetrytalks wikidata")
 #
-# EVERY graph node — regardless of class (Person, Entry, Poem, Critique,
-# Work, Place, Topic, Era, CriticalTerm, Series, ...) — has an `id` property
-# on the Neo4j node whose value resolves deterministically to
-# `https://poetrytalks.org/<id>`. The final Sources section refers to these
+# EVERY graph node — regardless of class — has an `id` property on the Neo4j
+# node whose value resolves deterministically to
+# `<POETRYTALKS_BASE_URL><id>`. The final Sources section refers to these
 # URLs as **"poetrytalks wikidata"** links (per user's naming convention);
 # they are the canonical, unconditional reference URL for any node cited in
 # an answer.
 #
-# Detection strategy: any single uppercase letter followed by 1–4 digits.
-# The digit ceiling rejects external-authority IDs that share a first letter
-# with a node prefix — most notably `idAKSency` values like `E0063034`
-# (7 digits) that look like Entry IDs but are Encyclopedia of Korean Culture
-# references. Column-name filtering (`_is_external_id_key`) provides a
-# second guard against those.
+# AUTHORITATIVE DOMAIN DECISION (all-node-coverage work order, Phase 0):
+# the repository, deployment, and prior behavior all use
+# `https://poetrytalks.org/`; the alternative spelling `poetrtalks.org` in a
+# requirement draft has NO DNS record (verified) and is treated as a typo.
+# The base URL is a SINGLE configurable constant here — override via the
+# POETRYTALKS_BASE_URL environment variable; every prompt, regex, and
+# renderer derives from this value rather than hardcoding the domain.
+#
+# NODE ID SCHEMA (measured against neo4j_import_nodes.jsonl — 8,232 ids):
+# a registered prefix of 1–2 uppercase letters followed by 1–4 digits.
+# The digit ceiling and the prefix ALLOWLIST both reject external-authority
+# IDs (`E0063034` 7-digit idAKSency values, `Q464558` Wikidata Q-ids, ...);
+# column-name filtering (`_is_external_id_key`) provides a second guard.
 # ──────────────────────────────────────────────
-POETRYTALKS_BASE = "https://poetrytalks.org/"
+import os as _os
+import re as _re
+
+POETRYTALKS_BASE_URL = (
+    _os.environ.get("POETRYTALKS_BASE_URL", "https://poetrytalks.org/").strip()
+)
+if not POETRYTALKS_BASE_URL.endswith("/"):
+    POETRYTALKS_BASE_URL += "/"
+
+# Legacy alias — kept for existing imports; same object, single source.
+POETRYTALKS_BASE = POETRYTALKS_BASE_URL
 
 # Canonical citation category name for these URLs.
 POETRYTALKS_WIKIDATA_LABEL = "poetrytalks wikidata"
 
+# Data-derived node-id prefix registry (single source of truth). Keys are the
+# literal ID prefixes found in the source data; values are the node classes.
+NODE_ID_PREFIXES = {
+    "B": "Work",
+    "E": "Entry",
+    "M": "Poem",
+    "C": "Critique",
+    "P": "Person",
+    "L": "Place",
+    "T": "Topic",
+    "H": "Era",
+    "CT": "CriticalTerm",
+}
+
+# 1–2 uppercase letters + 1–4 digits. Longest-prefix match ("CT017" → CT,
+# "C017" → C) keeps Critique and CriticalTerm ids unambiguous.
+_NODE_ID_RE = _re.compile(r"^([A-Z]{1,2})(\d{1,4})$")
+
+
+def split_node_id(value: Any) -> Optional[tuple]:
+    """Return (prefix, digits) for a registered node id, else None.
+
+    Fail-closed: unregistered prefixes ('Q464558', 'K123'), 5+ digit suffixes
+    ('E0063034'), lowercase, and non-strings all return None."""
+    if not isinstance(value, str):
+        return None
+    m = _NODE_ID_RE.match(value.strip())
+    if not m:
+        return None
+    prefix = m.group(1)
+    if prefix not in NODE_ID_PREFIXES:
+        return None
+    return prefix, m.group(2)
+
 
 def is_valid_node_id(value: Any) -> bool:
-    """True if `value` fits the node-id shape: one uppercase A–Z followed by
-    1–4 decimal digits. Works for every node class in the schema — including
-    ones whose prefix letter is not enumerated in `_ID_PREFIX_TO_KIND`
-    (e.g. CriticalTerm)."""
-    if not isinstance(value, str):
-        return False
-    value = value.strip()
-    if not (2 <= len(value) <= 5):
-        return False
-    if not (value[0].isascii() and value[0].isupper() and value[0].isalpha()):
-        return False
-    return value[1:].isdigit()
+    """True if `value` is a registered-prefix node id (see NODE_ID_PREFIXES).
+
+    Covers every node class in the source data, including CriticalTerm's
+    two-letter `CT###` ids (692 ids that the previous single-letter rule
+    dropped)."""
+    return split_node_id(value) is not None
+
+
+def node_type_for_id(value: Any) -> Optional[str]:
+    """Node class name ('Person', 'CriticalTerm', …) for a valid id, else None."""
+    parts = split_node_id(value)
+    return NODE_ID_PREFIXES[parts[0]] if parts else None
 
 
 def poetrytalks_url(node_id: Any) -> Optional[str]:
     """Return the Poetry Talks wiki URL ("poetrytalks wikidata" link) for any
-    node ID matching the canonical shape (single uppercase letter + 1–4
-    digits). Returns None for anything else — callers must never fabricate a
-    URL from an unrelated string (e.g. `idAKSency` values, Wikidata Q-ids)."""
+    node ID matching the canonical shape. Returns None for anything else —
+    callers must never fabricate a URL from an unrelated string (e.g.
+    `idAKSency` values, Wikidata Q-ids)."""
     if not isinstance(node_id, str):
         return None
     node_id = node_id.strip()
     if not node_id:
         return None
     if is_valid_node_id(node_id):
-        return POETRYTALKS_BASE + node_id
+        return POETRYTALKS_BASE_URL + node_id
     return None
 
 
@@ -205,6 +255,93 @@ class Provenance:
 
 
 @dataclass
+class NodeReference:
+    """A citable reference to ANY Neo4j node — not scoped to Person/Place.
+
+    `Entity` exists for external-authority enrichment (Person/Place only,
+    carries `authority_ids`). `NodeReference` is the parallel, more general
+    concept that guarantees every node class in the schema (Work, Entry, Poem,
+    Critique, Person, Place, Topic, Era, CriticalTerm) can be linked and cited
+    — Person/Place nodes legitimately produce BOTH an Entity and a
+    NodeReference; they serve different downstream purposes.
+
+    `node_id` is validated at construction time (`make_node_reference`) —
+    never fabricate one from a name or an external identifier."""
+
+    node_id: str
+    node_type: str
+    name_kor: Optional[str] = None
+    name_chi: Optional[str] = None
+    name_eng: Optional[str] = None
+    source_type: Optional[str] = None
+    work_id: Optional[str] = None
+    entry_id: Optional[str] = None
+
+    def url(self) -> Optional[str]:
+        return poetrytalks_url(self.node_id)
+
+    def display_name(self) -> str:
+        return self.name_kor or self.name_chi or self.name_eng or self.node_id
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def make_node_reference(
+    node_id: Any, *, node_type: Optional[str] = None,
+    source_type: Optional[str] = None,
+    work_id: Optional[str] = None, entry_id: Optional[str] = None,
+    name_kor: Optional[str] = None, name_chi: Optional[str] = None,
+    name_eng: Optional[str] = None,
+) -> Optional["NodeReference"]:
+    """Construct a NodeReference, or None if `node_id` is not a valid,
+    registered-prefix node id — this is the ONLY validation gate; callers
+    never need to pre-check `is_valid_node_id` themselves.
+
+    The node TYPE is always taken from the id itself (`node_type_for_id`); a
+    caller-supplied `node_type` that disagrees is logged and overridden, never
+    trusted blindly (guards against a mislabeled role in a Cypher alias)."""
+    inferred = node_type_for_id(node_id)
+    if inferred is None:
+        return None
+    if node_type and node_type != inferred:
+        logger.warning(
+            "node reference type mismatch for %r: claimed=%r inferred=%r — using inferred",
+            node_id, node_type, inferred,
+        )
+    return NodeReference(
+        node_id=node_id.strip(), node_type=inferred,
+        name_kor=name_kor, name_chi=name_chi, name_eng=name_eng,
+        source_type=source_type,
+        work_id=work_id if is_valid_node_id(work_id) else None,
+        entry_id=entry_id if is_valid_node_id(entry_id) else None,
+    )
+
+
+def merge_node_references(refs: Any) -> list:
+    """De-duplicate NodeReferences strictly by `node_id` — the only identity a
+    NodeReference has. Distinct ids are NEVER merged just because a name
+    matches; homonym ambiguity is resolved (by refusing to auto-link) at
+    body-linking time, not here. Fills in missing name/source fields from
+    later duplicates; preserves first-seen order."""
+    order: list = []
+    by_id: dict = {}
+    for r in refs or []:
+        if r is None:
+            continue
+        if r.node_id not in by_id:
+            by_id[r.node_id] = NodeReference(**asdict(r))
+            order.append(r.node_id)
+        else:
+            existing = by_id[r.node_id]
+            for f in ("node_type", "name_kor", "name_chi", "name_eng",
+                     "source_type", "work_id", "entry_id"):
+                if not getattr(existing, f) and getattr(r, f):
+                    setattr(existing, f, getattr(r, f))
+    return [by_id[i] for i in order]
+
+
+@dataclass
 class Evidence:
     """A bundle of evidence from a single retrieval source."""
 
@@ -213,6 +350,9 @@ class Evidence:
     entities: list = field(default_factory=list)
     documents: list = field(default_factory=list)
     provenance: list = field(default_factory=list)
+    # Every node class (Work/Entry/Poem/Critique/Person/Place/Topic/Era/
+    # CriticalTerm) referenced in this evidence bundle, for citation coverage.
+    node_references: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -221,6 +361,7 @@ class Evidence:
             "entities": [e.to_dict() for e in self.entities],
             "documents": list(self.documents),
             "provenance": [p.to_dict() for p in self.provenance],
+            "node_references": [r.to_dict() for r in self.node_references],
         }
 
 
@@ -308,6 +449,18 @@ def collect_entities(*evidences: Evidence, node_types: tuple = ENRICHABLE_TYPES)
 def collect_person_entities(*evidences: Evidence) -> list:
     """Compatibility wrapper — Person entities only."""
     return collect_entities(*evidences, node_types=("Person",))
+
+
+def collect_node_references(*evidences: Evidence) -> list:
+    """Gather and de-duplicate NodeReferences (ALL node classes) across
+    evidence bundles — the all-node-class counterpart to `collect_entities`,
+    used by the citation/body-linking layer rather than authority enrichment."""
+    found: list = []
+    for ev in evidences:
+        if ev is None:
+            continue
+        found.extend(ev.node_references or [])
+    return merge_node_references(found)
 
 
 # ──────────────────────────────────────────────
@@ -406,6 +559,80 @@ def person_entities_from_vector_meta(meta: dict) -> list:
     return [e for e in entities_from_vector_meta(meta) if e.node_type == "Person"]
 
 
+def _doc_meta_and_page(doc: Any) -> tuple:
+    """Shared (metadata, page_content) extraction for both `document_to_parts`
+    and `node_references_from_vector_meta` — `doc` may be a LangChain Document
+    or a plain dict, kept dependency-free of langchain."""
+    if hasattr(doc, "metadata"):
+        return dict(doc.metadata or {}), getattr(doc, "page_content", None)
+    if isinstance(doc, dict):
+        return dict(doc.get("metadata") or {}), (doc.get("page_content") or doc.get("text"))
+    return {}, str(doc)
+
+
+def node_references_from_vector_meta(meta: dict) -> list:
+    """Extract NodeReferences for EVERY node class surfaced in one
+    vector-retrieval metadata dict (work order Phase 3.1): the Entry itself,
+    its Work, the creator Person, mentioned_persons/audiences (Person),
+    places (Place), topics/forms_types/critical_terms (Topic/CriticalTerm),
+    era (Era), and contained_poems/contained_critiques (Poem/Critique).
+
+    Each candidate id is validated by `make_node_reference` — an absent or
+    malformed `id` field (e.g. a projection that hasn't been updated yet)
+    silently yields no reference rather than a fabricated one."""
+    if not isinstance(meta, dict):
+        return []
+
+    work_id = meta.get("source_work_id")
+    entry_id = meta.get("entry_id")
+    refs = [
+        make_node_reference(
+            entry_id, source_type="neo4j_vector",
+            name_kor=meta.get("entry_name_kor"), name_chi=meta.get("entry_name_chi"),
+            name_eng=meta.get("entry_name_eng"),
+        ),
+        make_node_reference(
+            work_id, source_type="neo4j_vector",
+            name_kor=meta.get("source_work_kor"), name_chi=meta.get("source_work_chi"),
+            name_eng=meta.get("source_work_eng"),
+        ),
+        make_node_reference(
+            meta.get("creator_id"), source_type="neo4j_vector",
+            name_kor=meta.get("creator"), name_chi=meta.get("creator_chi"),
+            name_eng=meta.get("creator_eng"),
+        ),
+    ]
+
+    for key in ("mentioned_persons", "audiences", "places", "topics",
+               "forms_types", "critical_terms"):
+        for item in meta.get(key) or []:
+            if isinstance(item, dict):
+                refs.append(make_node_reference(
+                    item.get("id"), source_type="neo4j_vector",
+                    name_kor=item.get("nameKor"), name_chi=item.get("nameChi"),
+                    name_eng=item.get("nameEng"),
+                ))
+
+    era = meta.get("era")
+    if isinstance(era, dict):
+        refs.append(make_node_reference(
+            era.get("id"), source_type="neo4j_vector",
+            name_kor=era.get("nameKor"), name_eng=era.get("nameEng"),
+        ))
+
+    for key in ("contained_poems", "contained_critiques"):
+        for item in meta.get(key) or []:
+            if isinstance(item, dict):
+                refs.append(make_node_reference(
+                    item.get("id"), source_type="neo4j_vector",
+                    name_kor=item.get("nameKor"), name_chi=item.get("nameChi"),
+                    name_eng=item.get("nameEng"),
+                    work_id=work_id, entry_id=entry_id,
+                ))
+
+    return merge_node_references(refs)
+
+
 def document_to_parts(doc: Any) -> tuple:
     """Pure helper: (langchain Document | dict) → (document_dict, entities, provenance).
 
@@ -413,14 +640,7 @@ def document_to_parts(doc: Any) -> tuple:
     preserves work/entry provenance. `doc` may be a LangChain Document (with
     .page_content/.metadata) or a plain dict — keeps this testable without
     importing langchain."""
-    if hasattr(doc, "metadata"):
-        meta = dict(doc.metadata or {})
-        page = getattr(doc, "page_content", None)
-    elif isinstance(doc, dict):
-        meta = dict(doc.get("metadata") or {})
-        page = doc.get("page_content") or doc.get("text")
-    else:
-        meta, page = {}, str(doc)
+    meta, page = _doc_meta_and_page(doc)
 
     document = {
         "entry_id": meta.get("entry_id"),
@@ -510,15 +730,26 @@ def docs_to_evidence(docs: Any) -> Evidence:
         ev.documents.append(document)
         ev.entities.extend(entities)
         ev.provenance.extend(provenance)
+        meta, _page = _doc_meta_and_page(doc)
+        ev.node_references.extend(node_references_from_vector_meta(meta))
+    ev.node_references = merge_node_references(ev.node_references)
     return ev
 
 
 # ──────────────────────────────────────────────
 # Graph-row normalization
 # ──────────────────────────────────────────────
+# Lowercase "kind" labels used by provenance/Provenance-field plumbing,
+# derived from the single NODE_ID_PREFIXES registry (no second source of
+# truth). "CT" -> "critical_term" is distinct from "C" -> "critique" —
+# longest-prefix matching in split_node_id() keeps them from colliding.
 _ID_PREFIX_TO_KIND = {
-    "B": "work", "E": "entry", "M": "poem", "C": "critique",
-    "P": "person", "L": "place", "T": "topic", "H": "era",
+    prefix: {
+        "Work": "work", "Entry": "entry", "Poem": "poem", "Critique": "critique",
+        "Person": "person", "Place": "place", "Topic": "topic", "Era": "era",
+        "CriticalTerm": "critical_term",
+    }[node_type]
+    for prefix, node_type in NODE_ID_PREFIXES.items()
 }
 
 # Standardized graph-row alias suffixes → normalized authority registry keys.
@@ -546,20 +777,20 @@ _ROW_ID_SUFFIXES = {
 
 
 def _looks_like_node_id(value: Any) -> Optional[str]:
-    """Return the id-kind for a value like 'B016'/'E003'/'P027', or the
-    generic 'node' string for any correctly-shaped id whose prefix is not
-    enumerated (e.g. CriticalTerm). Returns None if the value is not a valid
-    node id shape.
+    """Return the id-kind for a value like 'B016'/'E003'/'P027'/'CT017', or
+    the generic 'node' string for any correctly-shaped id whose prefix is not
+    in the registry (defensive fallback — every currently known prefix IS
+    registered). Returns None if the value is not a valid node id shape.
 
-    Every uppercase-letter + 1-4-digit value is treated as a node id — the
-    schema has 9 node classes and this project should never DROP a node
-    citation just because we don't know the exact prefix letter. External
-    authority IDs (idAKSency like 'E0063034', Wikidata like 'Q464558') are
-    rejected by the >4-digit ceiling and by column-name filtering elsewhere."""
-    if not is_valid_node_id(value):
+    Uses `split_node_id()` (longest-prefix match) so a two-letter CriticalTerm
+    id ('CT017') is never mistaken for a Critique id ('C017') sharing the
+    letter 'C'. External authority IDs (idAKSency like 'E0063034', Wikidata
+    like 'Q464558') are rejected by the digit ceiling / prefix allowlist and
+    by column-name filtering elsewhere."""
+    parts = split_node_id(value)
+    if not parts:
         return None
-    prefix = value[0]
-    return _ID_PREFIX_TO_KIND.get(prefix, "node")
+    return _ID_PREFIX_TO_KIND.get(parts[0], "node")
 
 
 def _is_external_id_key(key: str) -> bool:
@@ -730,6 +961,112 @@ def provenance_from_graph_row(row: dict) -> list:
     ]
 
 
+# ──────────────────────────────────────────────
+# Recursive, bounded NodeReference extraction from graph rows (Phase 3.3)
+#
+# Cypher aggregations frequently nest ids inside collect()/map results, e.g.
+#   RETURN collect({id: poem.id, nameKor: poem.nameKor}) AS poems
+# and a single row can carry MULTIPLE ids of the SAME kind (several Poem ids,
+# several CriticalTerm ids, ...). The scalar-only scan in
+# `provenance_from_graph_row` intentionally keeps its "one breadcrumb per row"
+# semantics for backward compatibility; THIS walker is the complete-coverage
+# path and preserves every distinct id it finds.
+#
+# Safety invariants:
+#   * an id is collected ONLY when it sits under an id-shaped KEY ("id",
+#     "<role>_id", ..., excluding external-authority keys/aliases) — a value
+#     is never treated as an id just because a string happens to fit the
+#     shape (so source text can never be mistaken for a node id);
+#   * `_is_external_id_key` / row-authority-suffix keys are excluded at EVERY
+#     depth, so idWikidata/idAKSency/wikidata_id/aks_map_id/... nested inside
+#     a collect() never leak in as Poetry Talks node ids;
+#   * depth and per-structure item counts are bounded so a pathological
+#     payload cannot cause unbounded recursion or scanning.
+# ──────────────────────────────────────────────
+_MAX_WALK_DEPTH = 6
+_MAX_WALK_ITEMS = 200
+
+
+def _is_id_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    if _is_external_id_key(key):
+        return False
+    if key == "id" or key.endswith("_id"):
+        # Exclude the known external-authority row-alias suffixes
+        # (wikidata_id, aks_digerati_id, loc_id, ...) regardless of any role
+        # prefix — these hold external values, never a node's own id.
+        return not any(key == s or key.endswith("_" + s) for s in _ROW_ID_SUFFIXES)
+    return False
+
+
+def _sibling_names_for_id_key(container: dict, id_key: str) -> dict:
+    """Best-effort name fields living alongside an id key in the same dict,
+    supporting both the project's snake_case convention (`<stem>_name_kor`)
+    and bare Neo4j-style camelCase (`nameKor`) for generic collect() maps."""
+    stem = id_key[:-3] if id_key.endswith("_id") else ""
+    out: dict = {}
+    for canon, tail in (("name_kor", "name_kor"), ("name_chi", "name_chi"),
+                       ("name_eng", "name_eng")):
+        candidates = [f"{stem}_{tail}"] if stem else [tail]
+        candidates.append({"name_kor": "nameKor", "name_chi": "nameChi",
+                           "name_eng": "nameEng"}[canon])
+        for cand in candidates:
+            val = container.get(cand)
+            if isinstance(val, str) and val.strip():
+                out[canon] = val.strip()
+                break
+    return out
+
+
+def _walk_for_node_refs(value: Any, refs: dict, depth: int = 0,
+                        budget: Optional[list] = None) -> None:
+    """Bounded recursive walk collecting NodeReference-worthy ids into `refs`
+    (a node_id -> NodeReference dict, so repeats within one row de-dup for
+    free). `budget` is a shared single-element counter bounding total
+    dict/list nodes visited across the whole walk."""
+    if budget is None:
+        budget = [0]
+    if depth > _MAX_WALK_DEPTH or budget[0] >= _MAX_WALK_ITEMS:
+        return
+    if isinstance(value, dict):
+        budget[0] += 1
+        for key, val in value.items():
+            if _is_id_key(key) and isinstance(val, str):
+                ref = make_node_reference(val, source_type="neo4j_graph",
+                                          **_sibling_names_for_id_key(value, key))
+                if ref is not None:
+                    refs.setdefault(ref.node_id, ref)
+        for key, val in value.items():
+            if isinstance(key, str) and (_is_external_id_key(key)
+                                         or any(key == s or key.endswith("_" + s)
+                                               for s in _ROW_ID_SUFFIXES)):
+                continue  # never descend into an external-authority subtree
+            if isinstance(val, (dict, list)):
+                _walk_for_node_refs(val, refs, depth + 1, budget)
+    elif isinstance(value, list):
+        for item in value:
+            if budget[0] >= _MAX_WALK_ITEMS:
+                break
+            budget[0] += 1
+            if isinstance(item, (dict, list)):
+                _walk_for_node_refs(item, refs, depth + 1, budget)
+            # scalar list items are never treated as ids — no key proves them.
+
+
+def node_references_from_graph_row(row: dict) -> list:
+    """Extract every distinct, validly-shaped node id in one graph result row
+    — top-level scalars AND nested collect()/map structures — as
+    NodeReferences. Complements `provenance_from_graph_row` (which builds one
+    human-readable breadcrumb per row) by preserving EVERY id, including
+    multiple ids of the same node class in a single row."""
+    if not isinstance(row, dict):
+        return []
+    refs: dict = {}
+    _walk_for_node_refs(row, refs)
+    return list(refs.values())
+
+
 def graph_rows_to_evidence(rows: Any, cypher: Optional[str] = None) -> Evidence:
     """Normalize graph query result rows into a graph Evidence bundle.
 
@@ -744,4 +1081,6 @@ def graph_rows_to_evidence(rows: Any, cypher: Optional[str] = None) -> Evidence:
             ev.documents.append(row)
             ev.entities.extend(entities_from_graph_row(row))
             ev.provenance.extend(provenance_from_graph_row(row))
+            ev.node_references.extend(node_references_from_graph_row(row))
+    ev.node_references = merge_node_references(ev.node_references)
     return ev

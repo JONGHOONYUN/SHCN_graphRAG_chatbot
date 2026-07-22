@@ -10,6 +10,10 @@ from langchain_classic.chains import create_retrieval_chain
 
 from langchain_core.prompts import ChatPromptTemplate
 
+# Single source of truth for the Poetry Talks domain — see tools/evidence.py.
+# Every prompt string and the Cypher projection below derive the URL from
+# this constant so the domain is never independently hardcoded here.
+from tools.evidence import POETRYTALKS_BASE_URL
 
 instructions = (
     "당신은 시화총림(詩話叢林) 전문가입니다. "
@@ -28,7 +32,7 @@ instructions = (
 
     # Entity links
     "언급된 모든 개체에 Poetry Talks 링크를 포함하세요: "
-    "https://poetrytalks.org/ + node id (예: https://poetrytalks.org/P027). "
+    f"{POETRYTALKS_BASE_URL} + node id (예: {POETRYTALKS_BASE_URL}P027). "
     "사용자 언어에 맞는 uselang 파라미터를 추가하세요 "
     "(en / ko / zh / fr). "
 
@@ -128,7 +132,7 @@ instructions = (
     "\n[비어 있는 metadata 필드 처리 원칙]\n"
     "  · null/빈 값은 절대 지어내지 마세요. 학술 챗봇의 신뢰성이 우선.\n"
     "  · '기록되지 않음' / 'not recorded in the database' 로 명시하거나 언급 생략.\n"
-    "  · 특히 external ID가 없으면 링크를 지어내지 말고 poetrytalks.org 링크만 제공.\n"
+    f"  · 특히 external ID가 없으면 링크를 지어내지 말고 {POETRYTALKS_BASE_URL} 링크만 제공.\n"
     "  · creator_year_birth/death가 없으면 creator_era의 yearStart~yearEnd로 폴백.\n"
 
     # G. Authority linking 활용
@@ -200,7 +204,7 @@ RETURN
         original_chinese: node.textChi,
         english_translation: node.textEng,
         korean_translation: node.textKor,
-        poetrytalks_link: 'https://poetrytalks.org/' + node.id,
+        poetrytalks_link: '{POETRYTALKS_BASE_URL}' + node.id,
         source_work_kor: [(w:Work)-[:HAS_PART]->(node) | w.nameKor][0],
         source_work_eng: [(w:Work)-[:HAS_PART]->(node) | w.nameEng][0],
         source_work_chi: [(w:Work)-[:HAS_PART]->(node) | w.nameChi][0],
@@ -259,20 +263,20 @@ RETURN
               open_library: a.idOpenLibrary, world_history: a.idWorldHistory,
               yale_lux: a.idYaleLux}}][0..3],
         topics: [(node)-[:HAS_SUBJECT_TOPIC]->(t:Topic) |
-            {{nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi,
+            {{id: t.id, nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi,
               nameFra: t.nameFra, descEng: t.descEng}}][0..5],
         forms_types: [(node)-[:HAS_TYPE]->(t:Topic) |
-            {{nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi}}][0..3],
+            {{id: t.id, nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi}}][0..3],
         places: [(node)-[:HAS_SUBJECT_PLACE]->(pl:Place) |
             {{nameKor: pl.nameKor, nameEng: pl.nameEng, nameChi: pl.nameChi,
               id: pl.id, gis: pl.gis, image: pl.image,
               aks_digerati: pl.idAKSdigerati, aks_map: pl.idAKSmap,
               aks_ency: pl.idAKSency}}][0..3],
         critical_terms: [(node)-[:HAS_SUBJECT_CRITICAL_TERM]->(ct:CriticalTerm) |
-            {{nameKor: ct.nameKor, nameEng: ct.nameEng, nameChi: ct.nameChi,
+            {{id: ct.id, nameKor: ct.nameKor, nameEng: ct.nameEng, nameChi: ct.nameChi,
               descEng: ct.descEng}}][0..5],
         era: [(node)-[:HAS_SUBJECT_ERA]->(e:Era) |
-            {{nameKor: e.nameKor, nameEng: e.nameEng,
+            {{id: e.id, nameKor: e.nameKor, nameEng: e.nameEng,
               yearStart: e.yearStart, yearEnd: e.yearEnd}}][0],
         contained_poems: [(node)-[:HAS_PART]->(pm:Poem) |
             {{id: pm.id, position: pm.position,

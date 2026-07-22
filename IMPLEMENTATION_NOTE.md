@@ -18,6 +18,201 @@ Covers four work orders, applied in sequence:
    `Entry None` placeholders are structurally impossible; structured citation
    de-duplication; deterministic body entity links; P553/P1227 internal-ID
    identity invariant.
+6. **All-node source link coverage**
+   (`CLAUDE_CODE_ALL_NODE_SOURCE_LINK_COVERAGE.md`) — CriticalTerm's `CT###`
+   ids (692 of them) now validate; a single `POETRYTALKS_BASE_URL` constant
+   backs every URL/prompt/regex; a new `NodeReference` contract covers all 9
+   node classes (not just Person/Place); nested `collect()`/map results and
+   multiple same-class ids per row are extracted, bounded; the mandatory
+   "poetrytalks wikidata" citation group is narrowed to ids the finished
+   answer actually references; body auto-linking now covers Work/Entry/Poem/
+   Critique/Topic/Era/CriticalTerm, with word-boundary-safe English matching.
+
+## Section 6 — All-node source link coverage (work order 6)
+
+### Authoritative domain
+
+Confirmed `https://poetrytalks.org/` as authoritative: it is what the
+repository, prior deployment, and every existing citation already use, and it
+is DNS-resolvable; the alternative spelling `poetrtalks.org` mentioned in the
+work order's own draft text has **no DNS record** and is treated as a typo. The
+domain is now a single constant, `tools.evidence.POETRYTALKS_BASE_URL`
+(overridable via the `POETRYTALKS_BASE_URL` env var), that every URL builder,
+the citation-parsing regex, the Cypher-generation prompt, and the vector
+retrieval prompt derive from — no second hardcoded domain literal remains in
+any URL-*constructing* code path.
+
+### Node ID prefix registry (single source of truth)
+
+`tools.evidence.NODE_ID_PREFIXES` — measured against
+`neo4j_data_import/neo4j_import_nodes.jsonl` (8,232 unique ids, zero misses):
+
+| Prefix | Class | Count |
+|---|---|---:|
+| B | Work | 116 |
+| E | Entry | 921 |
+| M | Poem | 1,771 |
+| C | Critique | 1,828 |
+| P | Person | 1,255 |
+| L | Place | 545 |
+| T | Topic | 1,060 |
+| H | Era | 44 |
+| **CT** | **CriticalTerm** | **692** |
+
+`is_valid_node_id`/`split_node_id`/`node_type_for_id` use a longest-prefix
+match (`^([A-Z]{1,2})(\d{1,4})$`, prefix checked against the registry) so
+`CT017` (CriticalTerm) and `C017` (Critique) never collide, and an
+unregistered prefix — including external ids like `Q464558`, `E0063034`
+(idAKSency), or `koreanPerson_16062` — is rejected fail-closed, exactly like
+the existing external-id protections. Two previously-passing tests
+(`tests/test_poetrytalks_wikidata_group.py`) asserted the OPPOSITE of this
+fail-closed policy using fictional placeholders (`K123`, `R042`) instead of
+the real `CT###` shape — updated to test the real prefix and to correctly
+assert that a truly unregistered prefix is rejected (this was defect 1's root
+cause: the fictional test fixture masked the gap).
+
+### `NodeReference` data contract
+
+```python
+NodeReference(node_id, node_type, name_kor=None, name_chi=None, name_eng=None,
+              source_type=None, work_id=None, entry_id=None)
+```
+
+Parallel to `Entity` (which stays Person/Place-only, for authority
+enrichment): `NodeReference` covers all 9 node classes and is the single
+citation/link-coverage inventory. `make_node_reference(id, ...)` is the only
+constructor — it validates the id via the prefix registry and returns `None`
+for anything invalid (an external id can never produce one), and it always
+trusts the ID-inferred type over a caller-supplied `node_type` argument
+(logged, not silently accepted, if they disagree). `merge_node_references`
+de-duplicates strictly by `node_id` — matching external ids or matching names
+never merge two different node ids (`P553`/`P1227` sharing `idWikidata`, or
+two same-named Persons, both stay separate; the case-order does not matter
+because merge is transitive-free by construction: key is always the id).
+`Evidence.node_references: list[NodeReference]` is a new, additive field
+(included in `to_dict()`); `collect_node_references(*evidences)` merges the
+graph+vector inventories, analogous to `collect_entities`.
+
+### Nested/graph/vector extraction (bounded)
+
+- `tools/vector.py`'s retrieval-query projection now includes `.id` on
+  `topics[]`, `forms_types[]`, `critical_terms[]`, and `era` (contained
+  poems/critiques already had it); `node_references_from_vector_meta()`
+  builds a `NodeReference` for the Entry itself, its Work, the creator,
+  every `mentioned_persons`/`audiences`/`places`/`topics`/`forms_types`/
+  `critical_terms` item, `era`, and every `contained_poems`/
+  `contained_critiques` item (carrying `work_id`/`entry_id` context).
+- `tools/evidence.py` adds a bounded recursive walker
+  (`node_references_from_graph_row`, `_MAX_WALK_DEPTH=6`,
+  `_MAX_WALK_ITEMS=200`) that finds ids nested inside `collect()`/map results
+  (`RETURN collect({id: poem.id, nameKor: poem.nameKor}) AS poems`) and
+  preserves **every** id of the same class in one row (previously only the
+  first). Safety: an id is only ever collected under an id-shaped **key**
+  (`"id"`, `"<role>_id"`, excluding `idWikidata`/`idAKSency`-style prefixed
+  external keys AND the `wikidata_id`/`aks_map_id`-style suffixed authority
+  row aliases at every depth) — a string is never treated as an id just
+  because it happens to fit the shape, so an id-looking token inside a
+  `textKor`/`textChi` prose field is never picked up. This is additive
+  (`provenance_from_graph_row`'s existing one-breadcrumb-per-row behavior for
+  the graph evidence block is unchanged).
+- `tools/cypher.py`'s prompt gained a general rule (no question-specific
+  wording) requiring every returned node — not only Person/Place or
+  aggregation subjects — to include its own internal id, with explicit
+  `collect()`-map guidance (`{id, nameKor, ...}` per element).
+
+### `referenced_node_ids` — cited vs. merely retrieved
+
+Rather than adding a structured JSON output contract to the synthesis LLM
+call (a new parsing-failure surface that would itself need the same "safe
+fallback" the work order requires), `tools/answer_renderer.derive_referenced_node_ids(body, node_references)`
+derives the referenced set **deterministically from the already-assembled
+body text** — this IS the accepted fallback design (work order Phase 4,
+requirement 5/6): it matches (a) explicit id-shaped tokens already known to
+evidence and (b) names that map to exactly one node id (ambiguous/homonym
+names are never resolved); it never raises, degrading to an empty list on any
+internal error. `build_citations(evidence, language, referenced_node_ids=None)`
+gained an **optional** parameter: `None` (every existing caller) preserves
+the exact legacy behavior (all evidence ids cited); a list narrows the
+mandatory "poetrytalks wikidata" bullet group to only those ids.
+
+**Deliberate scope decision**: Work/Entry/Poem/Critique **provenance
+breadcrumbs** (the `{graph_prefix}: ...` source-citation lines) are **NOT**
+filtered by `referenced_node_ids` — every such breadcrumb corresponds to a
+document actually placed in the evidence blocks the LLM read, so its
+citation stays available even if the model's prose didn't literally repeat
+the id (e.g. it quoted the poem text without typing "E031"). Only the
+entity-mention "poetrytalks wikidata" group — the part defect 3 was actually
+about — is narrowed. Silently dropping a legitimate source breadcrumb because
+of imperfect text-overlap detection would be a worse regression than the
+narrow over-inclusion defect 3 describes.
+
+### Body linking — all node classes
+
+`link_entities_in_body()` is unchanged in API; `agent.py` now feeds it a
+combined list of Entity dicts (Person/Place) **and** `NodeReference` dicts
+(all 9 classes, via `collect_node_references`), since both share the same
+`node_id`/`name_kor/chi/eng` shape. Added: pure-ASCII names now match on a
+`\b`-word-boundary (so "Yi" never matches inside "Yield"/"Yielding"); CJK
+names keep the previous substring match (Korean/Chinese grammatical particles
+attach with no space, so a strict boundary would break normal sentences like
+"허난설헌은").
+
+### Tests
+
+`tests/test_all_node_source_link_coverage.py` — 48 new tests: full
+9-class id resolution + JSONL 8,232-id/zero-miss coverage + CT/C
+non-collision; `NodeReference` construction/merge invariants (P553/P1227,
+C017/CT017, homonyms); vector-metadata and graph-row extraction for
+Topic/Era/CriticalTerm/contained-Poem/Critique, multi-same-kind preservation,
+nested-external-id exclusion, source-text-substring exclusion, bounded
+deep/wide payloads; `referenced_node_ids` filtering (cited-only, unknown/
+external ids excluded, dedup, never-raises, homonym skip, breadcrumb
+retained-when-referenced); body linking for Work/CriticalTerm/Topic/Era/
+Poem/Critique, bilingual no-double-link, English substring-false-positive
+guard, body/Sources URL identity, full contract under non-compliant LLM
+output. Two pre-existing tests in `test_poetrytalks_wikidata_group.py` were
+corrected (fictional `K123` → real `CT017`; the "any prefix" assertion
+flipped to "unregistered prefix is rejected", matching the newly-enforced
+fail-closed policy). **313 tests total, all passing**
+(`python -m unittest discover -s tests`).
+
+### Live smoke test — critical live-database finding
+
+Ran the three representative questions live against Neo4j + Gemini
+(`기고(奇古) 비평용어…`, `지봉유설에 포함된 시…`, and re-ran the earlier
+`Which woman is mentioned the most…`). The code held its contract in every
+case: **zero** `(?)`/`Entry 0`/`Entry None`/fabricated-link occurrences,
+correct graceful degradation when ids are absent, no crashes.
+
+However, a direct query proved the live database's `id` property is **empty
+on every one of the 8,232 corpus nodes, across all 9 classes**:
+
+```text
+MATCH (n) RETURN DISTINCT labels(n), count(n), count(n.id)
+Entry 921/0  Poem 1771/0  Critique 1828/0  Work 116/0
+Person 1255/0  Place 545/0  Era 44/0  CriticalTerm 692/0  Topic 1060/0
+```
+
+This is a **pre-existing live-database/import gap** (the local
+`neo4j_import_nodes.jsonl` export DOES have all 8,232 ids — the live instance
+was populated without carrying `id` over, or it was cleared) — not a defect
+in this work order's code, and modifying live Neo4j data is explicitly a
+non-goal here and in every prior work order. Consequences, all handled
+correctly by the existing fail-closed design:
+
+- No Poetry Talks link, body link, or "poetrytalks wikidata" bullet can be
+  produced against the live instance today — every id-shaped value the
+  retrievers see comes back `None`, and `make_node_reference`/`is_valid_node_id`
+  correctly refuse to fabricate anything from `None`.
+- External authority enrichment (Wikidata/AKS Digerati, verified working in
+  the very first work order's live tests) is unaffected — it reads
+  `idWikidata`/`idAKSdigerati` etc., which ARE populated; only the corpus's
+  OWN `id` property (used for Poetry Talks linking) is empty.
+- Once the live database's `id` property is backfilled from the JSONL/CSV
+  source-of-truth (a data/ops task, out of scope here), the entire pipeline
+  built in this work order activates with no code change required — this was
+  confirmed structurally via the 313 passing tests, which exercise the exact
+  same code paths with realistic ids.
 
 ## Deterministic Sources assembly (work order 5)
 
@@ -254,7 +449,7 @@ AKS Digerati). Any future key (e.g. NLK) must live in Streamlit secrets/env only
 ## Tests
 
 ```
-python -m unittest discover -s tests -v       # 263 tests, all passing
+python -m unittest discover -s tests -v       # 313 tests, all passing
 ```
 
 Covers: JSONL schema + full registry coverage of stored properties; ID
