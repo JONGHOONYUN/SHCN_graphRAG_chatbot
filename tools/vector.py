@@ -27,7 +27,7 @@ instructions = (
 
     # Provenance — Work label (not Book)
     "답변할 때 반드시 출처를 명시하세요: "
-    "시화집명(Work.nameKor / Work.nameEng), 항목 번호(Entry.position), 항목 ID(Entry.id). "
+    "시화집명(Work.nameKor / Work.nameEng), 항목 번호(Entry.position), 항목 ID(Entry.ID). "
     
 
     # Entity links
@@ -196,7 +196,7 @@ RETURN
     node.{text_property} AS text,
     score,
     {{
-        entry_id: node.id,
+        entry_id: node.ID,
         entry_position: node.position,
         entry_name_kor: node.nameKor,
         entry_name_chi: node.nameChi,
@@ -204,11 +204,11 @@ RETURN
         original_chinese: node.textChi,
         english_translation: node.textEng,
         korean_translation: node.textKor,
-        poetrytalks_link: '{POETRYTALKS_BASE_URL}' + node.id,
+        poetrytalks_link: '{POETRYTALKS_BASE_URL}' + node.ID,
         source_work_kor: [(w:Work)-[:HAS_PART]->(node) | w.nameKor][0],
         source_work_eng: [(w:Work)-[:HAS_PART]->(node) | w.nameEng][0],
         source_work_chi: [(w:Work)-[:HAS_PART]->(node) | w.nameChi][0],
-        source_work_id: [(w:Work)-[:HAS_PART]->(node) | w.id][0],
+        source_work_id: [(w:Work)-[:HAS_PART]->(node) | w.ID][0],
         source_work_desc: [(w:Work)-[:HAS_PART]->(node) | w.descEng][0],
         creator: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameKor][0],
         creator_eng: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameEng][0],
@@ -216,7 +216,7 @@ RETURN
         creator_mr: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameMR][0],
         creator_py: [(node)-[:HAS_CREATOR]->(p:Person) | p.namePY][0],
         creator_rr: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameRR][0],
-        creator_id: [(node)-[:HAS_CREATOR]->(p:Person) | p.id][0],
+        creator_id: [(node)-[:HAS_CREATOR]->(p:Person) | p.ID][0],
         creator_year_birth: [(node)-[:HAS_CREATOR]->(p:Person) | p.yearBirth][0],
         creator_year_death: [(node)-[:HAS_CREATOR]->(p:Person) | p.yearDeath][0],
         creator_image: [(node)-[:HAS_CREATOR]->(p:Person) | p.image][0],
@@ -242,7 +242,7 @@ RETURN
         mentioned_persons: [(node)-[:HAS_SUBJECT_PERSON]->(p:Person) |
             {{nameKor: p.nameKor, nameEng: p.nameEng, nameChi: p.nameChi,
               nameMR: p.nameMR, namePY: p.namePY, nameRR: p.nameRR,
-              id: p.id,
+              id: p.ID,
               wikidata: p.idWikidata, aks_digerati: p.idAKSdigerati,
               aks_ency: p.idAKSency, aks_sillok: p.idAKSsillok,
               aks_kdp: p.idAKSkdp, cbdb: p.idCBDB,
@@ -253,7 +253,7 @@ RETURN
               yale_lux: p.idYaleLux}}][0..5],
         audiences: [(node)-[:HAS_PART]->(pm:Poem)-[:HAS_AUDIENCE]->(a:Person) |
             {{nameKor: a.nameKor, nameEng: a.nameEng, nameChi: a.nameChi,
-              id: a.id,
+              id: a.ID,
               wikidata: a.idWikidata, aks_digerati: a.idAKSdigerati,
               aks_ency: a.idAKSency, aks_sillok: a.idAKSsillok,
               aks_kdp: a.idAKSkdp, cbdb: a.idCBDB,
@@ -263,27 +263,27 @@ RETURN
               open_library: a.idOpenLibrary, world_history: a.idWorldHistory,
               yale_lux: a.idYaleLux}}][0..3],
         topics: [(node)-[:HAS_SUBJECT_TOPIC]->(t:Topic) |
-            {{id: t.id, nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi,
+            {{id: t.ID, nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi,
               nameFra: t.nameFra, descEng: t.descEng}}][0..5],
         forms_types: [(node)-[:HAS_TYPE]->(t:Topic) |
-            {{id: t.id, nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi}}][0..3],
+            {{id: t.ID, nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi}}][0..3],
         places: [(node)-[:HAS_SUBJECT_PLACE]->(pl:Place) |
             {{nameKor: pl.nameKor, nameEng: pl.nameEng, nameChi: pl.nameChi,
-              id: pl.id, gis: pl.gis, image: pl.image,
+              id: pl.ID, gis: pl.gis, image: pl.image,
               aks_digerati: pl.idAKSdigerati, aks_map: pl.idAKSmap,
               aks_ency: pl.idAKSency}}][0..3],
         critical_terms: [(node)-[:HAS_SUBJECT_CRITICAL_TERM]->(ct:CriticalTerm) |
-            {{id: ct.id, nameKor: ct.nameKor, nameEng: ct.nameEng, nameChi: ct.nameChi,
+            {{id: ct.ID, nameKor: ct.nameKor, nameEng: ct.nameEng, nameChi: ct.nameChi,
               descEng: ct.descEng}}][0..5],
         era: [(node)-[:HAS_SUBJECT_ERA]->(e:Era) |
-            {{id: e.id, nameKor: e.nameKor, nameEng: e.nameEng,
+            {{id: e.ID, nameKor: e.nameKor, nameEng: e.nameEng,
               yearStart: e.yearStart, yearEnd: e.yearEnd}}][0],
         contained_poems: [(node)-[:HAS_PART]->(pm:Poem) |
-            {{id: pm.id, position: pm.position,
+            {{id: pm.ID, position: pm.position,
               nameKor: pm.nameKor, nameChi: pm.nameChi, nameEng: pm.nameEng,
               textKor: pm.textKor, textChi: pm.textChi, textEng: pm.textEng}}][0..3],
         contained_critiques: [(node)-[:HAS_PART]->(c:Critique) |
-            {{id: c.id, position: c.position,
+            {{id: c.ID, position: c.position,
               textKor: c.textKor, textChi: c.textChi, textEng: c.textEng}}][0..3]
     }} AS metadata
 """

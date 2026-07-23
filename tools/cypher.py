@@ -94,7 +94,13 @@ NOTE: descKor and descChi are not currently in use. Do not reference them.
 ## Structural Properties
   position  (Series, Work, Entry, Poem, Critique)
               Integer; order of the node within its parent container.
-    id        (all node types) Internal database ID. The prefix indicates type:
+    ID        (all node types) Internal database ID. CASE-SENSITIVE — the
+              property name is the TWO-UPPERCASE-LETTERS spelling `ID`, NOT
+              `id`. Neo4j property names are case-sensitive: `n.id` on any
+              node in this database returns null (the property does not
+              exist under that spelling); only `n.ID` returns the value.
+              ALWAYS write `.ID` (e.g. `p.ID`, `poem.ID`, `w.ID`) when reading
+              this property — never `.id`. The prefix indicates type:
                 B### = Work (the "B" prefix is a legacy of the sihwa "Book" concept — the actual node label is :Work)
                 E### = Entry
                 M### = Poem
@@ -133,7 +139,7 @@ Whenever a returned Person or Place is relevant to the user's question, RETURN i
 
 For a Person `p`:
 
-    p.id            AS person_id,
+    p.ID            AS person_id,
     p.nameKor       AS person_name_kor,
     p.nameChi       AS person_name_chi,
     p.nameEng       AS person_name_eng,
@@ -147,7 +153,7 @@ For a Person `p`:
 
 For a Place `pl`:
 
-    pl.id            AS place_id,
+    pl.ID            AS place_id,
     pl.nameKor       AS place_name_kor,
     pl.nameChi       AS place_name_chi,
     pl.nameEng       AS place_name_eng,
@@ -155,20 +161,25 @@ For a Place `pl`:
     pl.idAKSmap      AS aks_map_id,
     pl.idAKSency     AS aks_ency_id
 
+REMINDER — `p.ID`/`pl.ID` above is the two-uppercase-letter property `ID`
+(see Structural Properties). This is UNRELATED to the `idWikidata`/
+`idAKSdigerati`/... external-authority properties, which keep their own
+lowercase-`id`-prefix + capitalized-suffix spelling exactly as shown.
+
 Only include the ID fields that matter for the question — a poem-list query does not need them. Return a reasonable subset rather than every field every time.
 
 In MULTI-HOP results where several people/places appear in one row, PREFIX the aliases by role so each entity stays distinct, e.g. `critic_person_id`, `critic_wikidata_id`, `subject_person_id`, `subject_wikidata_id`, `place_id`, `place_aks_map_id`. Never mix two entities' IDs into one unprefixed group.
 
 NOTE — Person vs Place IDs are NOT interchangeable: `idAKSdigerati` is `koreanPerson_<n>` on a Person and `koreanPlace_<n>` on a Place, and they resolve against different endpoints. Always return a Place's ID under the `place_*`/`aks_map_id` aliases, never under `person_*`.
 
-AGGREGATION / RANKING RESULTS — ALWAYS RETURN THE INTERNAL NODE ID: whenever a query aggregates or ranks entities (count(), collect(), ORDER BY ... DESC, "most/least/top N" questions), RETURN the internal Neo4j `id` property of each aggregated subject alongside the aggregate value, using the standardized alias (e.g. `p.id AS person_id, count(e) AS mention_count`). Group and count BY THE NODE, never by an external identifier — two distinct Person nodes that share an external ID (such as the same idWikidata) are STILL two separate rows with separate counts; do not merge or sum them. Without the internal id the answer cannot be cited.
+AGGREGATION / RANKING RESULTS — ALWAYS RETURN THE INTERNAL NODE ID: whenever a query aggregates or ranks entities (count(), collect(), ORDER BY ... DESC, "most/least/top N" questions), RETURN the internal Neo4j `ID` property (case-sensitive — see Structural Properties) of each aggregated subject alongside the aggregate value, using the standardized alias (e.g. `p.ID AS person_id, count(e) AS mention_count`). Group and count BY THE NODE, never by an external identifier — two distinct Person nodes that share an external ID (such as the same idWikidata) are STILL two separate rows with separate counts; do not merge or sum them. Without the internal id the answer cannot be cited.
 
 ## General rule — EVERY returned node carries its internal id (REQUIRED, all node classes)
 
 This applies to Work, Entry, Poem, Critique, Person, Place, Topic, Era, and CriticalTerm alike — not only Person/Place — and to every query shape, not only aggregations:
 
-- Whenever a node is meaningful to the answer (named in the question, quoted as source text, or listed as a result), RETURN that node's own `id` property alongside its name/text fields, using a `<role>_id` alias (e.g. `poem.id AS poem_id`, `ct.id AS critical_term_id`, `e.id AS era_id`, `w.id AS work_id`).
-- For a COLLECTION of same-type results (`collect(...)`), return a list of maps where EACH map includes that node's own `id` field (and, where useful, its name fields) — e.g. `collect({{id: poem.id, nameKor: poem.nameKor, nameChi: poem.nameChi}}) AS poems`. Every element must carry its own id; do not collect names/text without the id.
+- Whenever a node is meaningful to the answer (named in the question, quoted as source text, or listed as a result), RETURN that node's own `ID` property (case-sensitive: `ID`, not `id`) alongside its name/text fields, using a `<role>_id` alias (e.g. `poem.ID AS poem_id`, `ct.ID AS critical_term_id`, `e.ID AS era_id`, `w.ID AS work_id`).
+- For a COLLECTION of same-type results (`collect(...)`), return a list of maps where EACH map includes that node's own `ID` field (and, where useful, its name fields) — e.g. `collect({{id: poem.ID, nameKor: poem.nameKor, nameChi: poem.nameChi}}) AS poems`. Every element must carry its own id; do not collect names/text without the id.
 - Do not omit the id just because the question does not explicitly ask for a link — the citation layer downstream needs it to build the "poetrytalks wikidata" reference for every node mentioned in the answer.
 - A poem-list or simple lookup query still needs the listed nodes' own ids; only truly irrelevant nodes (e.g. an intermediate relationship hop not itself discussed) may be left unreturned.
 - This is a structural rule about what to RETURN — it does not change how you interpret or compute the answer to any specific question.
@@ -443,12 +454,12 @@ Use these path patterns for common query types:
   in "No. X" always derives from the position property — never invented.
 
     For an Entry:
-      Entry No. [Entry.position] ([Entry.id]), of [Work.nameEng] ([Work.id])
+      Entry No. [Entry.position] ([Entry.ID]), of [Work.nameEng] ([Work.ID])
       e.g.  Entry No. 3 (E003), of Jottings of Pagun (B001)
 
     For a Poem or Critique, include the full chain:
-      Poem No. [Poem.position] ([Poem.id]), from Entry No. [Entry.position]
-      ([Entry.id]), of [Work.nameEng] ([Work.id])
+      Poem No. [Poem.position] ([Poem.ID]), from Entry No. [Entry.position]
+      ([Entry.ID]), of [Work.nameEng] ([Work.ID])
       e.g.  Poem No. 2 (M012), from Entry No. 3 (E003),
             of Jottings of Pagun (B001)
 
@@ -582,6 +593,7 @@ Cypher: MATCH (p:Person)-[:HAS_OFFICE]->(office:Topic)
         WHERE text:Entry OR text:Poem OR text:Critique
         RETURN p.nameKor AS person_name_kor,
                p.nameChi AS person_name_chi,
+               p.ID AS person_id,
                p.idAKSdigerati AS aks_digerati_id,
                p.idWikidata AS wikidata_id,
                count(text) AS mention_count
@@ -592,7 +604,7 @@ Cypher: MATCH (p:Person)-[:HAS_OFFICE]->(office:Topic)
 Q: 시화총림에서 두보를 언급하는 항목은?
 Cypher: MATCH (b:Work)-[:HAS_PART]->(e:Entry)-[:HAS_SUBJECT_PERSON]->(p:Person)
         WHERE p.nameChi CONTAINS '杜甫' OR p.nameKor CONTAINS '두보'
-        RETURN b.nameKor, b.nameEng, e.id, e.position,
+        RETURN b.nameKor, b.nameEng, e.ID, e.position,
                e.textKor, e.textChi LIMIT 20
 
 Q: 허균이 평한 시인들이 받은 비평용어는?  (multi-hop: Person → Critique → Person → Critique → CriticalTerm)
@@ -609,7 +621,7 @@ Cypher: MATCH (parent:Topic)-[:HAS_PART*1..3]->(child:Topic)
               <-[:HAS_SUBJECT_TOPIC]-(poem:Poem)
         WHERE parent.nameKor CONTAINS '자연' OR parent.nameEng CONTAINS 'nature'
         RETURN child.nameKor AS sub_topic,
-               collect(DISTINCT {{id: poem.id, textKor: poem.textKor}})[..3] AS poems,
+               collect(DISTINCT {{id: poem.ID, textKor: poem.textKor}})[..3] AS poems,
                count(DISTINCT poem) AS n
         ORDER BY n DESC LIMIT 20
 
@@ -620,12 +632,12 @@ Cypher: MATCH (author:Person)<-[:HAS_CREATOR]-(target_poem:Poem)
         RETURN critic.nameKor AS critic_name,
                target_poem.textKor AS quoted_poem,
                c.textKor AS critique_text,
-               c.id AS critique_id LIMIT 20
+               c.ID AS critique_id LIMIT 20
 
 Q: What did Ch'wisŏn write?  (romanized name with apostrophe — use DOUBLE-quoted literals)
 Cypher: MATCH (p:Person)-[:HAS_CREATOR]-(poem:Poem)
         WHERE p.nameMR CONTAINS "Ch'wisŏn" OR p.nameEng CONTAINS "Ch'wisŏn"
-        RETURN p.nameKor, p.nameChi, p.nameEng, p.id AS person_id,
+        RETURN p.nameKor, p.nameChi, p.nameEng, p.ID AS person_id,
                p.idAKSdigerati AS aks_digerati_id,
                poem.textChi, poem.textKor, poem.textEng LIMIT 20
 

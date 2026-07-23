@@ -176,43 +176,88 @@ flipped to "unregistered prefix is rejected", matching the newly-enforced
 fail-closed policy). **313 tests total, all passing**
 (`python -m unittest discover -s tests`).
 
-### Live smoke test — critical live-database finding
+### Live smoke test — CORRECTED finding: property-name casing, not missing data
 
-Ran the three representative questions live against Neo4j + Gemini
-(`기고(奇古) 비평용어…`, `지봉유설에 포함된 시…`, and re-ran the earlier
-`Which woman is mentioned the most…`). The code held its contract in every
-case: **zero** `(?)`/`Entry 0`/`Entry None`/fabricated-link occurrences,
-correct graceful degradation when ids are absent, no crashes.
-
-However, a direct query proved the live database's `id` property is **empty
-on every one of the 8,232 corpus nodes, across all 9 classes**:
+**Correction to an earlier note in this document.** The first live smoke test
+run reported the live database's `id` property as universally empty and
+framed it as a data/import gap requiring a live-DB backfill (out of scope).
+That conclusion was **wrong**. The user pointed out the property is spelled
+`ID` (two uppercase letters), not `id`, and a direct query confirmed it:
 
 ```text
-MATCH (n) RETURN DISTINCT labels(n), count(n), count(n.id)
-Entry 921/0  Poem 1771/0  Critique 1828/0  Work 116/0
-Person 1255/0  Place 545/0  Era 44/0  CriticalTerm 692/0  Topic 1060/0
+MATCH (p:Person) RETURN p.id AS id LIMIT 3          -- {'id': None} × 3
+MATCH (p:Person) RETURN p.ID AS ID, p.nameKor LIMIT 3 -- {'ID': 'P001', 'name': '이규보'}, ...
+
+MATCH (n) RETURN labels(n), count(n), count(n.ID)
+Entry 921/921  Poem 1771/1771  Critique 1828/1828  Work 116/116
+Person 1255/1255  Place 545/545  Era 44/44  CriticalTerm 692/692  Topic 1060/1060
 ```
 
-This is a **pre-existing live-database/import gap** (the local
-`neo4j_import_nodes.jsonl` export DOES have all 8,232 ids — the live instance
-was populated without carrying `id` over, or it was cleared) — not a defect
-in this work order's code, and modifying live Neo4j data is explicitly a
-non-goal here and in every prior work order. Consequences, all handled
-correctly by the existing fail-closed design:
+Every corpus node **does** carry its id — 100% populated across all 9
+classes — under the property name `ID`. Neo4j property names are
+case-sensitive, so `n.id` silently returns `null` on a graph where the real
+property is `n.ID`; there is no error, which is exactly why this went
+undetected through 313 passing (mocked) tests and three "successful" live
+smoke test runs that quietly produced zero citations.
 
-- No Poetry Talks link, body link, or "poetrytalks wikidata" bullet can be
-  produced against the live instance today — every id-shaped value the
-  retrievers see comes back `None`, and `make_node_reference`/`is_valid_node_id`
-  correctly refuse to fabricate anything from `None`.
-- External authority enrichment (Wikidata/AKS Digerati, verified working in
-  the very first work order's live tests) is unaffected — it reads
-  `idWikidata`/`idAKSdigerati` etc., which ARE populated; only the corpus's
-  OWN `id` property (used for Poetry Talks linking) is empty.
-- Once the live database's `id` property is backfilled from the JSONL/CSV
-  source-of-truth (a data/ops task, out of scope here), the entire pipeline
-  built in this work order activates with no code change required — this was
-  confirmed structurally via the 313 passing tests, which exercise the exact
-  same code paths with realistic ids.
+**Root cause, precisely**: every Cypher-generation prompt example, the
+"Standardized authority aliases" section, the aggregation/general id-return
+rules (added in this same work order), and `tools/vector.py`'s hand-written
+retrieval-query projection all instructed lowercase `.id`. The live
+`Neo4jGraph` schema introspection (`{schema}` in the prompt) almost certainly
+already reported the correct `ID` casing, but the hand-written few-shot
+examples and rules likely dominated Gemini's output, since every observed
+live query consistently generated lowercase `p.id`/`poem.id`/etc.
+
+**Fix applied** (`tools/vector.py`, `tools/cypher.py`): every occurrence of
+`.id` used as a NODE'S-OWN-identifier accessor (`node.id`, `p.id`, `w.id`,
+`e.id`, `t.id`, `ct.id`, `pm.id`, `pl.id`, `c.id`, ...) changed to `.ID`, in:
+the vector retrieval-query Cypher literal (entry/work/creator/mentioned-
+persons/audiences/places/topics/forms_types/critical_terms/era/contained-
+poems/contained-critiques projections); the Cypher-generation prompt's
+"Structural Properties" doc (now states the property is case-sensitively
+`ID`, with an explicit "`n.id` returns null" warning), "Standardized
+authority aliases", the aggregation rule, the general all-node-id rule added
+earlier in this work order, the citation-format examples, and every few-shot
+example that read a node's own id. External authority properties
+(`idWikidata`, `idAKSency`, `idAKSdigerati`, ...) were already correctly
+cased and are untouched — only the bare internal identifier was affected.
+
+**Re-verified live after the fix** — both retrieval paths now return real
+ids end-to-end:
+
+```text
+Vector path ("Which woman is mentioned the most…", graph blocked by an
+unrelated Cypher-syntax issue, vector supplied the evidence):
+  vector node_references: [('E220','Entry'), ('B009','Work'), ('P009','Person'),
+                            ('P044','Person'), ('T023','Topic'), ...]
+  citations: "- poetrytalks wikidata: [E220](https://poetrytalks.org/E220)", ...
+  (previously: 4× "vector provenance skipped ... metadata contract violation",
+   zero citations — this warning no longer appears)
+
+Graph path ("기고(奇古) 비평용어가 사용된 비평문을 알려줘"):
+  graph_row: {'critique_id': 'C001', 'entry_id': 'E001', 'work_id': 'B001',
+              'work_name_kor': '백운소설', ...}
+  graph node_references: [('C001','Critique'), ('E001','Entry'), ('B001','Work'), ...]
+  (previously: critique_id=None, entry_id=None, work_id=None — zero references)
+```
+
+No test changes were required by this fix (all 313 tests still pass) — the
+Python-side parsing already worked correctly from row *aliases*
+(`person_id`, `entry_id`, ...); only the Cypher-side property accessor
+feeding those aliases was wrong. `git diff --check` clean;
+`python -m unittest discover -s tests` still reports 313/313 passing.
+
+**Remaining known limitation**: the multi-label `WHERE text:Entry OR
+text:Poem OR text:Critique` backtick-quoting pattern is occasionally
+generated malformed by Gemini (e.g. producing
+`` text:`Entry OR text`:`Poem OR text`:`Critique `` and bleeding backticks
+into the following `RETURN` line), which the existing Cypher safety
+validator correctly rejects (`query has no RETURN clause`) and the
+orchestrator correctly degrades to vector-only evidence for that turn. This
+is a separate, pre-existing LLM Cypher-generation reliability issue
+(non-deterministic prompt output), unrelated to the id-casing defect fixed
+here, and out of scope for this correction.
 
 ## Deterministic Sources assembly (work order 5)
 
