@@ -28,6 +28,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
 from utils import get_session_id
+from tools.evidence import POETRYTALKS_BASE_URL
 
 
 # ──────────────────────────────────────────────
@@ -56,15 +57,15 @@ RETURN
     node.{text_property} AS text,
     score,
     {{
-        entry_id: node.id,
+        entry_id: node.ID,
         entry_position: node.position,
         original_chinese: node.textChi,
         korean_translation: node.textKor,
         english_translation: node.textEng,
         source_work_kor: [(w:Work)-[:HAS_PART]->(node) | w.nameKor][0],
         source_work_eng: [(w:Work)-[:HAS_PART]->(node) | w.nameEng][0],
-        source_work_id: [(w:Work)-[:HAS_PART]->(node) | w.id][0],
-        poetrytalks_link: 'https://poetrytalks.org/' + node.id
+        source_work_id: [(w:Work)-[:HAS_PART]->(node) | w.ID][0],
+        poetrytalks_link: '{POETRYTALKS_BASE_URL}' + node.ID
     }} AS metadata
 """
 

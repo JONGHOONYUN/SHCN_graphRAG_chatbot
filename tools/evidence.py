@@ -670,7 +670,7 @@ def document_to_parts(doc: Any) -> tuple:
     #   2. valid work_id only        → work-only citation (no faked position)
     #   3. neither valid internal ID → NO user-facing provenance; diagnostic
     #      log only (metadata contract violation — the retrieval query
-    #      projects node.id / position / work id, so absence is a bug).
+    #      projects node.ID / position / work ID, so absence is a bug).
     # `(?)`, `(None)`, `Entry 0`, `Entry None` must never be produced.
     raw_entry_id = meta.get("entry_id")
     raw_work_id = meta.get("source_work_id")

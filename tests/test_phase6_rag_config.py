@@ -5,6 +5,7 @@ Both `tools.vector` and `text_rag` must reference the same object owned by
 """
 
 import unittest
+from pathlib import Path
 
 
 class TestRagConfigSingleSource(unittest.TestCase):
@@ -51,7 +52,7 @@ class TestNoDuplicateInVectorPy(unittest.TestCase):
     removes that: only the re-export from `rag_config` may remain."""
 
     def test_vector_py_does_not_redefine_index_by_lang(self):
-        src = open("tools/vector.py", encoding="utf-8").read()
+        src = Path("tools/vector.py").read_text(encoding="utf-8")
         # Textual mentions in prompt strings and comments are fine; a literal
         # dict assignment is not.
         self.assertNotIn(
@@ -64,10 +65,39 @@ class TestNoDuplicateInVectorPy(unittest.TestCase):
 
 class TestNoDuplicateInTextRagPy(unittest.TestCase):
     def test_text_rag_py_does_not_redefine_index_by_lang(self):
-        src = open("text_rag.py", encoding="utf-8").read()
+        src = Path("text_rag.py").read_text(encoding="utf-8")
         self.assertNotIn(
             "INDEX_BY_LANG = {", src,
             "text_rag.py must not redefine INDEX_BY_LANG as a literal.",
+        )
+
+
+class TestTextRagRetrievalMetadataContract(unittest.TestCase):
+    """textRAG must project the public domain ID, not an export/runtime id."""
+
+    @staticmethod
+    def _builder_source():
+        src = Path("text_rag.py").read_text(encoding="utf-8")
+        start = src.index("def _build_light_retrieval_query")
+        end = src.index("def _get_text_retriever_for_lang", start)
+        return src[start:end]
+
+    def test_entry_and_work_use_uppercase_domain_id(self):
+        builder = self._builder_source()
+        self.assertIn("entry_id: node.ID", builder)
+        self.assertIn("| w.ID][0]", builder)
+        self.assertNotIn("node.id", builder)
+        self.assertNotIn("| w.id][0]", builder)
+
+    def test_poetrytalks_link_uses_shared_base_url_and_domain_id(self):
+        src = Path("text_rag.py").read_text(encoding="utf-8")
+        builder = self._builder_source()
+        self.assertIn(
+            "from tools.evidence import POETRYTALKS_BASE_URL", src
+        )
+        self.assertIn(
+            "poetrytalks_link: '{POETRYTALKS_BASE_URL}' + node.ID",
+            builder,
         )
 
 
