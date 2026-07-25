@@ -69,7 +69,14 @@ Available on: Series, Work, Person, Place, Era, Topic, CriticalTerm
     nameMR    McCune-Reischauer romanization (Korean entities)
     namePY    Hanyu Pinyin romanization (Sinitic entities)
 
-NOTE: nameRR does not exist in the data. Do not use it.
+NOTE: `nameRR` (Revised Romanization) DOES exist on some Person/Place nodes,
+but it is NOT a display field for this project — `nameMR` (McCune-Reischauer)
+is the sole authoritative Latin-script form for Korean-related entities. You
+may reference `nameRR` inside a search predicate (CONTAINS matching) if the
+user's query text looks like Revised-Romanization spelling, but NEVER return
+it under a name/display alias and never present it as the answer's
+romanization — that is downstream synthesis's job to enforce, but do not
+manufacture the confusion by aliasing `nameRR` as if it were `nameMR`.
 
 
 ## Text Content Properties
@@ -143,6 +150,7 @@ For a Person `p`:
     p.nameKor       AS person_name_kor,
     p.nameChi       AS person_name_chi,
     p.nameEng       AS person_name_eng,
+    p.nameMR        AS person_name_mr,
     p.idWikidata    AS wikidata_id,
     p.idAKSdigerati AS aks_digerati_id,
     p.idLOC         AS loc_id,
@@ -157,6 +165,7 @@ For a Place `pl`:
     pl.nameKor       AS place_name_kor,
     pl.nameChi       AS place_name_chi,
     pl.nameEng       AS place_name_eng,
+    pl.nameMR        AS place_name_mr,
     pl.idAKSdigerati AS aks_digerati_id,
     pl.idAKSmap      AS aks_map_id,
     pl.idAKSency     AS aks_ency_id
@@ -432,15 +441,23 @@ Use these path patterns for common query types:
 - Respond in the same language the user is writing in.
 - Use the following name fields as authoritative — never re-romanize or
   re-transliterate names from scratch:
-    nameEng   Canonical name form for most languages (English, Korean, French,
-              Spanish, German, etc.)
+    nameEng   English name or translation
     nameMR    McCune-Reischauer romanization for Korean entities
     namePY    Hanyu Pinyin romanization for Sinitic entities
     nameChi   Prefer as primary name form for users writing in languages that
               read Chinese characters natively (e.g. Japanese)
-- Example: a French response about a Korean poet uses nameEng ("Yi Kyubo"),
-  not a new French romanization of 이규보. A French response about a Chinese
-  poet uses nameEng with namePY in parentheses if available.
+- Korean-related entities (Person/Place/Work/Era/Topic tied to the Korean
+  cultural sphere): `nameMR` is the SOLE authoritative Latin-script
+  romanization field. When both `nameMR` and `nameEng` are populated, prefer
+  `nameMR` for the romanized form. When `nameMR` is absent, you may fall back
+  to `nameEng` AS STORED (verbatim) — never invent a new romanization to fill
+  the gap, and never label a fallback `nameEng` value as if it were "the"
+  McCune-Reischauer form. `nameRR` (Revised Romanization) must never be
+  surfaced as a name/display value under any circumstance, in any language.
+- Example: a French response about a Korean poet with a populated `nameMR`
+  uses that MR form ("Yi Kyubo"), not a new French romanization of 이규보 and
+  not `nameRR`. A French response about a Chinese poet uses nameEng with
+  namePY in parentheses if available.
 - All name fields are authoritative as stored. Do not modify them.
 - NEVER translate, paraphrase, summarize, or alter source text fields in any
   way: textChi, textKor, textEng, descEng. This applies even if the user
@@ -717,6 +734,16 @@ _SYNTAX_RETRY_HINT = (
     "Ch'wisŏn), wrap that literal in DOUBLE quotes (\"Ch'wisŏn\") — never "
     "escape it SQL-style by doubling (''). Regenerate the query accordingly."
 )
+
+# 안전검증기가 malformed_label_predicate/missing_return으로 거부한 경우의
+# 복구 힌트 (graph-ranking-reliability work order §3 P0-A-6). 원본 쿼리는
+# 절대 다시 넣지 않고, 일반화된 규칙만 전달한다.
+_SHAPE_RETRY_HINT = (
+    "\n\n[SYSTEM NOTE] The previous Cypher was rejected for query shape. "
+    "Return exactly one read-only Cypher query with a RETURN clause. For "
+    "multiple labels, write separate label predicates joined by OR; never "
+    "place \"OR\" inside a backtick-quoted label."
+)
 def cypher_qa_safe(question: str) -> str:
     """GraphCypherQAChain 호출 wrapper.
 
@@ -799,6 +826,7 @@ def cypher_qa_safe(question: str) -> str:
 import logging  # noqa: E402
 import uuid  # noqa: E402
 
+from tools.cypher_safety import RECOVERABLE_REASON_CODES  # noqa: E402
 from tools.evidence import Evidence, graph_rows_to_evidence  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -810,6 +838,13 @@ def _status_evidence(outcome: str, exc: Exception) -> Evidence:
                    code, type(exc).__name__, exc)
     ev = Evidence(kind="graph")
     ev.claims.append({"type": "status", "outcome": outcome})
+    return ev
+
+
+def _invalid_query_evidence() -> Evidence:
+    """User-safe `invalid_query` Evidence — never carries raw query text."""
+    ev = Evidence(kind="graph")
+    ev.claims.append({"type": "status", "outcome": "invalid_query"})
     return ev
 
 
@@ -841,7 +876,18 @@ def retrieve_graph_evidence(question: str,
 
     On failure returns an empty graph Evidence carrying only a user-safe status
     claim; the exception itself is logged with a correlation code and never
-    placed in Evidence."""
+    placed in Evidence.
+
+    Recovery policy (graph-ranking-reliability work order §3 P0-A):
+      * `CypherSyntaxError` and `UnsafeCypherError` whose `reason_code` is in
+        `RECOVERABLE_REASON_CODES` (malformed backtick multi-label predicate,
+        missing RETURN) get exactly ONE regeneration attempt, guided by a
+        GENERALIZED hint — the original query text is never re-sent.
+      * Any other `UnsafeCypherError` (forbidden keyword, disallowed CALL,
+        multi-statement, ...) is never retried — it is blocked outright and
+        reported as `invalid_query`, exactly as before.
+      * A second failure of any kind ends the attempt with a user-safe status;
+        it never falls through to a third attempt."""
     query = question
     if history_text:
         query = (
@@ -850,29 +896,52 @@ def retrieve_graph_evidence(question: str,
             "사용하고, 사실(근거)로 취급하지 말 것]\n"
             f"{history_text}"
         )
+
     try:
         result = cypher_qa_structured.invoke({"query": query})
     except CypherSyntaxError as e:
         # 흔한 원인: 로마자 이름의 아포스트로피(Ch'wisŏn)를 SQL식 ''로
         # 이스케이프한 잘못된 Cypher. 힌트를 덧붙여 1회 재생성 시도.
-        logger.info("Cypher syntax error — retrying with escaping hint: %s", e)
+        logger.info("Cypher syntax error [recoverable] — retrying once with "
+                   "escaping hint: %s", e)
         try:
             result = cypher_qa_structured.invoke(
                 {"query": query + _SYNTAX_RETRY_HINT})
         except UnsafeCypherError as e2:
-            return _status_evidence("invalid_query", e2)
+            logger.warning(
+                "graph retrieval rejected unsafe cypher on retry [%s] "
+                "reason_code=%s", e2.correlation_id, e2.reason_code)
+            return _invalid_query_evidence()
         except Exception as e2:
             return _status_evidence("temporarily_unavailable", e2)
     except UnsafeCypherError as e:
-        # Read-only validator rejected the LLM-generated Cypher. This is a
-        # user-safe `invalid_query` outcome — no raw text propagates.
-        logger.warning(
-            "graph retrieval rejected unsafe cypher [%s]: %s",
-            e.correlation_id, e.reason,
-        )
-        ev = Evidence(kind="graph")
-        ev.claims.append({"type": "status", "outcome": "invalid_query"})
-        return ev
+        if e.recoverable:
+            logger.info(
+                "graph retrieval rejected [recoverable] [%s] reason_code=%s "
+                "— retrying once with a generalized shape hint (original "
+                "query never re-sent)", e.correlation_id, e.reason_code)
+            try:
+                result = cypher_qa_structured.invoke(
+                    {"query": query + _SHAPE_RETRY_HINT})
+            except UnsafeCypherError as e2:
+                logger.warning(
+                    "graph retrieval rejected unsafe cypher on retry [%s] "
+                    "reason_code=%s — giving up, no further retry",
+                    e2.correlation_id, e2.reason_code)
+                return _invalid_query_evidence()
+            except CypherSyntaxError as e2:
+                return _status_evidence("temporarily_unavailable", e2)
+            except Exception as e2:
+                return _status_evidence("temporarily_unavailable", e2)
+        else:
+            # Write/schema/permission/dynamic keyword, disallowed CALL, or
+            # multi-statement — never retried, blocked outright.
+            logger.warning(
+                "graph retrieval rejected unsafe cypher [%s] reason_code=%s "
+                "(non-recoverable — not retried): %s",
+                e.correlation_id, e.reason_code, e.reason,
+            )
+            return _invalid_query_evidence()
     except ClientError as e:
         return _status_evidence("temporarily_unavailable", e)
     except Exception as e:  # transient LLM/parse issues — degrade gracefully
@@ -882,4 +951,70 @@ def retrieve_graph_evidence(question: str,
         return Evidence(kind="graph")
     cypher, rows = _extract_intermediate(result)
     return graph_rows_to_evidence(rows, cypher=cypher)
+
+
+# ──────────────────────────────────────────────
+# Deterministic ranking/aggregation template (graph-ranking-reliability work
+# order §3 P0-B). "Most mentioned X" / "가장 많이 언급된 X" questions never go
+# through free-form LLM Cypher generation — a parameterized template is run
+# directly against the safe read-only graph wrapper, so a malformed
+# multi-label predicate (as originally observed for this exact question
+# class) can no longer masquerade as "no results". Callers pick this path by
+# checking `tools.graph_intent.is_graph_aggregation_intent()` BEFORE the
+# authority-cue / free-form-Cypher routing (see tools/orchestrator.py).
+# ──────────────────────────────────────────────
+from tools.graph_intent import (  # noqa: E402
+    DEFAULT_RANKING_LIMIT,
+    MENTION_COUNT_UNIT,
+    ROLE_TYPE_CUES,
+    build_role_ranking_query,
+    rank_rows_by_mention_count,
+)
+
+
+def retrieve_role_ranking_evidence(role: str,
+                                   limit: int = DEFAULT_RANKING_LIMIT) -> Evidence:
+    """Deterministic graph-first ranking Evidence for a registered role
+    (work order §3 P0-B/P0-D).
+
+    Never falls through to LLM Cypher generation. Never triggers external
+    authority enrichment itself — it only records the winning Person id(s)
+    as a `ranking` claim so a caller (tools/orchestrator.py) can decide
+    whether/which single winner to enrich, per P0-D (authority fetch stays
+    at 0 unless the user explicitly asked about the winner)."""
+    if role not in ROLE_TYPE_CUES:
+        return _invalid_query_evidence()
+
+    cypher, params = build_role_ranking_query(role, limit=limit)
+    try:
+        rows = _safe_graph.query(cypher, params=params)
+    except UnsafeCypherError as e:
+        # A rejection here means the TEMPLATE itself is malformed — not a
+        # runtime input problem, since params never enter the query string.
+        logger.warning(
+            "role ranking template rejected by safety validator [%s] "
+            "reason_code=%s — this indicates a bug in the template, not "
+            "user input", e.correlation_id, e.reason_code)
+        return _invalid_query_evidence()
+    except ClientError as e:
+        return _status_evidence("temporarily_unavailable", e)
+    except Exception as e:
+        return _status_evidence("temporarily_unavailable", e)
+
+    if not rows:
+        ev = Evidence(kind="graph")
+        ev.claims.append({"type": "status", "outcome": "no_results"})
+        return ev
+
+    ev = graph_rows_to_evidence(rows)
+    top_count, winners = rank_rows_by_mention_count(list(rows))
+    winner_ids = [w.get("person_id") for w in winners if w.get("person_id")]
+    ev.claims.append({
+        "type": "ranking",
+        "role": role,
+        "unit": MENTION_COUNT_UNIT,
+        "winner_person_ids": winner_ids,
+        "winner_count": top_count,
+    })
+    return ev
 

@@ -183,13 +183,21 @@ class Entity:
     """A resolved entity (Person or Place) carrying authority identifiers.
 
     `authority_ids` maps a normalized registry key ('wikidata', 'aks_digerati',
-    'loc', 'aks_map', …) to the ID stored on the Neo4j node."""
+    'loc', 'aks_map', …) to the ID stored on the Neo4j node.
+
+    `name_mr` is the stored McCune–Reischauer romanization — the ONLY
+    authoritative Latin-script form for Korean-related entities in this
+    project (graph-ranking-reliability work order §2 rule 7). It is never
+    derived, guessed, or backfilled from `name_eng`/`name_rr`; it is simply
+    carried through verbatim from the `nameMR` graph property, or left `None`
+    when the node has none."""
 
     node_id: Optional[str] = None
     node_type: Optional[str] = None
     name_kor: Optional[str] = None
     name_chi: Optional[str] = None
     name_eng: Optional[str] = None
+    name_mr: Optional[str] = None
     authority_ids: dict = field(default_factory=dict)
 
     # ── Convenience accessors (read-only; authority_ids stays the source of truth)
@@ -248,6 +256,7 @@ class Provenance:
     work_name_kor: Optional[str] = None
     work_name_eng: Optional[str] = None
     work_name_chi: Optional[str] = None
+    work_name_mr: Optional[str] = None
     entry_position: Any = None
 
     def to_dict(self) -> dict:
@@ -273,6 +282,7 @@ class NodeReference:
     name_kor: Optional[str] = None
     name_chi: Optional[str] = None
     name_eng: Optional[str] = None
+    name_mr: Optional[str] = None
     source_type: Optional[str] = None
     work_id: Optional[str] = None
     entry_id: Optional[str] = None
@@ -292,7 +302,7 @@ def make_node_reference(
     source_type: Optional[str] = None,
     work_id: Optional[str] = None, entry_id: Optional[str] = None,
     name_kor: Optional[str] = None, name_chi: Optional[str] = None,
-    name_eng: Optional[str] = None,
+    name_eng: Optional[str] = None, name_mr: Optional[str] = None,
 ) -> Optional["NodeReference"]:
     """Construct a NodeReference, or None if `node_id` is not a valid,
     registered-prefix node id — this is the ONLY validation gate; callers
@@ -312,7 +322,7 @@ def make_node_reference(
     return NodeReference(
         node_id=node_id.strip(), node_type=inferred,
         name_kor=name_kor, name_chi=name_chi, name_eng=name_eng,
-        source_type=source_type,
+        name_mr=name_mr, source_type=source_type,
         work_id=work_id if is_valid_node_id(work_id) else None,
         entry_id=entry_id if is_valid_node_id(entry_id) else None,
     )
@@ -335,7 +345,7 @@ def merge_node_references(refs: Any) -> list:
         else:
             existing = by_id[r.node_id]
             for f in ("node_type", "name_kor", "name_chi", "name_eng",
-                     "source_type", "work_id", "entry_id"):
+                     "name_mr", "source_type", "work_id", "entry_id"):
                 if not getattr(existing, f) and getattr(r, f):
                     setattr(existing, f, getattr(r, f))
     return [by_id[i] for i in order]
@@ -387,7 +397,7 @@ def _entities_match(a: Entity, b: Entity) -> bool:
 def _merge_into(target: Entity, other: Entity) -> None:
     """Fill empty fields on `target` from `other`, merging all non-conflicting
     authority IDs. An existing value always wins over a conflicting one."""
-    for f in ("node_id", "node_type", "name_kor", "name_chi", "name_eng"):
+    for f in ("node_id", "node_type", "name_kor", "name_chi", "name_eng", "name_mr"):
         if not getattr(target, f) and getattr(other, f):
             setattr(target, f, getattr(other, f))
     for key, value in other.authority_ids.items():
@@ -398,7 +408,7 @@ def _merge_into(target: Entity, other: Entity) -> None:
 def _copy_entity(e: Entity) -> Entity:
     return Entity(
         node_id=e.node_id, node_type=e.node_type, name_kor=e.name_kor,
-        name_chi=e.name_chi, name_eng=e.name_eng,
+        name_chi=e.name_chi, name_eng=e.name_eng, name_mr=e.name_mr,
         authority_ids=dict(e.authority_ids or {}),
     )
 
@@ -481,7 +491,12 @@ def _clean_ids(raw: Any) -> dict:
 def _person_from_flat(p: dict) -> Optional[Entity]:
     """Build a Person Entity from a flat metadata dict (mentioned_persons,
     audiences). Any key that is not a name/id field is treated as an authority
-    id, so new registry keys flow through without code changes."""
+    id, so new registry keys flow through without code changes.
+
+    `nameRR` is deliberately read into NOTHING — it is dropped here (present
+    in `reserved` only so it is excluded from `authority_ids`, never so it
+    reaches a name field). The project's sole Latin-script field is `nameMR`
+    (work order §2 rule 7)."""
     if not isinstance(p, dict):
         return None
     reserved = {"id", "nameKor", "nameChi", "nameEng", "nameMR", "namePY", "nameRR"}
@@ -489,6 +504,7 @@ def _person_from_flat(p: dict) -> Optional[Entity]:
     return Entity(
         node_id=p.get("id"), node_type="Person",
         name_kor=p.get("nameKor"), name_chi=p.get("nameChi"), name_eng=p.get("nameEng"),
+        name_mr=p.get("nameMR"),
         authority_ids=authority,
     )
 
@@ -508,16 +524,20 @@ def _normalize_place_authority(authority: dict) -> dict:
 
 def _place_from_flat(p: dict) -> Optional[Entity]:
     """Build a Place Entity from a flat metadata dict. `gis`/`image` are display
-    data, not authority ids, so they are excluded from authority_ids."""
+    data, not authority ids, so they are excluded from authority_ids.
+    `nameRR` is excluded from authority_ids but never read into a name field —
+    `nameMR` is the sole Latin-script field (work order §2 rule 7)."""
     if not isinstance(p, dict):
         return None
-    reserved = {"id", "nameKor", "nameChi", "nameEng", "gis", "image"}
+    reserved = {"id", "nameKor", "nameChi", "nameEng", "nameMR", "nameRR",
+               "gis", "image"}
     authority = _normalize_place_authority(
         _clean_ids({k: v for k, v in p.items() if k not in reserved})
     )
     return Entity(
         node_id=p.get("id"), node_type="Place",
         name_kor=p.get("nameKor"), name_chi=p.get("nameChi"), name_eng=p.get("nameEng"),
+        name_mr=p.get("nameMR"),
         authority_ids=authority,
     )
 
@@ -536,7 +556,8 @@ def entities_from_vector_meta(meta: dict) -> list:
             Entity(
                 node_id=meta.get("creator_id"), node_type="Person",
                 name_kor=meta.get("creator"), name_chi=meta.get("creator_chi"),
-                name_eng=meta.get("creator_eng"), authority_ids=creator_ids,
+                name_eng=meta.get("creator_eng"), name_mr=meta.get("creator_mr"),
+                authority_ids=creator_ids,
             )
         )
 
@@ -594,12 +615,12 @@ def node_references_from_vector_meta(meta: dict) -> list:
         make_node_reference(
             work_id, source_type="neo4j_vector",
             name_kor=meta.get("source_work_kor"), name_chi=meta.get("source_work_chi"),
-            name_eng=meta.get("source_work_eng"),
+            name_eng=meta.get("source_work_eng"), name_mr=meta.get("source_work_mr"),
         ),
         make_node_reference(
             meta.get("creator_id"), source_type="neo4j_vector",
             name_kor=meta.get("creator"), name_chi=meta.get("creator_chi"),
-            name_eng=meta.get("creator_eng"),
+            name_eng=meta.get("creator_eng"), name_mr=meta.get("creator_mr"),
         ),
     ]
 
@@ -610,7 +631,7 @@ def node_references_from_vector_meta(meta: dict) -> list:
                 refs.append(make_node_reference(
                     item.get("id"), source_type="neo4j_vector",
                     name_kor=item.get("nameKor"), name_chi=item.get("nameChi"),
-                    name_eng=item.get("nameEng"),
+                    name_eng=item.get("nameEng"), name_mr=item.get("nameMR"),
                 ))
 
     era = meta.get("era")
@@ -618,6 +639,7 @@ def node_references_from_vector_meta(meta: dict) -> list:
         refs.append(make_node_reference(
             era.get("id"), source_type="neo4j_vector",
             name_kor=era.get("nameKor"), name_eng=era.get("nameEng"),
+            name_mr=era.get("nameMR"),
         ))
 
     for key in ("contained_poems", "contained_critiques"):
@@ -716,6 +738,7 @@ def document_to_parts(doc: Any) -> tuple:
                 work_name_kor=meta.get("source_work_kor"),
                 work_name_eng=meta.get("source_work_eng"),
                 work_name_chi=meta.get("source_work_chi"),
+                work_name_mr=meta.get("source_work_mr"),
                 entry_position=entry_position,
             )
         )
@@ -837,6 +860,7 @@ def _row_entity(row: dict, prefix: str, node_type: str) -> Optional[Entity]:
         "name_kor": row.get(f"{prefix}{lower}_name_kor"),
         "name_chi": row.get(f"{prefix}{lower}_name_chi"),
         "name_eng": row.get(f"{prefix}{lower}_name_eng"),
+        "name_mr": row.get(f"{prefix}{lower}_name_mr"),
     }
     has_anchor = bool(node_id) or any(names.values())
     has_other_anchor = bool(row.get(f"{prefix}{other}_id")) or any(
@@ -1003,14 +1027,18 @@ def _is_id_key(key: Any) -> bool:
 def _sibling_names_for_id_key(container: dict, id_key: str) -> dict:
     """Best-effort name fields living alongside an id key in the same dict,
     supporting both the project's snake_case convention (`<stem>_name_kor`)
-    and bare Neo4j-style camelCase (`nameKor`) for generic collect() maps."""
+    and bare Neo4j-style camelCase (`nameKor`) for generic collect() maps.
+
+    `name_mr` (McCune–Reischauer) is included on equal footing — it is the
+    sole Latin-script display field for Korean-related entities (work order
+    §2 rule 7); `nameRR` is intentionally never read here."""
     stem = id_key[:-3] if id_key.endswith("_id") else ""
     out: dict = {}
     for canon, tail in (("name_kor", "name_kor"), ("name_chi", "name_chi"),
-                       ("name_eng", "name_eng")):
+                       ("name_eng", "name_eng"), ("name_mr", "name_mr")):
         candidates = [f"{stem}_{tail}"] if stem else [tail]
         candidates.append({"name_kor": "nameKor", "name_chi": "nameChi",
-                           "name_eng": "nameEng"}[canon])
+                           "name_eng": "nameEng", "name_mr": "nameMR"}[canon])
         for cand in candidates:
             val = container.get(cand)
             if isinstance(val, str) and val.strip():

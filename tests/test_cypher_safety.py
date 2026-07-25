@@ -9,6 +9,14 @@ import unittest
 from unittest.mock import MagicMock
 
 from tools.cypher_safety import (
+    RECOVERABLE_REASON_CODES,
+    REASON_DISALLOWED_CALL,
+    REASON_EMPTY_QUERY,
+    REASON_FORBIDDEN_KEYWORD,
+    REASON_MALFORMED_LABEL_PREDICATE,
+    REASON_MISSING_RETURN,
+    REASON_MULTI_STATEMENT,
+    REASON_NOT_A_STRING,
     UnsafeCypherError,
     SafeNeo4jGraph,
     safe_graph,
@@ -256,6 +264,147 @@ class TestSafeNeo4jGraphProxy(unittest.TestCase):
         inner.some_other_attr = "hello"
         proxy = safe_graph(inner)
         self.assertEqual(proxy.some_other_attr, "hello")
+
+
+class TestMalformedLabelPredicate(unittest.TestCase):
+    """graph-ranking-reliability work order §5.1 — the exact observed failure
+    shape and its two correct alternatives."""
+
+    def test_observed_malformed_query_rejected(self):
+        query = (
+            "MATCH (text)\n"
+            "WHERE text:`Entry OR text`:Poem OR text:Critique\n"
+            "RETURN text.ID"
+        )
+        with self.assertRaises(UnsafeCypherError) as ctx:
+            validate_read_only_cypher(query)
+        self.assertEqual(ctx.exception.reason_code, REASON_MALFORMED_LABEL_PREDICATE)
+        self.assertTrue(ctx.exception.recoverable)
+        self.assertIn(REASON_MALFORMED_LABEL_PREDICATE, RECOVERABLE_REASON_CODES)
+
+    def test_separate_label_predicates_form_passes(self):
+        query = ("MATCH (text) WHERE text:Entry OR text:Poem OR text:Critique "
+                 "RETURN text.ID LIMIT 20")
+        result = validate_read_only_cypher(query)
+        self.assertIn("RETURN text.ID", result)
+
+    def test_any_labels_form_passes(self):
+        query = (
+            "MATCH (text) WHERE any(label IN labels(text) "
+            "WHERE label IN ['Entry', 'Poem', 'Critique']) "
+            "RETURN text.ID LIMIT 20"
+        )
+        result = validate_read_only_cypher(query)
+        self.assertIn("RETURN text.ID", result)
+
+    def test_query_text_never_in_exception(self):
+        query = "MATCH (text) WHERE text:`Entry OR text`:Poem RETURN text.ID"
+        try:
+            validate_read_only_cypher(query)
+        except UnsafeCypherError as e:
+            self.assertNotIn("Entry OR text", str(e))
+            self.assertNotIn("text.ID", str(e))
+        else:
+            self.fail("UnsafeCypherError was not raised")
+
+
+class TestReasonCodeClassification(unittest.TestCase):
+    """graph-ranking-reliability work order §5.1 items 3-4: every rejection
+    carries a mechanically-branchable reason_code, and only the query-SHAPE
+    codes are recoverable — write/call/multi-statement stay blocked."""
+
+    def test_missing_return_is_recoverable(self):
+        with self.assertRaises(UnsafeCypherError) as ctx:
+            validate_read_only_cypher("MATCH (p:Person) WHERE p.ID = 'P001'")
+        self.assertEqual(ctx.exception.reason_code, REASON_MISSING_RETURN)
+        self.assertTrue(ctx.exception.recoverable)
+
+    def test_forbidden_keyword_not_recoverable(self):
+        with self.assertRaises(UnsafeCypherError) as ctx:
+            validate_read_only_cypher("MATCH (p:Person) DELETE p")
+        self.assertEqual(ctx.exception.reason_code, REASON_FORBIDDEN_KEYWORD)
+        self.assertFalse(ctx.exception.recoverable)
+
+    def test_disallowed_call_not_recoverable(self):
+        with self.assertRaises(UnsafeCypherError) as ctx:
+            validate_read_only_cypher("CALL db.labels() YIELD label RETURN label")
+        self.assertEqual(ctx.exception.reason_code, REASON_DISALLOWED_CALL)
+        self.assertFalse(ctx.exception.recoverable)
+
+    def test_multi_statement_not_recoverable(self):
+        with self.assertRaises(UnsafeCypherError) as ctx:
+            validate_read_only_cypher(
+                "MATCH (p:Person) RETURN p LIMIT 5; MATCH (n) RETURN n")
+        self.assertEqual(ctx.exception.reason_code, REASON_MULTI_STATEMENT)
+        self.assertFalse(ctx.exception.recoverable)
+
+    def test_empty_query_not_recoverable(self):
+        with self.assertRaises(UnsafeCypherError) as ctx:
+            validate_read_only_cypher("   ")
+        self.assertEqual(ctx.exception.reason_code, REASON_EMPTY_QUERY)
+        self.assertFalse(ctx.exception.recoverable)
+
+    def test_non_string_query_not_recoverable(self):
+        with self.assertRaises(UnsafeCypherError) as ctx:
+            validate_read_only_cypher(None)  # type: ignore[arg-type]
+        self.assertEqual(ctx.exception.reason_code, REASON_NOT_A_STRING)
+        self.assertFalse(ctx.exception.recoverable)
+
+    def test_recoverable_set_is_exactly_shape_errors(self):
+        self.assertEqual(
+            RECOVERABLE_REASON_CODES,
+            frozenset({REASON_MALFORMED_LABEL_PREDICATE, REASON_MISSING_RETURN}),
+        )
+
+
+class TestBoundedReadRetry(unittest.TestCase):
+    """graph-ranking-reliability work order §3 P1 / §5.2 items 4-5: read-only
+    graph queries retry a BOUNDED number of times on transport-transient
+    failures, then give up; non-transient exceptions are never retried."""
+
+    def test_retries_transient_then_succeeds(self):
+        from neo4j.exceptions import ServiceUnavailable
+
+        inner = MagicMock()
+        inner.query.side_effect = [
+            ServiceUnavailable("defunct connection"),
+            ServiceUnavailable("defunct connection"),
+            [{"n": 1}],
+        ]
+        proxy = SafeNeo4jGraph(inner)
+        with unittest.mock.patch("tools.cypher_safety.time.sleep"):
+            rows = proxy.query("MATCH (n:Person) RETURN n LIMIT 5")
+        self.assertEqual(rows, [{"n": 1}])
+        self.assertEqual(inner.query.call_count, 3)
+
+    def test_gives_up_after_max_attempts(self):
+        from neo4j.exceptions import ServiceUnavailable
+        from tools.cypher_safety import READ_RETRY_MAX_ATTEMPTS
+
+        inner = MagicMock()
+        inner.query.side_effect = ServiceUnavailable("still down")
+        proxy = SafeNeo4jGraph(inner)
+        with unittest.mock.patch("tools.cypher_safety.time.sleep"):
+            with self.assertRaises(ServiceUnavailable):
+                proxy.query("MATCH (n:Person) RETURN n LIMIT 5")
+        self.assertEqual(inner.query.call_count, READ_RETRY_MAX_ATTEMPTS)
+
+    def test_non_transient_exception_never_retried(self):
+        inner = MagicMock()
+        inner.query.side_effect = RuntimeError("unrelated bug")
+        proxy = SafeNeo4jGraph(inner)
+        with self.assertRaises(RuntimeError):
+            proxy.query("MATCH (n:Person) RETURN n LIMIT 5")
+        inner.query.assert_called_once()
+
+    def test_unsafe_query_never_reaches_retry_layer(self):
+        # A write/shape rejection must fail on the FIRST validation pass —
+        # never retried, never reaching `inner.query` at all.
+        inner = MagicMock()
+        proxy = SafeNeo4jGraph(inner)
+        with self.assertRaises(UnsafeCypherError):
+            proxy.query("MATCH (p:Person) DELETE p")
+        inner.query.assert_not_called()
 
 
 if __name__ == "__main__":

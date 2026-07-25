@@ -29,6 +29,7 @@ from tools.external_authority import (
     CAPABILITY_LINK_ONLY,
     sources_for_node_type,
 )
+from tools.graph_intent import detect_role_cue, is_graph_aggregation_intent
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,58 @@ def authority_intent(question: str, language: str = "ko") -> dict:
 
 
 # ──────────────────────────────────────────────
+# Ranking/aggregation authority gate (graph-ranking-reliability work order
+# §3 P0-D)
+#
+# `_PERSON_CUES` includes generic biography triggers like "who is" / "tell me
+# about" — necessary for real biography questions, but the reference bug
+# question ("Who is the most mentioned king in Sihwa ch'ongnim?") ALSO
+# contains "who is" while asking a pure corpus-ranking question. Routing that
+# through `authority_intent()` fanned out to external lookups for every
+# candidate Person the vector retriever happened to surface (10 of 14, in the
+# observed incident) — none of them relevant to the ranking answer itself.
+#
+# For a detected ranking/aggregation question, `_PERSON_CUES` is NOT
+# consulted at all. Only an unambiguous request for outside information (the
+# cues below, or an explicit comparison request) opts in, and even then
+# enrichment is scoped to the ranking winner(s) only — never the full
+# candidate cohort — via `_extract_ranking_winner_ids`.
+# ──────────────────────────────────────────────
+_RANKING_EXTERNAL_CUES = [
+    # Korean
+    "위키데이터", "위키", "백과사전", "외부 출처", "외부 자료",
+    # English
+    "wikidata", "wikipedia", "encyclopedia", "external source", "authority record",
+    "authority database",
+    # Chinese
+    "维基", "維基", "百科",
+]
+
+
+def _ranking_authority_intent(question: str) -> dict:
+    """Authority-enrichment gate used ONLY for a detected ranking/aggregation
+    question. Deliberately ignores `_PERSON_CUES`/`_PLACE_CUES` — see module
+    note above. Ranking is currently Person-only (`tools.graph_intent`'s role
+    registry has no Place roles yet), so Place enrichment always stays off
+    here regardless of cues."""
+    compare = _matches(question, _COMPARE_CUES)
+    person = compare or _matches(question, _RANKING_EXTERNAL_CUES)
+    return {"Person": person, "Place": False, "compare": compare}
+
+
+def _extract_ranking_winner_ids(graph_ev: Evidence) -> set:
+    """Pull the winner Person id(s) out of a `retrieve_role_ranking_evidence`
+    result's `ranking` claim. Empty set when there is no ranking claim (e.g.
+    the ranking query returned no_results / was unavailable) — callers must
+    treat that as "no eligible authority candidates", never as "enrich
+    everyone"."""
+    for claim in graph_ev.claims or []:
+        if isinstance(claim, dict) and claim.get("type") == "ranking":
+            return set(claim.get("winner_person_ids") or [])
+    return set()
+
+
+# ──────────────────────────────────────────────
 # Lazy default dependencies (kept out of the import path for tests)
 # ──────────────────────────────────────────────
 def _default_graph_retriever(question: str, language: str,
@@ -165,6 +218,12 @@ def _default_vector_retriever(question: str, language: str,
     from tools.vector import retrieve_sihwa_evidence
 
     return retrieve_sihwa_evidence(question, language)
+
+
+def _default_role_ranking_retriever(role: str) -> Evidence:
+    from tools.cypher import retrieve_role_ranking_evidence
+
+    return retrieve_role_ranking_evidence(role)
 
 
 # ──────────────────────────────────────────────
@@ -316,6 +375,7 @@ def gather_graphrag_evidence(
     place_cap: Optional[int] = None,
     sources_per_entity: Optional[int] = None,
     want_authority: Optional[bool] = None,
+    role_ranking_retriever: Optional[Callable] = None,
 ) -> dict:
     """Collect graph + vector + (optional) external authority evidence.
 
@@ -332,6 +392,8 @@ def gather_graphrag_evidence(
           "coverage": {"Person": {eligible_entity_count, enriched_entity_count,
                                   skipped_due_to_cap_count}, "Place": {...}},
           "authority_attempted": bool,
+          "ranking_role": Optional[str],  # e.g. "king" when routed through
+                                          # the deterministic ranking template
         }
 
     Sequence: graph → vector → collect entities → de-duplicate → registry-driven
@@ -340,10 +402,24 @@ def gather_graphrag_evidence(
     graph retrieval for reference resolution only. Retrieval failures become
     user-safe statuses; enrichment failures never abort the response. External
     fetches stay sequential (bounded, provider-friendly — no unbounded
-    concurrency)."""
+    concurrency).
+
+    Ranking/aggregation routing (graph-ranking-reliability work order §3
+    P0-B/P0-D): when `question` is a detected corpus-wide rank/count
+    question naming a registered role (currently just "king" — see
+    `tools.graph_intent.ROLE_TYPE_CUES`), `graph_retriever` is bypassed
+    entirely in favor of `role_ranking_retriever` (default:
+    `retrieve_role_ranking_evidence`), a parameterized template — never
+    free-form LLM Cypher generation. The generic `_PERSON_CUES`/`_PLACE_CUES`
+    authority gate is also bypassed for this path (see
+    `_ranking_authority_intent`): a bare "who is"/"tell me about" no longer
+    triggers external lookups, and when an explicit external-source request
+    IS present, enrichment is scoped to the ranking winner(s) only — never
+    the full candidate cohort."""
     graph_retriever = graph_retriever or _default_graph_retriever
     vector_retriever = vector_retriever or _default_vector_retriever
     authority_fetcher = authority_fetcher or _default_authority_fetcher
+    role_ranking_retriever = role_ranking_retriever or _default_role_ranking_retriever
     if person_cap is None:
         person_cap = _config_int("AUTHORITY_PERSON_CAP", DEFAULT_PERSON_AUTHORITY_CAP)
     if place_cap is None:
@@ -352,8 +428,17 @@ def gather_graphrag_evidence(
         sources_per_entity = _config_int(
             "AUTHORITY_SOURCES_PER_ENTITY", DEFAULT_FETCHABLE_SOURCES_PER_ENTITY)
 
-    graph_ev, graph_status = _safe_retrieve(
-        graph_retriever, question, language, history_text, "graph")
+    ranking_role = detect_role_cue(question) if is_graph_aggregation_intent(question) else None
+
+    if ranking_role:
+        def _ranking_graph_retriever(q, lang, hist=None, _role=ranking_role):
+            return role_ranking_retriever(_role)
+
+        graph_ev, graph_status = _safe_retrieve(
+            _ranking_graph_retriever, question, language, history_text, "graph")
+    else:
+        graph_ev, graph_status = _safe_retrieve(
+            graph_retriever, question, language, history_text, "graph")
     vector_ev, vector_status = _safe_retrieve(
         vector_retriever, question, language, history_text, "vector")
 
@@ -361,7 +446,21 @@ def gather_graphrag_evidence(
     persons = [e for e in entities if (e.node_type or "Person") == "Person"]
     places = [e for e in entities if e.node_type == "Place"]
 
-    intent = authority_intent(question, language)
+    if ranking_role:
+        intent = _ranking_authority_intent(question)
+        # Candidate pool for enrichment is the graph ranking winner(s) ONLY
+        # (P0-D item 5) — never the full `persons` cohort, and never a
+        # person the vector retriever happened to surface. An empty winner
+        # set (ranking failed / no_results) means zero eligible candidates,
+        # which forces zero fetches below regardless of `intent`.
+        winner_ids = _extract_ranking_winner_ids(graph_ev)
+        persons_for_authority = [e for e in persons if e.node_id in winner_ids]
+        places_for_authority: list = []
+    else:
+        intent = authority_intent(question, language)
+        persons_for_authority = persons
+        places_for_authority = places
+
     if want_authority is True:
         intent = {"Person": True, "Place": True, "compare": intent["compare"]}
     elif want_authority is False:
@@ -377,8 +476,10 @@ def gather_graphrag_evidence(
     attempted = False
     coverage: dict = {}
 
-    for group, cap in ((persons, person_cap), (places, place_cap)):
-        node_type = "Person" if group is persons else "Place"
+    for node_type, group, cap in (
+        ("Person", persons_for_authority, person_cap),
+        ("Place", places_for_authority, place_cap),
+    ):
         if not intent.get(node_type):
             continue
         eligible = enriched = skipped = 0
@@ -425,6 +526,7 @@ def gather_graphrag_evidence(
         "statuses": {"graph": graph_status, "vector": vector_status},
         "coverage": coverage,
         "authority_attempted": attempted,
+        "ranking_role": ranking_role,
     }
 
 

@@ -362,6 +362,16 @@ the only step that writes user-facing prose. Obey these rules strictly:
    only for that place. Never cite a Person authority record in a Place answer
    or a Place record in a Person answer, even if names or numbers look similar.
 
+7d. "poetrytalks wikidata" IS AN INTERNAL LINK GROUP, NOT EXTERNAL WIKIDATA.
+   Despite the name, every `https://poetrytalks.org/<ID>` link (including
+   Topic ids like `T1052`) points at this project's own internal wiki page
+   for that graph node — it is NOT a real Wikidata.org record, regardless of
+   the node's class. Never write "according to Wikidata" or "Wikidata says"
+   about a poetrytalks.org link. Genuine external Wikidata facts exist only
+   in a FETCHED external-authority block (status=ok) whose source is
+   literally "wikidata" — those are the only records "Wikidata says" may
+   describe.
+
 8. Keep verbatim source text fields (textChi/textKor/textEng/descEng) exactly as
    given — never translate, summarize, or alter them. Your commentary is in the
    locked response language; quoted source text keeps its original characters.
@@ -392,6 +402,30 @@ the only step that writes user-facing prose. Obey these rules strictly:
    the user explicitly asked for an exhaustive comparison, state that the result
    is a capped subset and offer a narrowed follow-up.
 
+12. ROMANIZATION OF KOREAN-RELATED NAMES: when an evidence line shows an
+   `MR=` field, that is the ONLY authoritative Latin-script romanization for
+   that entity (McCune-Reischauer). Use it whenever the response language
+   needs a romanized form. Never re-romanize a Korean name yourself, never
+   produce Revised-Romanization-style spelling, and never present the
+   English name field as if it were "the" romanization when an `MR=` value
+   is present — the two can differ and the MR form always takes priority. If
+   no `MR=` field is shown, you may use the English name field as stored,
+   but do not fabricate a romanization to fill the gap.
+
+13. RANKING/AGGREGATION QUESTIONS ("most mentioned", "top N", "가장 많이
+   언급된", ...): the answer, including the winning entity and its count,
+   comes ONLY from Graph Evidence rows that carry a `mention_count` (or
+   equivalent aggregate) field — never from Vector Evidence excerpts, and
+   never estimated by counting how many times a name happens to appear in
+   the evidence text. If Graph Evidence for a ranking question shows no
+   qualifying rows and the Retrieval Status says `no_results`, state plainly
+   that the graph search found no matching results — do NOT phrase this as
+   a negative fact about the world ("there is no such king" / "no king is
+   mentioned"); the correct meaning is "the search did not find a match",
+   not "the answer is none". If the Retrieval Status says `invalid_query` or
+   `temporarily_unavailable`, relay that per rule 10 and do not attempt to
+   answer the ranking question from any other evidence in the bundle.
+
 If no evidence supports the question, say so plainly in the locked language and
 do not invent an answer.
 """
@@ -419,6 +453,8 @@ def _entity_line(e: dict) -> str:
     if node_id:
         url = poetrytalks_url(node_id)
         bits.append(f"id=[{node_id}]({url})" if url else f"id={node_id}")
+    if e.get("name_mr"):
+        bits.append(f"MR={e['name_mr']}")
     for key, value in sorted((e.get("authority_ids") or {}).items()):
         if value:
             bits.append(f"{key}={value}")

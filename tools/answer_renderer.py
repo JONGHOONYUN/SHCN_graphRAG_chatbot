@@ -100,7 +100,7 @@ def _entity_names(entity: Any) -> list:
     else:
         get = lambda k: getattr(entity, k, None)  # noqa: E731
     names = []
-    for key in ("name_kor", "name_chi", "name_eng"):
+    for key in ("name_kor", "name_chi", "name_eng", "name_mr"):
         value = get(key)
         if isinstance(value, str) and len(value.strip()) >= 2:
             names.append(value.strip())

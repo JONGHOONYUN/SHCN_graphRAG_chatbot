@@ -63,8 +63,11 @@ instructions = (
 
     # Language
     "사용자가 쓰는 언어로 답변하세요. "
-    "인물명은 데이터베이스에 저장된 nameEng, nameMR, namePY, nameRR를 그대로 사용하고 "
-    "다시 로마자화하지 마세요. "
+    "한국 관련 인물·지명의 로마자 표기는 데이터베이스에 저장된 nameMR(매큔-라이샤워 표기) "
+    "만 사용하세요. nameMR이 없으면 로마자 표기를 생략하고 원어(nameKor/nameChi)를 "
+    "그대로 쓰세요. nameRR(정부 표준 로마자 표기)은 이 프로젝트의 표시용 필드가 아니므로 "
+    "절대 인용하거나 새로 만들지 마세요. nameEng을 로마자 표기의 대체물로 조용히 쓰지 "
+    "마세요 — nameEng은 영문 명칭이지 로마자 표기 필드가 아닙니다. "
     "일본어 등 한자 사용 언어 사용자에게는 nameChi를 우선 사용하세요. "
     "프랑스어 사용자에게 Topic은 nameFra가 있으면 우선 사용하세요."
 
@@ -210,12 +213,12 @@ RETURN
         source_work_chi: [(w:Work)-[:HAS_PART]->(node) | w.nameChi][0],
         source_work_id: [(w:Work)-[:HAS_PART]->(node) | w.ID][0],
         source_work_desc: [(w:Work)-[:HAS_PART]->(node) | w.descEng][0],
+        source_work_mr: [(w:Work)-[:HAS_PART]->(node) | w.nameMR][0],
         creator: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameKor][0],
         creator_eng: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameEng][0],
         creator_chi: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameChi][0],
         creator_mr: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameMR][0],
         creator_py: [(node)-[:HAS_CREATOR]->(p:Person) | p.namePY][0],
-        creator_rr: [(node)-[:HAS_CREATOR]->(p:Person) | p.nameRR][0],
         creator_id: [(node)-[:HAS_CREATOR]->(p:Person) | p.ID][0],
         creator_year_birth: [(node)-[:HAS_CREATOR]->(p:Person) | p.yearBirth][0],
         creator_year_death: [(node)-[:HAS_CREATOR]->(p:Person) | p.yearDeath][0],
@@ -241,7 +244,7 @@ RETURN
             {{nameKor: cl.nameKor, nameEng: cl.nameEng}}][0],
         mentioned_persons: [(node)-[:HAS_SUBJECT_PERSON]->(p:Person) |
             {{nameKor: p.nameKor, nameEng: p.nameEng, nameChi: p.nameChi,
-              nameMR: p.nameMR, namePY: p.namePY, nameRR: p.nameRR,
+              nameMR: p.nameMR, namePY: p.namePY,
               id: p.ID,
               wikidata: p.idWikidata, aks_digerati: p.idAKSdigerati,
               aks_ency: p.idAKSency, aks_sillok: p.idAKSsillok,
@@ -253,7 +256,7 @@ RETURN
               yale_lux: p.idYaleLux}}][0..5],
         audiences: [(node)-[:HAS_PART]->(pm:Poem)-[:HAS_AUDIENCE]->(a:Person) |
             {{nameKor: a.nameKor, nameEng: a.nameEng, nameChi: a.nameChi,
-              id: a.ID,
+              nameMR: a.nameMR, id: a.ID,
               wikidata: a.idWikidata, aks_digerati: a.idAKSdigerati,
               aks_ency: a.idAKSency, aks_sillok: a.idAKSsillok,
               aks_kdp: a.idAKSkdp, cbdb: a.idCBDB,
@@ -264,19 +267,21 @@ RETURN
               yale_lux: a.idYaleLux}}][0..3],
         topics: [(node)-[:HAS_SUBJECT_TOPIC]->(t:Topic) |
             {{id: t.ID, nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi,
-              nameFra: t.nameFra, descEng: t.descEng}}][0..5],
+              nameMR: t.nameMR, nameFra: t.nameFra, descEng: t.descEng}}][0..5],
         forms_types: [(node)-[:HAS_TYPE]->(t:Topic) |
-            {{id: t.ID, nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi}}][0..3],
+            {{id: t.ID, nameKor: t.nameKor, nameEng: t.nameEng, nameChi: t.nameChi,
+              nameMR: t.nameMR}}][0..3],
         places: [(node)-[:HAS_SUBJECT_PLACE]->(pl:Place) |
             {{nameKor: pl.nameKor, nameEng: pl.nameEng, nameChi: pl.nameChi,
+              nameMR: pl.nameMR,
               id: pl.ID, gis: pl.gis, image: pl.image,
               aks_digerati: pl.idAKSdigerati, aks_map: pl.idAKSmap,
               aks_ency: pl.idAKSency}}][0..3],
         critical_terms: [(node)-[:HAS_SUBJECT_CRITICAL_TERM]->(ct:CriticalTerm) |
             {{id: ct.ID, nameKor: ct.nameKor, nameEng: ct.nameEng, nameChi: ct.nameChi,
-              descEng: ct.descEng}}][0..5],
+              nameMR: ct.nameMR, descEng: ct.descEng}}][0..5],
         era: [(node)-[:HAS_SUBJECT_ERA]->(e:Era) |
-            {{id: e.ID, nameKor: e.nameKor, nameEng: e.nameEng,
+            {{id: e.ID, nameKor: e.nameKor, nameEng: e.nameEng, nameMR: e.nameMR,
               yearStart: e.yearStart, yearEnd: e.yearEnd}}][0],
         contained_poems: [(node)-[:HAS_PART]->(pm:Poem) |
             {{id: pm.ID, position: pm.position,

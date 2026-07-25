@@ -27,6 +27,21 @@ Covers four work orders, applied in sequence:
    "poetrytalks wikidata" citation group is narrowed to ids the finished
    answer actually references; body auto-linking now covers Work/Entry/Poem/
    Critique/Topic/Era/CriticalTerm, with word-boundary-safe English matching.
+7. **Property-name casing correction** (live smoke test finding, no separate
+   work order file) — the internal node identifier is `ID` (two uppercase
+   letters), not `id`; every Cypher literal/prompt/rule reading a node's own
+   id was fixed. See "Live smoke test — CORRECTED finding" below.
+8. **Graph ranking/aggregation reliability**
+   (`CLAUDE_CODE_GRAPH_RANKING_RELIABILITY_FIX.md`) — deterministic
+   parameterized template for "most mentioned X" questions (bypasses
+   free-form Cypher generation entirely for this question class); pre-flight
+   detection + one bounded recovery retry for the malformed backtick
+   multi-label Cypher shape; ranking-aware authority routing so a bare
+   ranking question makes zero external calls and an explicit follow-up
+   enriches only the winner; `no_results`/`invalid_query`/
+   `temporarily_unavailable` kept distinct for ranking failures;
+   McCune-Reischauer as the sole romanization field end-to-end; bounded
+   read-only retry for transient Bolt failures. See "Section 8" below.
 
 ## Section 6 — All-node source link coverage (work order 6)
 
@@ -628,3 +643,289 @@ Work order: `CLAUDE_CODE_SECURITY_RELIABILITY_HARDENING.md`.
 Baseline: 79 tests. After hardening: 175 tests, all passing on
 `python -m unittest discover -s tests`. No live Neo4j / Gemini / network
 access is required to run the suite.
+
+## Section 8 — Graph ranking/aggregation reliability (work order 8)
+
+(`CLAUDE_CODE_GRAPH_RANKING_RELIABILITY_FIX.md`) — resolves the "remaining
+known limitation" flagged at the end of the ID-casing correction above: the
+malformed backtick multi-label Cypher (`` text:`Entry OR text`:Poem ``) that
+Gemini occasionally produced for ranking/aggregation questions. That bug is
+now structurally unreachable for the question class it affected — ranking
+questions never go through free-form Cypher generation at all.
+
+### P0-A — Malformed-label pre-flight detection + one bounded recovery retry
+
+`tools/cypher_safety.py`:
+- New `reason_code` on every `UnsafeCypherError`: `malformed_label_predicate`,
+  `missing_return`, `forbidden_keyword`, `disallowed_call`, `multi_statement`,
+  `empty_query`, `not_a_string`. `RECOVERABLE_REASON_CODES` = the first two
+  only — a plausible LLM query-*shape* slip. Everything else (write/schema/
+  CALL/multi-statement) is never retried.
+- `_detect_malformed_label_predicate()` runs on the RAW query, before string/
+  comment stripping (so it still fires even when the malformed backtick
+  swallows the following `RETURN`). Signature is narrow by design:
+  `` `[^`]*\bOR\b[^`]*`\s*: `` — a backtick-quoted identifier containing "OR"
+  immediately followed by another `:label`. This is deliberately narrower
+  than "any backtick containing OR" — the first, broader regex attempt broke
+  the pre-existing `test_backtick_label_cannot_smuggle_keyword` test (a
+  harmless `` n:`OR DELETE` `` single-label case that must keep passing), so
+  it was tightened to the exact chained-label signature.
+
+`tools/cypher.py`'s `retrieve_graph_evidence()`: on a recoverable
+`UnsafeCypherError` (or `CypherSyntaxError`), regenerates the Cypher exactly
+ONCE with a generalized hint (`_SHAPE_RETRY_HINT`) that never re-embeds the
+original query text. A second failure of any kind ends with a user-safe
+status (`invalid_query`), never a third attempt.
+
+### P0-B — Deterministic ranking template (new `tools/graph_intent.py`)
+
+Corpus-wide "most mentioned X" questions are answered by a parameterized
+Cypher template run directly through `SafeNeo4jGraph`, never by free-form LLM
+Cypher generation, so the malformed-label failure mode is structurally
+impossible for this question class.
+
+- `is_graph_aggregation_intent(question)` — multilingual cue detector
+  (English/Korean/Chinese: "most mentioned", "가장 많이 언급", "最多", ...).
+- `ROLE_TYPE_CUES` — registry mapping a role key (currently only `"king"`) to
+  its exact `nameKor`/`nameEng`/`nameChi` values. **Live-verified, not
+  assumed**: a CONTAINS-based probe (`nameKor CONTAINS '왕'` etc., matching
+  the ORIGINAL failing query's own predicate style) returned T1052 (king, 20
+  Person) but ALSO T1069 (queen consort, 5), T1070 (queen, 1), T183 ("poems
+  by kings and queens"), and T527 ("kingfisher" — via the English substring
+  "king"). Switching to EXACT equality (`nameKor = '왕' OR nameEng = 'king'
+  OR nameChi = '王'`) returns only T1052. The template therefore matches by
+  exact equality, never CONTAINS — documented in code comments at both the
+  registry and the query builder so this doesn't regress.
+- `ROLE_RELATIONSHIP = "HAS_TYPE"` — also live-verified: the original failing
+  query assumed `HAS_OFFICE`, but a direct query showed `HAS_OFFICE` has NO
+  king/왕/王-matching Topic in this dataset at all; `HAS_TYPE → Topic(T1052)`
+  is the real relationship (20 Person nodes connected).
+- `build_role_ranking_query(role, limit)` — pure function, returns
+  `(cypher, params)`. Mentions are counted as `count(DISTINCT e)` over
+  `(Entry)-[:HAS_SUBJECT_PERSON]->(Person)` — see canonical-definition note
+  below. Standard aliases (`person_id`, `person_name_mr`, `wikidata_id`, ...)
+  match the existing row-parsing convention in `tools/evidence.py` so
+  `graph_rows_to_evidence()` needs no changes to build Entities from the
+  ranking rows. `limit` is embedded as a literal int (not `$limit`) —
+  `SafeNeo4jGraph._ensure_limit`'s trailing-`LIMIT`-detector only recognizes
+  `LIMIT <digits>`, and a `LIMIT $limit` placeholder would be invisible to it
+  and produce an invalid double-`LIMIT` query (caught during implementation
+  by a live run that raised `Neo.ClientError.Statement.SyntaxError` on
+  exactly this).
+- `rank_rows_by_mention_count(rows)` — winners are every row tied for the
+  max `mention_count` (handles ties; the live data has none for "king", but
+  the code path is exercised by unit tests with a synthetic tie).
+- `tools/cypher.py`'s `retrieve_role_ranking_evidence(role)` is the thin,
+  side-effecting wrapper: resolves the query, runs it through
+  `_safe_graph.query()`, classifies the outcome (`no_results` / `invalid_query`
+  / `temporarily_unavailable`), and — on success — records a `{"type":
+  "ranking", "winner_person_ids": [...], "winner_count": N}` claim that
+  `tools/orchestrator.py` uses to scope authority enrichment (P0-D).
+
+**Canonical "most mentioned" definition — confirmed live, default chosen,
+flagged for maintainer confirmation per the work order's own instructions**:
+compared Entry-only `HAS_SUBJECT_PERSON` counts against Entry+Poem+Critique
+combined counts for every king-cohort Person:
+
+```text
+Entry-only:              선조(P519)=10, 성종(P513)=6,  광해군(P960)=6
+Entry+Poem+Critique:     선조(P519)=16, 성종(P513)=9,  광해군(P960)=8
+```
+
+Both definitions agree on the #1 result (선조, no tie either way), so the
+choice does not change the "king" answer, but the two counts themselves
+differ and only one can be "the" displayed number. **Entry-only is used as
+the implemented default** (`tools.graph_intent.MENTION_COUNT_UNIT =
+"entry"`) because an Entry and the Poems/Critiques nested under it via
+`HAS_PART` can each separately carry a `HAS_SUBJECT_PERSON` edge to the same
+Person — summing all three node types risks double-counting one narrative
+mention. Per the work order's explicit instruction ("합의된 기준이 없으면
+기본값으로 'Entry 단위의 HAS_SUBJECT_PERSON 관계 수'를 사용하되 ... 사용자에게
+확인이 필요한 결정으로 기록한다"), **this is a default, not a confirmed
+product decision** — a maintainer may prefer the combined count as "true"
+mention volume; switching it is a one-line change to `build_role_ranking_query`.
+
+### P0-C — Status normalization (mostly pre-existing; ranking-specific gaps closed)
+
+The `no_results` / `invalid_query` / `temporarily_unavailable` three-way
+status contract, and the localized `RETRIEVAL_STATUS_MESSAGES` that render
+them distinctly, already existed from the context/authority-cap work order
+(Section on "User-safe retrieval statuses" above) and needed no structural
+change — `retrieve_role_ranking_evidence()` was written to emit the same
+three outcomes the existing `_normalize_evidence_status` already
+distinguishes correctly. What this work order added to `tools/synthesis.py`:
+- **Rule 13** (`SYNTHESIS_SYSTEM_RULES`): for a ranking/aggregation question,
+  the answer must come only from Graph Evidence rows carrying a
+  `mention_count` field — never estimated from Vector Evidence text, and a
+  `no_results` outcome must be phrased as "the search found no match", never
+  as a negative world-fact ("there is no such king").
+- **Rule 7d**: `poetrytalks wikidata` links (including Topic ids like
+  `T1052`) are this project's own internal wiki pages, never real
+  Wikidata.org records — "according to Wikidata" may only describe a
+  FETCHED external-authority block whose source is literally `"wikidata"`.
+
+### P0-D — Ranking-aware authority routing (`tools/orchestrator.py`)
+
+`_PERSON_CUES` includes "who is" / "tell me about" — necessary for real
+biography questions, but the reference bug question itself ("Who is the
+most mentioned king...?") also contains "who is", which is exactly how the
+original incident enriched 10 of 14 irrelevant vector-surfaced candidates.
+
+- `gather_graphrag_evidence()` now checks
+  `is_graph_aggregation_intent(question)` + `detect_role_cue(question)`
+  BEFORE any authority-cue routing. When both match a registered role, the
+  free-form `graph_retriever` is bypassed entirely in favor of
+  `role_ranking_retriever` (default `retrieve_role_ranking_evidence`).
+- A separate, narrower gate (`_ranking_authority_intent`) replaces
+  `authority_intent()` for this path: `_PERSON_CUES`/`_PLACE_CUES` are not
+  consulted at all; only an unambiguous external-source cue (`wikidata`,
+  `위키데이터`, `encyclopedia`, or a `_COMPARE_CUES` match) opts in.
+- When it does opt in, the candidate pool is `_extract_ranking_winner_ids()`
+  — the winner id(s) from the ranking template's own claim — intersected
+  with the collected Person entities, NEVER the full `persons` list (which
+  still includes every vector-surfaced candidate for body-linking purposes).
+  A failed/empty ranking yields an empty winner set, which forces 0 fetches
+  regardless of cues.
+- New return key `"ranking_role"` (e.g. `"king"` or `None`) for callers/tests.
+
+**Live-verified end-to-end** (real Neo4j, real vector index, real external
+HTTP — no LLM call, no chat-history write):
+
+```text
+Q: "Who is the most mentioned king in Sihwa ch'ongnim?"
+   ranking_role=king  authority_attempted=False
+   graph status=ok  vector status=ok
+   winner=P519 (선조)  mention_count=10  (14 candidates total, matching the
+   incident report's own "14 후보" figure)
+
+Q: "시화총림에서 가장 많이 언급된 왕은 누구인가요?" (Korean equivalent)
+   ranking_role=king  authority_attempted=False   (identical routing)
+
+Q: "Who is the most mentioned king, and what does Wikidata say about
+    that person?"
+   ranking_role=king  authority_attempted=True
+   external claims: [(P519, wikidata, ok), (P519, loc, ok),
+                      (P519, aks_ency, link_only)]
+   — ALL three claims are for P519 only; P513 (runner-up) and every
+   vector-surfaced candidate received ZERO fetches.
+```
+
+Additionally covered by mocks (`tests/test_ranking_orchestration.py`):
+"Compare external sources for the most mentioned king" (winner-only,
+compare-cap policy applies), a tied-winner scenario (both tied Persons
+become eligible), `want_authority=False` overriding an explicit cue, and a
+failed-ranking scenario keeping fetches at 0 even with an explicit cue.
+
+### P0-E — McCune-Reischauer (MR) romanization consistency
+
+`nameMR` is now the single authoritative Latin-script field for Korean-
+related entities end-to-end: `tools/vector.py`'s retrieval-query projection
+(added `nameMR` to places/topics/forms_types/critical_terms/era/work,
+removed the response-facing `nameRR`/`creator_rr` projections),
+`tools/evidence.py` (`Entity.name_mr` / `NodeReference.name_mr` /
+`Provenance.work_name_mr`, threaded through `make_node_reference`,
+`merge_node_references`, `merge_entities`, `_person_from_flat`,
+`_place_from_flat`, `_row_entity`, `document_to_parts`), `tools/cypher.py`'s
+prompt (corrected the false "nameRR does not exist" claim, added
+`person_name_mr`/`place_name_mr` standardized aliases, rewrote the Language-
+of-Response section so `nameEng` is never silently used as if it were "the"
+romanization when `nameMR` is populated), `tools/synthesis.py` (`_entity_line`
+renders an explicit `MR=` field; new rule 12 tells the LLM to prefer it over
+re-romanizing or reading `nameEng` as a romanization), and
+`tools/answer_renderer.py` (`_entity_names` includes `name_mr` as a body-link
+candidate, so an MR-only mention in the LLM's prose still gets linked).
+`nameRR` is read into NOTHING anywhere in this path — it stays in each
+`reserved` field-exclusion set purely so it never leaks into `authority_ids`.
+
+Live-verified per node class (`total` / `with nameMR` / `with nameRR`):
+Person 1255/214/35, Place 545/23/16, Work 116/68/1, Era 44/10/1,
+Topic 1060/505/1. Person example showing the two fields genuinely differ
+(a real risk if the wrong one were ever read): 이규보 `nameMR='Yi Kyubo'` vs
+`nameRR='Yi Gyubo'`. 선조 (this work order's ranking winner) has no stored
+`nameMR` (`nameEng='King Sŏnjo'` only) — confirms the "no MR → keep the
+stored English name, never fabricate a romanization" fallback path is
+exercised by the live answer, not just a hypothetical.
+
+### P1 — Bounded read-only retry for transient Bolt failures
+
+`tools/cypher_safety.py`: `SafeNeo4jGraph.query()` and
+`_SafeNeo4jGraphSubclass.query()` now wrap their inner `.query()` call in
+`_read_with_retry()` — up to `READ_RETRY_MAX_ATTEMPTS` (default 3, env-
+overridable via `GRAPH_READ_RETRY_MAX_ATTEMPTS`) attempts with doubling
+backoff from `READ_RETRY_BACKOFF_SECONDS` (default 0.5s, env-overridable),
+retrying ONLY `ServiceUnavailable` / `SessionExpired` / `TransientError` /
+`OSError` (the exact exception shapes behind the observed "Failed to read
+from defunct connection ... OSError('No data')" log). Any other exception
+(including `UnsafeCypherError`, which is raised and re-raised BEFORE the
+retry wrapper is ever entered) propagates on the first attempt — retrying a
+safety rejection or a logic error would just repeat it. Because this lives
+inside `SafeNeo4jGraph`/`_SafeNeo4jGraphSubclass` specifically, it applies
+uniformly to both the free-form LLM Cypher path and the new ranking
+template, and never to `Neo4jChatMessageHistory` (writes) or external-
+authority HTTP fetches (neither goes through this wrapper) — satisfying the
+work order's "never apply this to write/history/authority paths" constraint
+by construction rather than by a separate check. `graph.py` gained a
+documenting comment only; no `driver_config` override was added; the
+existing `neo4j`/`langchain_neo4j` version pair was not verified to need one
+beyond the driver's own defaults, and the work order explicitly disallows
+guessing unsupported connection arguments.
+
+### Files changed / added (work order 8)
+
+- New: `tools/graph_intent.py`, `tests/test_graph_intent.py`,
+  `tests/test_ranking_orchestration.py`, `tests/test_mr_romanization.py`.
+- Modified: `tools/cypher_safety.py` (reason codes, malformed-label
+  detection, bounded read retry), `tools/cypher.py` (recovery retry wiring,
+  ranking template wrapper, MR prompt fixes), `tools/orchestrator.py`
+  (ranking-aware routing), `tools/synthesis.py` (rules 7d/12/13), `graph.py`
+  (documenting comment only), `tools/vector.py` (MR/RR projection fixes),
+  `tools/evidence.py` (name_mr plumbing), `tools/answer_renderer.py`
+  (name_mr body-link candidate), `tests/test_cypher_safety.py` (29 new
+  cases: malformed-label, reason-code classification, bounded retry).
+
+### Test totals (work order 8)
+
+315 → **390 tests**, all passing on `python -m unittest discover -s tests`.
+No live Neo4j / Gemini / network access is required to run the suite —
+every ranking/orchestrator test injects its retrievers and fetchers.
+
+### Live smoke test summary (read-only for Neo4j; no chat-history write; no LLM call)
+
+All items in work order §5.6 were run against the live database EXCEPT a
+full `agent.synthesize_answer()` pass, which was deliberately skipped: that
+path writes to `Neo4jChatMessageHistory` (a real write against the live
+Neo4j instance) and calls the live Gemini API, both outside the "쓰기 없는"
+(no-write) scope §5.6 states for ALL of its verification items, including
+item 4. Everything read-only-verifiable was run instead, directly against
+`tools.orchestrator.gather_graphrag_evidence()` with its REAL (non-mocked)
+graph/vector retrievers — see the P0-D section above for the exact
+transcript. Confirmed live: correct winner + count, zero UnknownLabelWarning
+(the template never uses the failing backtick shape), no "no RETURN"
+rejection, zero irrelevant authority fetches for the bare question, and
+exactly the winner enriched (3 external claims, all for P519) for the
+explicit-Wikidata follow-up.
+
+### Remaining limitations / decisions for the maintainer
+
+1. **Mention-count canonical definition** (see P0-B above) is a default
+   (Entry-only `HAS_SUBJECT_PERSON`), not a confirmed product decision — the
+   work order explicitly requires flagging this rather than silently
+   picking one.
+2. **Role registry currently covers only `"king"`.** Extending
+   `tools.graph_intent.ROLE_TYPE_CUES` to other role/type questions (e.g.
+   "most mentioned queen/monk/official") requires the same live
+   exact-vs-CONTAINS verification documented above for each new role before
+   adding it — do not copy the pattern blind.
+3. **No full LLM synthesis run was performed** for the ranking question (see
+   live-smoke-test note above) — the final prose output (rule 12/13
+   compliance in an actual model response, not just the rule text existing
+   in the prompt) is unverified beyond what the existing prompt-content
+   tests can pin statically. A maintainer with authorization to write test
+   chat-history rows and spend LLM quota should run
+   `agent.synthesize_answer("Who is the most mentioned king in Sihwa
+   ch'ongnim?", "en")` once to close this gap.
+4. **Bounded read retry (P1) was verified with synthetic mocks**
+   (`ServiceUnavailable` raised twice then succeeding, and exhausting all
+   attempts), not by reproducing an actual live Bolt disconnect — that
+   failure mode is inherently hard to trigger on demand against a healthy
+   Aura instance.
