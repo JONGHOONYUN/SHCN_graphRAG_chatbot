@@ -5,6 +5,7 @@ import uuid
 
 import streamlit as st
 
+from mode_labels import mode_display_label
 from utils import write_message
 
 # NOTE — Phase 2 hardening (auth-gated lazy init):
@@ -150,14 +151,14 @@ with st.sidebar:
         help=(
             "켜짐 (graphRAG): 그래프 관계 + 벡터 + 외부 authority. "
             "구조적 사실·관계·다국어 인용 우수. 응답 5~30초.\n\n"
-            "꺼짐 (textRAG): Entry 본문 의미 기반 벡터 검색. 그래프 관계 추론은 "
+            "꺼짐 (vectorRAG): Entry 본문 의미 기반 벡터 검색. 그래프 관계 추론은 "
             "수행하지 않고, Entry–Work 포함 관계는 출처 표기에만 사용. 응답 1~3초."
         ),
     )
     chatbot_mode = "graphRAG" if is_graphrag else "textRAG"
     st.session_state["chatbot_mode"] = chatbot_mode
     st.caption(
-        f"**현재 모드**: `{chatbot_mode}`  \n"
+        f"**현재 모드**: `{mode_display_label(chatbot_mode)}`  \n"
         "두 모드는 별도의 대화 이력을 유지합니다."
     )
 
@@ -183,7 +184,7 @@ GREETING_GRAPHRAG = {
 GREETING_TEXTRAG = {
     "role": "assistant",
     "content": (
-        "안녕하세요! **시화총림(詩話叢林) DB 챗봇 — textRAG 모드**입니다.\n\n"
+        "안녕하세요! **시화총림(詩話叢林) DB 챗봇 — vectorRAG 모드**입니다.\n\n"
         "이 모드는 Entry 본문(한국어·한문·영어)에 대한 의미 기반 벡터 검색으로 답변합니다. "
         "그래프 관계 추론(작자·관직·시대·비평 관계 등 구조 질의)은 수행하지 않으며, "
         "Entry가 속한 시화집(Work) 정보는 출처 표기를 위해서만 사용합니다. "
