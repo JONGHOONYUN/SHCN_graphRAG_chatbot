@@ -39,6 +39,99 @@ def _pick_by_language(kor: Optional[str], eng: Optional[str],
     return kor or eng or chi
 
 
+# ── Language-aware source-text presentation order (work order:
+# CLAUDE_CODE_LANGUAGE_AWARE_QUOTES_AND_NAMED_SOURCES.md §3.1) ──────────────
+# Content is NEVER translated/altered here — only the PRESENTATION ORDER of
+# the parallel textEng/textKor/textChi fields changes, so a reader gets the
+# quotation in their own response language first. Both graphRAG formatters
+# (_format_graph_block / _format_vector_block) and the independent vectorRAG
+# path share this single source of truth.
+_SOURCE_TEXT_PRIORITY = {
+    "en": ("textEng", "textKor", "textChi"),
+    "ko": ("textKor", "textEng", "textChi"),
+    "zh": ("textChi", "textKor", "textEng"),
+}
+
+
+def source_text_priority(language: str) -> tuple:
+    """Language-locked presentation order for the three parallel source-text
+    fields. Unsupported/unknown languages fall back to the project's
+    existing default language policy (`ko`)."""
+    return _SOURCE_TEXT_PRIORITY.get(language, _SOURCE_TEXT_PRIORITY["ko"])
+
+
+# Bare source-text field -> 2-letter language code, and the reverse mapping,
+# used by `reorder_source_text_fields` to recognize both the bare
+# (textEng/textKor/textChi) and role-prefixed (<role>_text_eng|kor|chi)
+# field-family shapes.
+_BARE_TEXT_FIELD_LANG = {"textEng": "eng", "textKor": "kor", "textChi": "chi"}
+_LANG_TO_BARE_TEXT_FIELD = {v: k for k, v in _BARE_TEXT_FIELD_LANG.items()}
+_ROLE_TEXT_FIELD_RE = __import__("re").compile(r"^(.+)_text_(eng|kor|chi)$")
+
+
+def _text_field_family(key: str):
+    """Return (family_key, lang_code) if `key` is a recognized parallel
+    source-text field, else None. `family_key` groups siblings that must be
+    reordered together: bare `textEng/textKor/textChi` share family_key ""；
+    role-prefixed `<role>_text_eng|kor|chi` (e.g. `critique_text_eng`) share
+    family_key `<role>`."""
+    if key in _BARE_TEXT_FIELD_LANG:
+        return "", _BARE_TEXT_FIELD_LANG[key]
+    m = _ROLE_TEXT_FIELD_RE.match(key)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def _family_member_key(family_key: str, lang_code: str) -> str:
+    if family_key == "":
+        return _LANG_TO_BARE_TEXT_FIELD[lang_code]
+    return f"{family_key}_text_{lang_code}"
+
+
+def reorder_source_text_fields(value: Any, language: str) -> Any:
+    """Recursively return a NEW copy of `value` with every sibling family of
+    parallel source-text fields (bare `textEng/textKor/textChi`, and
+    role-prefixed `<role>_text_eng|kor|chi`, at ANY nesting depth inside
+    dicts/lists — e.g. `collect()`/map results) presented in the response
+    language's priority order (work order §3.1).
+
+    Guarantees:
+      * every text VALUE is passed through unchanged — byte-for-byte
+        identical, never translated/summarized/normalized;
+      * only the RELATIVE ORDER of a family's present members changes; a
+        family with only one member present is a no-op;
+      * every non-text-field key/value (including unrelated dict keys,
+        nested structures, and list items) is preserved in its original
+        relative position;
+      * the input is never mutated — `value` and everything reachable from
+        it are only ever read, and a fresh dict/list is built for the
+        result whenever `value` is itself a dict/list."""
+    if isinstance(value, list):
+        return [reorder_source_text_fields(item, language) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    priority_langs = [_BARE_TEXT_FIELD_LANG[f] for f in source_text_priority(language)]
+    result: dict = {}
+    emitted_families: set = set()
+    for key, val in value.items():
+        family = _text_field_family(key)
+        if family is None:
+            result[key] = reorder_source_text_fields(val, language)
+            continue
+        family_key, _lang_code = family
+        if family_key in emitted_families:
+            continue  # this family's members were already emitted in order
+        emitted_families.add(family_key)
+        for lang_code in priority_langs:
+            member_key = _family_member_key(family_key, lang_code)
+            if member_key in value:
+                result[member_key] = reorder_source_text_fields(
+                    value[member_key], language)
+    return result
+
+
 def _work_name_bilingual(prov: dict, language: str) -> Optional[str]:
     """Language-aware work name, bilingual when the answer language differs
     from the original (Korean) name — e.g. "Paegwan Chapki (패관잡기)" for
@@ -375,6 +468,18 @@ the only step that writes user-facing prose. Obey these rules strictly:
 8. Keep verbatim source text fields (textChi/textKor/textEng/descEng) exactly as
    given — never translate, summarize, or alter them. Your commentary is in the
    locked response language; quoted source text keeps its original characters.
+   The evidence blocks already PRESENT each text node's parallel-language
+   fields in the locked response language's priority order (en: textEng
+   before textKor before textChi; ko: textKor first; zh: textChi first) —
+   when you quote more than one language variant of the same passage, quote
+   them in that same order; never reorder them back to a different sequence.
+
+8b. When you cite a resolved entity or a "poetrytalks wikidata" node id that
+   the evidence lists with both a name_kor/name_eng (or a `person_name_kor`/
+   `person_name_eng`-style pair), refer to it using the name in the locked
+   response language — the system's own Sources section will already show
+   both names bilingually per rule 9, so your body prose does not need to
+   repeat both.
 
 9. SOURCES ARE SYSTEM-OWNED — WRITE THE ANSWER BODY ONLY.
    Do NOT write a Sources / References / 출처 / 참고문헌 / 来源 / 參考資料
@@ -461,10 +566,17 @@ def _entity_line(e: dict) -> str:
     return "- " + ", ".join(bits)
 
 
-def _format_graph_block(graph: dict, outcome: str = "ok") -> str:
+def _format_graph_block(graph: dict, outcome: str = "ok",
+                        language: str = "ko") -> str:
     """Graph rows only. Error/status claims are NEVER rendered here — raw
     exception text must not reach the final prompt (work order §3); the
-    localized status line is emitted by _format_status_block instead."""
+    localized status line is emitted by _format_status_block instead.
+
+    Each row is reordered (never mutated or altered in value) via
+    `reorder_source_text_fields` so parallel source-text fields — top-level
+    or nested inside collect()/map results — present in the locked response
+    language's priority order regardless of the Cypher RETURN key order or
+    Python dict insertion order (work order §3.1)."""
     lines = ["## Graph Evidence (Neo4j — authoritative for the sihwa corpus)"]
     docs = graph.get("documents", [])
     if not docs:
@@ -473,7 +585,8 @@ def _format_graph_block(graph: dict, outcome: str = "ok") -> str:
         else:
             lines.append("(no graph rows)")
     for row in docs[:_MAX_DOCS]:
-        lines.append("- " + _truncate(json.dumps(row, ensure_ascii=False), 800))
+        ordered_row = reorder_source_text_fields(row, language)
+        lines.append("- " + _truncate(json.dumps(ordered_row, ensure_ascii=False), 800))
     return _truncate("\n".join(lines))
 
 
@@ -510,7 +623,7 @@ def _format_vector_block(vector: dict, outcome: str = "ok",
         elif pos:
             head += f" > Entry {pos}"
         lines.append(head)
-        for f in ("textChi", "textKor", "textEng", "descEng"):
+        for f in source_text_priority(language) + ("descEng",):
             if d.get(f):
                 lines.append(f"    {f}: {d[f]}")
         if d.get("poetrytalks_link"):
@@ -655,7 +768,7 @@ def format_evidence_for_prompt(evidence: dict, language: str = "ko") -> str:
     vector_outcome = (statuses.get("vector") or {}).get("outcome", "ok")
     parts = [
         "\n".join(ent_lines),
-        _format_graph_block(graph, graph_outcome),
+        _format_graph_block(graph, graph_outcome, language),
         _format_vector_block(vector, vector_outcome, language),
         _format_external_block(external),
     ]
@@ -666,6 +779,86 @@ def format_evidence_for_prompt(evidence: dict, language: str = "ko") -> str:
     if coverage_block:
         parts.append(coverage_block)
     return _truncate("\n\n".join(parts), _MAX_TOTAL_CHARS)
+
+
+# ── Named "poetrytalks wikidata" citations (work order:
+# CLAUDE_CODE_LANGUAGE_AWARE_QUOTES_AND_NAMED_SOURCES.md §3.2/Phase 3) ──────
+def _collect_node_names(graph: dict, vector: dict) -> dict:
+    """node_id -> {"name_kor", "name_chi", "name_eng"}, merged across BOTH
+    evidence sources for citation-name display.
+
+    Priority (work order Phase 3 item 2): `node_references` (the
+    all-node-class inventory) is the primary source; `entities` (Person/
+    Place only) fills in a field ONLY when node_references left it empty.
+    Never overwrites an already-populated field with a different value —
+    first-seen non-empty wins, mirroring `merge_node_references()`'s policy
+    exactly, just operating on the already-serialized dict shape `graph`/
+    `vector` carry by the time `build_citations` runs."""
+    names: dict = {}
+
+    def _fill(node_id, name_kor, name_chi, name_eng):
+        if not node_id:
+            return
+        slot = names.setdefault(
+            node_id, {"name_kor": None, "name_chi": None, "name_eng": None})
+        for field_name, val in (("name_kor", name_kor), ("name_chi", name_chi),
+                               ("name_eng", name_eng)):
+            if not slot[field_name] and val:
+                slot[field_name] = val
+
+    # Primary: node_references (covers every node class).
+    for ref in graph.get("node_references", []) + vector.get("node_references", []):
+        if isinstance(ref, dict):
+            _fill(ref.get("node_id"), ref.get("name_kor"),
+                 ref.get("name_chi"), ref.get("name_eng"))
+    # Secondary: entities (Person/Place) — fills gaps only.
+    for ent in graph.get("entities", []) + vector.get("entities", []):
+        if isinstance(ent, dict):
+            _fill(ent.get("node_id"), ent.get("name_kor"),
+                 ent.get("name_chi"), ent.get("name_eng"))
+    return names
+
+
+def _format_citation_name(name_kor: Optional[str], name_eng: Optional[str],
+                          name_chi: Optional[str], language: str) -> str:
+    """Render the ' — <primary> (<secondary>)' suffix for one "poetrytalks
+    wikidata" bullet (work order §3.2). Returns '' when no usable name
+    exists — the caller then keeps the plain ID-only bullet (rule 6).
+
+    Rules (work order §3.2 name-fallback list):
+      1. en: nameEng primary; a DIFFERENT nameKor appends in parens.
+      2. ko: nameKor primary; a DIFFERENT nameEng appends in parens.
+      3. zh: nameChi primary (existing zh convention); nameKor/nameEng are
+         still preserved as the secondary rather than dropped outright.
+      4. Only one of the pair present → show that one alone.
+      5. Trimmed-equal pair → show once, no parenthetical repeat.
+      6. Neither present → '' (ID-only fallback; never fabricated).
+      7. nameMR/nameChi never substitutes for a missing nameEng in the
+         en/ko cases — only the zh case is allowed to prioritize nameChi."""
+    kor = (name_kor or "").strip() or None
+    eng = (name_eng or "").strip() or None
+    chi = (name_chi or "").strip() or None
+
+    if language == "zh":
+        primary = chi or kor or eng
+        if not primary:
+            return ""
+        secondary = kor if kor and kor != primary else (
+            eng if eng and eng != primary else None)
+        return f" — {primary} ({secondary})" if secondary else f" — {primary}"
+
+    if language == "en":
+        primary, secondary = eng, kor
+    else:  # ko, or an unsupported/unknown language — matches the project's
+        primary, secondary = kor, eng   # existing ko-default fallback policy.
+
+    if not primary:
+        primary, secondary = secondary, None
+    if not primary:
+        return ""
+    if secondary and secondary == primary:
+        secondary = None
+    return f" — {primary} ({secondary})" if secondary else f" — {primary}"
 
 
 def build_citations(evidence: dict, language: str = "ko",
@@ -722,11 +915,15 @@ def build_citations(evidence: dict, language: str = "ko",
     if referenced_node_ids is not None:
         allowed = set(referenced_node_ids)
         ptw_ids = [nid for nid in ptw_ids if nid in allowed]
+    node_names = _collect_node_names(graph, vector)
     for node_id in ptw_ids:
         url = poetrytalks_url(node_id)
         if not url:
             continue
-        _add(f"- {ptw_prefix}: [{node_id}]({url})")
+        nm = node_names.get(node_id) or {}
+        name_suffix = _format_citation_name(
+            nm.get("name_kor"), nm.get("name_eng"), nm.get("name_chi"), language)
+        _add(f"- {ptw_prefix}: [{node_id}]({url}){name_suffix}")
 
     # (b) Per-provenance breadcrumb rendered in the LOCKED response language.
     # Graph-provenance labels are ID-only (already language-neutral) so we

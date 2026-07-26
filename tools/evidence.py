@@ -775,6 +775,30 @@ _ID_PREFIX_TO_KIND = {
     for prefix, node_type in NODE_ID_PREFIXES.items()
 }
 
+# Legacy name-alias variants observed in REAL generated Cypher that predate
+# the standardized `<stem>_name_kor|chi|eng|mr` convention (work order:
+# CLAUDE_CODE_LANGUAGE_AWARE_QUOTES_AND_NAMED_SOURCES.md §2.2). Keyed by the
+# EXACT id_key each variant belongs to — deliberately explicit, never a
+# generic stem-stripping transform, so a role can never inherit another
+# role's name (e.g. `subject_person_id` must never read `critic_name_eng`).
+# Consulted by both `_row_entity` (Person/Place extraction) and
+# `_sibling_names_for_id_key` (generic NodeReference walker, e.g. for
+# `critical_term_id`, which is not a Person/Place id at all).
+_LEGACY_SIBLING_NAME_KEYS = {
+    "subject_person_id": {
+        "name_kor": "subject_name_kor", "name_chi": "subject_name_chi",
+        "name_eng": "subject_name_eng", "name_mr": "subject_name_mr",
+    },
+    "critic_person_id": {
+        "name_kor": "critic_name_kor", "name_chi": "critic_name_chi",
+        "name_eng": "critic_name_eng", "name_mr": "critic_name_mr",
+    },
+    "critical_term_id": {
+        "name_kor": "critical_term_kor", "name_chi": "critical_term_chi",
+        "name_eng": "critical_term_eng", "name_mr": "critical_term_mr",
+    },
+}
+
 # Standardized graph-row alias suffixes → normalized authority registry keys.
 # The Cypher-generation prompt asks for these aliases (optionally role-prefixed,
 # e.g. creator_wikidata_id, place_aks_map_id).
@@ -851,17 +875,26 @@ def _row_entity(row: dict, prefix: str, node_type: str) -> Optional[Entity]:
       * a Place is built ONLY when a place_id / place_name_* alias is present;
       * a Person is built from a person anchor, or — for legacy rows carrying
         bare authority aliases — only when no place anchor exists in the group.
-    Authority IDs are filtered to those the registry allows for the node type."""
+    Authority IDs are filtered to those the registry allows for the node type.
+
+    Name lookup ALSO accepts the exact legacy alias variants observed in real
+    generated Cypher (`subject_name_kor` for `subject_person_id`,
+    `critic_name_kor` for `critic_person_id` — work order:
+    CLAUDE_CODE_LANGUAGE_AWARE_QUOTES_AND_NAMED_SOURCES.md §2.2/§4 Phase 2)
+    via `_LEGACY_SIBLING_NAME_KEYS`, keyed by the EXACT id_key so a role can
+    never inherit another role's name (no broad/heuristic fallback)."""
     lower = "person" if node_type == "Person" else "place"
     other = "place" if node_type == "Person" else "person"
 
-    node_id = row.get(f"{prefix}{lower}_id")
-    names = {
-        "name_kor": row.get(f"{prefix}{lower}_name_kor"),
-        "name_chi": row.get(f"{prefix}{lower}_name_chi"),
-        "name_eng": row.get(f"{prefix}{lower}_name_eng"),
-        "name_mr": row.get(f"{prefix}{lower}_name_mr"),
-    }
+    id_key = f"{prefix}{lower}_id"
+    node_id = row.get(id_key)
+    legacy = _LEGACY_SIBLING_NAME_KEYS.get(id_key, {})
+    names = {}
+    for canon in ("name_kor", "name_chi", "name_eng", "name_mr"):
+        val = row.get(f"{prefix}{lower}_{canon}")
+        if val is None and canon in legacy:
+            val = row.get(legacy[canon])
+        names[canon] = val
     has_anchor = bool(node_id) or any(names.values())
     has_other_anchor = bool(row.get(f"{prefix}{other}_id")) or any(
         row.get(f"{prefix}{other}_name_{s}") for s in ("kor", "chi", "eng")
@@ -1026,17 +1059,23 @@ def _is_id_key(key: Any) -> bool:
 
 def _sibling_names_for_id_key(container: dict, id_key: str) -> dict:
     """Best-effort name fields living alongside an id key in the same dict,
-    supporting both the project's snake_case convention (`<stem>_name_kor`)
-    and bare Neo4j-style camelCase (`nameKor`) for generic collect() maps.
+    supporting the project's standardized snake_case convention
+    (`<stem>_name_kor`), the exact legacy alias variants observed in real
+    generated Cypher for `subject_person_id`/`critic_person_id`/
+    `critical_term_id` (`_LEGACY_SIBLING_NAME_KEYS`), and bare Neo4j-style
+    camelCase (`nameKor`) for generic collect() maps.
 
     `name_mr` (McCune–Reischauer) is included on equal footing — it is the
     sole Latin-script display field for Korean-related entities (work order
     §2 rule 7); `nameRR` is intentionally never read here."""
     stem = id_key[:-3] if id_key.endswith("_id") else ""
+    legacy = _LEGACY_SIBLING_NAME_KEYS.get(id_key, {})
     out: dict = {}
     for canon, tail in (("name_kor", "name_kor"), ("name_chi", "name_chi"),
                        ("name_eng", "name_eng"), ("name_mr", "name_mr")):
         candidates = [f"{stem}_{tail}"] if stem else [tail]
+        if canon in legacy:
+            candidates.append(legacy[canon])
         candidates.append({"name_kor": "nameKor", "name_chi": "nameChi",
                            "name_eng": "nameEng", "name_mr": "nameMR"}[canon])
         for cand in candidates:

@@ -42,6 +42,23 @@ Covers four work orders, applied in sequence:
    `temporarily_unavailable` kept distinct for ranking failures;
    McCune-Reischauer as the sole romanization field end-to-end; bounded
    read-only retry for transient Bolt failures. See "Section 8" below.
+9. **textRAG → vectorRAG UI label** (`CLAUDE_CODE_TEXTRAG_UI_LABEL_TO_VECTORRAG.md`)
+   — user-facing mode name changed from `textRAG` to `vectorRAG` via a new
+   `mode_labels.py` display-label mapping; internal mode key `"textRAG"`,
+   `messages_by_mode["textRAG"]`, and the `::textRAG` Neo4j history suffix
+   all deliberately unchanged for session/history compatibility.
+10. **Language-aware quotes & named Poetry Talks sources**
+    (`CLAUDE_CODE_LANGUAGE_AWARE_QUOTES_AND_NAMED_SOURCES.md`) — parallel
+    source-text fields (textEng/textKor/textChi, including role-prefixed
+    `<role>_text_eng|kor|chi` and nested collect() results) now present in
+    the locked response language's priority order in both graphRAG
+    (Graph/Vector evidence) and the independent vectorRAG path; every
+    "poetrytalks wikidata" citation shows the node's bilingual name when
+    available (`[P094](url) — Du Fu (두보)`); the actual legacy Cypher
+    alias mismatch that dropped names to ID-only is fixed; vectorRAG gained
+    a custom `document_prompt` and now reuses graphRAG's deterministic
+    Sources-assembly boundary instead of letting the LLM write its own. See
+    "Section 9" below.
 
 ## Section 6 — All-node source link coverage (work order 6)
 
@@ -929,3 +946,263 @@ explicit-Wikidata follow-up.
    attempts), not by reproducing an actual live Bolt disconnect — that
    failure mode is inherently hard to trigger on demand against a healthy
    Aura instance.
+
+## Section 9 — Language-aware quotes & named Poetry Talks sources (work order 10)
+
+(`CLAUDE_CODE_LANGUAGE_AWARE_QUOTES_AND_NAMED_SOURCES.md`) — fixes two
+related defects observed in a live English graphRAG response to "How is Du
+Fu critiqued in Sihwa Ch'ongnim?": quoted source text always appeared
+`textKor -> textEng` regardless of response language, and every
+"poetrytalks wikidata" Sources bullet was ID-only even for nodes whose name
+WAS present in the generated Cypher row — because the actual alias shapes
+Gemini produced (`subject_name_kor`/`critic_name_kor`/`critical_term_kor`)
+didn't match what the extraction code expected
+(`subject_person_name_kor`/`critic_person_name_kor`/
+`critical_term_name_kor`).
+
+### Phase 1 — Language-locked source-text presentation order
+
+`tools/synthesis.py`:
+- `source_text_priority(language)` — single source of truth: `en` ->
+  (textEng, textKor, textChi); `ko` -> (textKor, textEng, textChi); `zh` ->
+  (textChi, textKor, textEng); unsupported/unknown -> `ko`'s order (existing
+  project-wide language-fallback convention).
+- `reorder_source_text_fields(value, language)` — pure, recursive dict/list
+  copy that reorders any sibling family of parallel source-text fields
+  (bare `textEng/textKor/textChi`, and role-prefixed
+  `<role>_text_eng|kor|chi`, e.g. `critique_text_eng`) at ANY nesting depth
+  (top-level and inside `collect()`/map results), in the locked language's
+  priority order. Values are never altered — only presentation order
+  changes; a family with only one member present is a no-op; unrelated
+  keys/values pass through in their original relative position; the input
+  is never mutated.
+- `_format_graph_block(graph, outcome, language)` — signature extended with
+  `language`; each row is passed through `reorder_source_text_fields`
+  before `json.dumps()` (previously the raw Cypher `RETURN` key order —
+  effectively arbitrary — went straight into the prompt).
+- `_format_vector_block(...)` — the previous FIXED tuple
+  `("textChi", "textKor", "textEng", "descEng")` is now
+  `source_text_priority(language) + ("descEng",)` — `descEng` always stays
+  last, per the work order's explicit ordering rule.
+- `SYNTHESIS_SYSTEM_RULES` rule 8 extended to state the ordering policy
+  explicitly (so the LLM doesn't re-shuffle multi-language quotes back to
+  Korean-first out of habit); new rule 8b on using the locked-language name
+  in body prose (the system's own Sources section already shows both names
+  bilingually).
+
+### Phase 2 — Legacy Cypher alias normalization (the actual root cause)
+
+`tools/evidence.py`:
+- New `_LEGACY_SIBLING_NAME_KEYS` — an EXPLICIT (never a generic
+  stem-stripping transform) map from an exact `id_key` to its legacy name
+  aliases: `subject_person_id` -> `subject_name_kor|chi|eng|mr`,
+  `critic_person_id` -> `critic_name_kor|chi|eng|mr`, `critical_term_id` ->
+  `critical_term_kor|chi|eng|mr` (no `_name_` infix at all for this one).
+  Deliberately narrow and per-id_key so a role can NEVER inherit another
+  role's name (e.g. `subject_person_id` must never read
+  `critic_name_eng`) — this constraint is enforced by a dedicated
+  regression test (`test_no_broad_fallback_across_unrelated_roles`).
+- `_row_entity()` (Person/Place extraction) and `_sibling_names_for_id_key()`
+  (generic all-node-class NodeReference walker, used for `critical_term_id`
+  among others) both consult this map as a fallback AFTER the standardized
+  `<stem>_name_kor|chi|eng|mr` form and BEFORE the bare-camelCase
+  (`nameKor`) form.
+
+`tools/cypher.py` prompt:
+- The "MULTI-HOP results" guidance now shows the full paired ID+name alias
+  block (`subject.ID AS subject_person_id, subject.nameKor AS
+  subject_person_name_kor, ...`) with an explicit "WRONG (do not do this):
+  `critic_name`, `critical_term_kor`" callout.
+- The two few-shot examples that previously taught the WRONG pattern
+  outright (the 최치원 critical-term example used bare `critic.nameKor AS
+  critic_name` with no ID at all; the 이백 intertextual example used
+  `critic.nameKor AS critic_name`) are rewritten to the standardized
+  alias contract, and now also demonstrate the `<role>_text_eng|kor|chi`
+  convention Phase 1 depends on.
+
+**Live-verified this was the actual fix**, not just a plausible theory: a
+live `agent.synthesize_answer("How is Du Fu critiqued in Sihwa
+Ch'ongnim?", "en")` run against the SAME live database, AFTER this phase's
+prompt fix, produced Cypher reading:
+
+```cypher
+RETURN subject.ID AS subject_person_id,
+       subject.nameKor AS subject_person_name_kor,
+       ...
+       critic.ID AS critic_person_id,
+       critic.nameKor AS critic_person_name_kor,
+       ...
+```
+
+— i.e. Gemini's own generated Cypher changed to the corrected alias shape
+once the prompt taught it correctly, and the resulting Sources bullet came
+out named: `- poetrytalks wikidata: [P094](https://poetrytalks.org/P094) — Du Fu (두보)`.
+
+### Phase 3 — Named "poetrytalks wikidata" citations
+
+`tools/synthesis.py`:
+- `_collect_node_names(graph, vector)` — `node_id -> {name_kor, name_chi,
+  name_eng}`, merged from `node_references` (primary, all node classes)
+  then `entities` (Person/Place, fills gaps only) — first-seen non-empty
+  wins, mirroring `merge_node_references()`'s policy but operating on the
+  already-serialized dict shape `build_citations()` receives.
+- `_format_citation_name(name_kor, name_eng, name_chi, language)` — renders
+  the ` — <primary> (<secondary>)` suffix per the work order's exact rule
+  list: en -> nameEng primary, differing nameKor in parens; ko -> nameKor
+  primary, differing nameEng in parens; zh -> nameChi primary (existing zh
+  convention) but nameKor/nameEng preserved as secondary, never both
+  dropped; only one present -> that one alone; equal-after-trim -> shown
+  once; neither present -> `""` (caller keeps the existing ID-only bullet);
+  nameMR/nameChi NEVER substitute for a missing nameEng in the en/ko cases
+  — only zh may prioritize nameChi.
+- `build_citations()`'s "poetrytalks wikidata" bullet loop now appends this
+  suffix after the existing `[id](url)` link — the link itself is
+  UNCHANGED, preserving every existing substring-based test's compatibility
+  (verified: all 409 pre-existing tests still pass unmodified).
+- Identity/safety invariants unchanged and re-verified: citation identity
+  is still solely the internal `node_id` (P553/P1227 sharing an external
+  Wikidata id stay two separate, distinctly-named bullets); external
+  authority ids (Q-ids, `koreanPerson_*`, `idAKSency` codes) never appear as
+  a Poetry Talks node id.
+- Chose NOT to implement Phase 3 item 6's optional live batch name-backfill
+  query (`MATCH (n) WHERE n.ID IN $ids`) — see "Remaining limitations"
+  below.
+
+### Phase 4 — Independent vectorRAG (`text_rag.py`) brought onto the same contract
+
+New pure module `tools/vectorrag_prompt.py` (no streamlit/neo4j/llm
+import — same testability rationale as `tools/graph_intent.py`):
+- `quoted_text_block(meta, language)` — language-ordered, null-omitted
+  rendering of the three parallel source texts.
+- `provenance_block(meta)` — Entry ID/name/position + Work ID/name +
+  poetrytalks_link, omitting absent parts (never `Entry None`).
+- `prepare_documents_for_prompt(docs, language)` — returns NEW Document
+  objects (inputs never mutated) whose metadata gains these two computed
+  keys, needed because a raw `{field}` placeholder in a LangChain
+  `PromptTemplate` renders a missing/null metadata value as the literal
+  string `"None"` — the null-aware composition has to happen in Python,
+  not in the template.
+- `document_prompt_for_lang(language)` — the custom `PromptTemplate` passed
+  to `create_stuff_documents_chain(..., document_prompt=...)`.
+
+`text_rag.py` changes (internal function/session-suffix NAMES unchanged,
+per the work order's explicit constraint and the prior UI-label work
+order's own non-goal list):
+- `_build_light_retrieval_query()` gained `entry_name_kor`/`entry_name_eng`
+  — the only piece missing for `tools.evidence.node_references_from_vector_meta`
+  (which already reads exactly these two keys) to name the Entry itself.
+- `_get_text_retriever_for_lang()` now caches a composite Runnable
+  (`(lambda x: x["input"]) | base_retriever | RunnableLambda(prepare_fn)`)
+  instead of the bare `.as_retriever()` object — `create_retrieval_chain`
+  only auto-extracts `x["input"]` for a genuine `BaseRetriever` instance,
+  so once the retriever becomes a composite `RunnableSequence` the
+  extraction step must be included explicitly, or the retriever would
+  receive the whole input dict instead of the query string.
+- `_build_prompt()`'s system message dropped the old self-written Sources
+  section instructions (18 lines of per-language label examples) and the
+  hardcoded "always quote Chinese first" bilingual rule, replacing both
+  with: write the body only (the system appends Sources deterministically),
+  and the context's `quoted_text_block` is already in this session's
+  response-language order — don't reorder it back.
+- `generate_text_rag_response()`: after the chain returns, `result["context"]`
+  (the prepared Documents) normalizes via `docs_to_evidence()` and flows
+  through the EXACT SAME `build_citations()` + `assemble_final_answer()`
+  boundary graphRAG uses — so a fake Sources section the model writes
+  anyway is discarded and replaced exactly once, identical to the graphRAG
+  guarantee. `RunnableWithMessageHistory` still auto-saves the raw
+  pre-assembly body to Neo4j chat history unchanged (a deliberate,
+  documented scope decision — see "Remaining limitations").
+
+**Live-verified end-to-end** (real Neo4j vector index, real Gemini call,
+both English and Korean):
+- English: "How is Du Fu critiqued..." -> body quotes English-first, Sources
+  header appears exactly once, named Work citations
+  (`[B023](...) — Hogok's Remarks on Poetry (호곡시화)`), unnamed Entries
+  correctly ID-only.
+- Korean: moonlight-in-poetry question -> Korean-first quoting, `## 출처`
+  header exactly once.
+
+### Phase 5 — External authority path: regression-verified, not modified
+
+No code in `tools/orchestrator.py` or `tools/external_authority.py` was
+touched. Confirmed via both a live `agent.synthesize_answer()` run (the Du
+Fu critique question produced **zero** external authority claims — a
+critique-relation question is not a biography/location/external-source
+intent, so the gate correctly stayed off) and new mock-based regression
+tests (`tests/test_external_authority_regression_lang_order.py`):
+reproduction question -> 0 fetches; explicit biography question -> fetches
+only graph-stored valid ids; `status=ok`/`link_only` + URL -> citation;
+`unavailable`/`error` -> no citation, no asserted fact.
+
+Four potential follow-up risks were identified but deliberately NOT fixed
+in this work order (per its own explicit "found but out of scope" list):
+missing scheme/hostname re-validation on final external citation URLs, no
+upper bound on authority-cap environment overrides, possible link-only
+references skipped at the entity-cap boundary, and a possible mismatch
+between the count of external claims shown in-prompt vs. the full citation
+traversal range.
+
+### Files changed / added (work order 10)
+
+- New: `tools/vectorrag_prompt.py`, `tests/test_source_text_language_order.py`,
+  `tests/test_named_poetrytalks_citations.py`,
+  `tests/test_vectorrag_document_prompt.py`,
+  `tests/test_external_authority_regression_lang_order.py`.
+- Modified: `tools/synthesis.py` (language-order helpers, named-citation
+  helpers, rules 8/8b), `tools/evidence.py` (`_LEGACY_SIBLING_NAME_KEYS`,
+  `_row_entity`/`_sibling_names_for_id_key` fallback), `tools/cypher.py`
+  (MULTI-HOP guidance + two corrected few-shot examples), `text_rag.py`
+  (retriever composition, document_prompt, deterministic Sources
+  assembly, prompt rule rewrite).
+- Untouched (regression-verified only): `tools/orchestrator.py`,
+  `tools/external_authority.py`, `tools/vector.py` (graphRAG's own vector
+  projection already carried the right fields), `bot.py`, `agent.py`.
+
+### Test totals (work order 10)
+
+409 (post work-order-8/9 baseline) -> **487 tests**, all passing on
+`python -m unittest discover -s tests -p "test_*.py"`. No live Neo4j /
+Gemini / network access is required to run the suite —
+`tools/vectorrag_prompt.py` was specifically extracted into its own
+side-effect-free module so Phase 4 could be unit-tested without importing
+`text_rag.py` (which constructs live Gemini/Neo4j clients at import time,
+per this project's established Phase-2 lazy-import convention).
+
+### Live smoke test summary
+
+All of §7.1/7.2/7.3's manual-verification scenarios were run live (real
+Neo4j, real Gemini, English AND Korean, both graphRAG and independent
+vectorRAG) rather than only unit-tested — see the Phase 2 and Phase 4
+sections above for transcripts. Every exact-format assertion from the work
+order (`— Du Fu (두보)` / `— 두보 (Du Fu)`) was reproduced by a real model
+response, not just a hand-built fixture.
+
+### Remaining limitations / decisions for the maintainer
+
+1. **Phase 3 item 6's optional live batch name-backfill query was not
+   implemented.** The work order frames it conditionally ("보장해야
+   한다면") for the residual case where a retrieval result carries only an
+   id and the LLM's own Cypher genuinely omitted any name field despite
+   the corrected prompt instructions. Given Phase 2 fixes the actual
+   observed root cause (alias mismatch, not absent projection) and the
+   acceptance criteria's "이름이 없는 node는 ID-only로 fallback한다"
+   requirement is already satisfied without it, this was scoped out to
+   avoid adding a new live Neo4j round-trip (latency + failure surface) to
+   every graphRAG turn without a demonstrated remaining need. A maintainer
+   who observes ID-only citations for nodes with real DB-side names after
+   this fix ships should revisit this.
+2. **vectorRAG's chat history still stores the pre-assembly body**, not
+   the final Sources-appended answer — `RunnableWithMessageHistory` saves
+   automatically during `.invoke()`, before the deterministic assembly
+   step runs. This mirrors the PRE-EXISTING vectorRAG history behavior
+   (unlike graphRAG, which manually saves the fully assembled output) and
+   was left as-is to avoid restructuring history persistence, which is
+   outside this work order's stated scope; conversation history is only
+   ever used for pronoun/reference resolution, never re-cited as fact.
+3. **`build_citations()` for vectorRAG uses `referenced_node_ids=None`**
+   (the pre-existing legacy default — every retrieved node id is included,
+   not narrowed to only the ones the model's prose actually mentioned).
+   graphRAG's optional narrowing (`agent.py`'s `derive_referenced_node_ids`)
+   was not ported to vectorRAG, consistent with the work order's own
+   explicit non-goal ("검색된 모든 graph provenance를 본문 사용 여부로
+   추가 필터링하는 정책" is out of scope).

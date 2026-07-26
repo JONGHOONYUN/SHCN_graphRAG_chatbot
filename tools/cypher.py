@@ -177,7 +177,19 @@ lowercase-`id`-prefix + capitalized-suffix spelling exactly as shown.
 
 Only include the ID fields that matter for the question — a poem-list query does not need them. Return a reasonable subset rather than every field every time.
 
-In MULTI-HOP results where several people/places appear in one row, PREFIX the aliases by role so each entity stays distinct, e.g. `critic_person_id`, `critic_wikidata_id`, `subject_person_id`, `subject_wikidata_id`, `place_id`, `place_aks_map_id`. Never mix two entities' IDs into one unprefixed group.
+In MULTI-HOP results where several people/places appear in one row, PREFIX the aliases by role so each entity stays distinct — and give each role BOTH its ID and its name aliases under the SAME role prefix, using the standardized `<role>_name_kor|chi|eng` form (never a shortened alias that drops the role noun or the `_name_` infix):
+
+    subject.ID       AS subject_person_id,
+    subject.nameKor  AS subject_person_name_kor,
+    subject.nameEng  AS subject_person_name_eng,
+    critic.ID        AS critic_person_id,
+    critic.nameKor   AS critic_person_name_kor,
+    critic.nameEng   AS critic_person_name_eng,
+    ct.ID            AS critical_term_id,
+    ct.nameKor       AS critical_term_name_kor,
+    ct.nameEng       AS critical_term_name_eng
+
+WRONG (do not do this): `critic_name`, `critic_name_kor`, `critical_term_kor` — these drop the role noun (`_person_`) or the `_name_` infix and will NOT be recognized as that role's own name by the downstream citation step, which then falls back to showing an ID-only citation even though a name was returned. `critic_person_id`, `critic_wikidata_id`, `subject_person_id`, `subject_wikidata_id`, `place_id`, `place_aks_map_id` remain the standard ID-family aliases. Never mix two entities' IDs or names into one unprefixed group.
 
 NOTE — Person vs Place IDs are NOT interchangeable: `idAKSdigerati` is `koreanPerson_<n>` on a Person and `koreanPlace_<n>` on a Place, and they resolve against different endpoints. Always return a Place's ID under the `place_*`/`aks_map_id` aliases, never under `person_*`.
 
@@ -589,9 +601,20 @@ Cypher: MATCH (subject:Person)<-[:HAS_SUBJECT_PERSON]-(c:Critique)
               -[:HAS_SUBJECT_CRITICAL_TERM]->(ct:CriticalTerm),
               (c)-[:HAS_CREATOR]->(critic:Person)
         WHERE subject.nameKor CONTAINS '최치원' OR subject.nameChi CONTAINS '崔致遠'
-        RETURN ct.nameKor, ct.nameChi, ct.nameEng,
-               critic.nameKor AS critic_name,
-               c.textKor, c.textChi LIMIT 20
+        RETURN subject.ID AS subject_person_id,
+               subject.nameKor AS subject_person_name_kor,
+               subject.nameEng AS subject_person_name_eng,
+               critic.ID AS critic_person_id,
+               critic.nameKor AS critic_person_name_kor,
+               critic.nameEng AS critic_person_name_eng,
+               ct.ID AS critical_term_id,
+               ct.nameKor AS critical_term_name_kor,
+               ct.nameChi AS critical_term_name_chi,
+               ct.nameEng AS critical_term_name_eng,
+               c.ID AS critique_id,
+               c.textKor AS critique_text_kor,
+               c.textChi AS critique_text_chi,
+               c.textEng AS critique_text_eng LIMIT 20
 
 Q: 고려 시대 시인들이 가장 많이 쓴 주제는?
 Cypher: MATCH (p:Person)-[:HAS_ERA]->(e:Era),
@@ -646,10 +669,15 @@ Q: 이백의 시를 인용·논평한 비평문은?  (intertextual — HAS_SUBJE
 Cypher: MATCH (author:Person)<-[:HAS_CREATOR]-(target_poem:Poem)
               <-[:HAS_SUBJECT_TEXT]-(c:Critique)-[:HAS_CREATOR]->(critic:Person)
         WHERE author.nameKor CONTAINS '이백' OR author.nameChi CONTAINS '李白'
-        RETURN critic.nameKor AS critic_name,
-               target_poem.textKor AS quoted_poem,
-               c.textKor AS critique_text,
-               c.ID AS critique_id LIMIT 20
+        RETURN critic.ID AS critic_person_id,
+               critic.nameKor AS critic_person_name_kor,
+               critic.nameEng AS critic_person_name_eng,
+               target_poem.ID AS poem_id,
+               target_poem.textKor AS poem_text_kor,
+               target_poem.textEng AS poem_text_eng,
+               c.ID AS critique_id,
+               c.textKor AS critique_text_kor,
+               c.textEng AS critique_text_eng LIMIT 20
 
 Q: What did Ch'wisŏn write?  (romanized name with apostrophe — use DOUBLE-quoted literals)
 Cypher: MATCH (p:Person)-[:HAS_CREATOR]-(poem:Poem)
