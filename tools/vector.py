@@ -155,9 +155,15 @@ _LANGUAGE_LABEL = {
 
 
 def _build_prompt():
-    """매 호출 시 이번 턴 적용 언어(effective_language)를 반영한 prompt를 새로 생성.
-    bot.py가 매 턴 'effective_language'를 갱신하므로 그 값을 그대로 사용."""
-    user_language = st.session_state.get("effective_language", "ko")
+    """매 호출 시 이번 턴의 응답 언어(response_language)를 반영한 prompt를
+    새로 생성한다. 이 값은 최종 출력 언어이지 검색 index 언어가 아니다 — 검색
+    index 선택은 `get_poetry_plot()`이 별도로 `question_language`를 읽어
+    수행한다 (work order
+    CLAUDE_CODE_MIXED_SCRIPT_LANGUAGE_DETECTION_AND_ROUTING.md §3 Phase 3
+    item 7). `response_language`가 없는 구세션 호환을 위해
+    `effective_language`(response_language의 하위 호환 alias)로 폴백한다."""
+    user_language = (st.session_state.get("response_language")
+                    or st.session_state.get("effective_language", "ko"))
     label = _LANGUAGE_LABEL.get(user_language, _LANGUAGE_LABEL["ko"])
     language_clause = (
         f"이번 답변은 반드시 {label}로 작성하세요. "
@@ -316,14 +322,19 @@ def _get_retriever_for_lang(lang: str):
 
 
 def get_poetry_plot(input):
-    # 매 호출 시 세션의 effective_language를 읽어 그에 맞는 in-language 인덱스로 라우팅.
-    # bot.py가 매 턴 갱신하는 키이며, 없으면 ko로 폴백.
+    # 매 호출 시 세션의 question_language(검색 index 언어)를 읽어 그에 맞는
+    # in-language 인덱스로 라우팅한다 — 응답 언어(response_language)와는
+    # 분리된 값이다 (work order
+    # CLAUDE_CODE_MIXED_SCRIPT_LANGUAGE_DETECTION_AND_ROUTING.md §3 Phase 3
+    # item 7). bot.py가 매 턴 갱신하는 키이며, 구세션 호환을 위해
+    # effective_language로 폴백한 뒤 최종적으로 ko를 기본값으로 쓴다.
     # NOTE: 이 함수는 자체적으로 최종 답변 prose를 생성한다. graphRAG 파이프라인은
     # 대신 retrieve_sihwa_evidence()를 사용해 구조화된 근거만 수집하고, 최종 합성은
     # agent.synthesize_answer()에서 단 한 번 수행한다. get_poetry_plot는 하위 호환
     # (기존 ReAct tool)용으로만 남겨둔다.
-    user_language = st.session_state.get("effective_language", "ko")
-    retriever = _get_retriever_for_lang(user_language)
+    question_language = (st.session_state.get("question_language")
+                        or st.session_state.get("effective_language", "ko"))
+    retriever = _get_retriever_for_lang(question_language)
     question_answer_chain = create_stuff_documents_chain(llm, _build_prompt())
     plot_retriever = create_retrieval_chain(retriever, question_answer_chain)
     return plot_retriever.invoke({"input": input})
@@ -347,8 +358,16 @@ def retrieve_sihwa_evidence(query: str, language: Optional[str] = None) -> Evide
     authority IDs where present), and provenance. Does NOT call
     create_stuff_documents_chain and does NOT produce a final answer.
 
-    Retains the existing multilingual index routing via effective_language."""
-    user_language = language or st.session_state.get("effective_language", "ko")
+    `language` here is the QUERY/INDEX language — i.e. `question_language`
+    in the work order
+    CLAUDE_CODE_MIXED_SCRIPT_LANGUAGE_DETECTION_AND_ROUTING.md §3 split, NOT
+    the final response language. `tools.orchestrator._default_vector_retriever`
+    always passes it explicitly (the orchestrator's `question_language`); the
+    session-state fallback below only applies to legacy/direct callers that
+    omit it, and prefers `question_language` over the response-language
+    alias `effective_language` for that reason."""
+    user_language = (language or st.session_state.get("question_language")
+                    or st.session_state.get("effective_language", "ko"))
     retriever = _get_retriever_for_lang(user_language)
     docs = retriever.invoke(query)
     return docs_to_evidence(docs)

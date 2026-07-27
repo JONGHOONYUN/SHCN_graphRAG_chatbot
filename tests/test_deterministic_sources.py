@@ -236,7 +236,7 @@ class TestDeterministicAssembly(unittest.TestCase):
         self.assertLess(src.index("assemble_final_answer("),
                         src.index("hist.add_ai_message(output)"))
         # retrieval-failure safe message returns BEFORE any assembly
-        self.assertLess(src.index("retrieval_failure_message(user_language)"),
+        self.assertLess(src.index("retrieval_failure_message(response_language)"),
                         src.index("assemble_final_answer("))
 
 

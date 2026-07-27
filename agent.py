@@ -659,8 +659,19 @@ def _load_bounded_history(session_id: str) -> str:
         return ""
 
 
-def synthesize_answer(user_input: str, user_language: str) -> str:
+def synthesize_answer(user_input: str, response_language: str,
+                      question_language: str = None) -> str:
     """graphRAG 최종 합성. bounded 대화 이력 + 구조화된 근거로 단일 LLM 호출.
+
+    work order CLAUDE_CODE_MIXED_SCRIPT_LANGUAGE_DETECTION_AND_ROUTING.md §3:
+    `question_language`(질문/검색 언어)와 `response_language`(최종 출력 언어)를
+    분리한다. `question_language`가 생략되면 `response_language`와 같다고
+    가정한다 — 기존 호출자(단일 언어 인자만 넘기는 코드)의 동작을 그대로
+    보존하는 하위 호환 기본값이다.
+
+    `user_input`은 이미 언어 제어 문구가 제거된 question_text여야 한다
+    (bot.py의 `resolve_languages()`가 보장) — 이 함수는 별도로 번역하거나
+    제어 문구를 다시 파싱하지 않는다.
 
     이력 정책 (persistence 소유권):
     - 정상 경로(이 함수)가 성공 답변을 반환하기 직전에 user/assistant 메시지를
@@ -669,23 +680,30 @@ def synthesize_answer(user_input: str, user_language: str) -> str:
       이 함수가 빈 출력/예외로 폴백에 넘어간 경우 여기서는 저장하지 않는다
       (이중 저장 방지 — 경로당 소유자 1곳).
     """
+    question_language = question_language or response_language
     session_id = get_session_id()
     history_text = _load_bounded_history(session_id)
 
+    # vector retriever에는 question_language(검색 index 언어)가 전달되고,
+    # external authority fetch/coverage 문구에는 response_language가 전달된다
+    # (gather_graphrag_evidence의 `language`=question_language,
+    # `response_language`=response_language 분리 — 하위 호환을 위해
+    # `response_language`를 생략하면 내부적으로 `language`와 같다고 처리됨).
     evidence = gather_graphrag_evidence(
-        user_input, user_language, history_text=history_text or None)
+        user_input, question_language, history_text=history_text or None,
+        response_language=response_language)
 
     # 그래프·벡터 검색이 모두 일시 불가하고 외부 근거도 없으면, pretraining으로
     # 메우지 않고 즉시 락 언어 안내를 반환한다 (LLM 호출 없음).
     if both_retrievals_failed(evidence.get("statuses") or {}) \
             and not evidence["external"].claims:
-        return retrieval_failure_message(user_language)
+        return retrieval_failure_message(response_language)
 
-    evidence_blocks = format_evidence_for_prompt(evidence, user_language)
+    evidence_blocks = format_evidence_for_prompt(evidence, response_language)
 
     body = synthesis_chain.invoke(
         {
-            "language_directive": _build_language_directive(user_language),
+            "language_directive": _build_language_directive(response_language),
             "chat_history": history_text or "(이전 대화 없음)",
             "question": user_input,
             "evidence_blocks": evidence_blocks,
@@ -710,11 +728,11 @@ def synthesize_answer(user_input: str, user_language: str) -> str:
     # 모델 Sources를 먼저 제거한 sanitized body를 기준으로 판단한다.
     sanitized_body, _ = strip_model_sources(body or "")
     referenced_ids = derive_referenced_node_ids(sanitized_body, node_ref_dicts)
-    citations = build_citations(evidence, user_language,
+    citations = build_citations(evidence, response_language,
                                 referenced_node_ids=referenced_ids)
 
     output = assemble_final_answer(
-        body, citations, user_language,
+        body, citations, response_language,
         entities=link_targets, correlation_id=correlation_id,
     )
     _logger.debug(
@@ -765,43 +783,49 @@ def generate_response(user_input):
         NO fallback (hiding a coding bug behind ReAct forever is exactly
         what the work order forbids).
     """
-    user_language = st.session_state.get("effective_language", "ko")
+    # response_language: 최종 출력/오류 문구 언어. question_language: 검색·
+    # index 선택 언어. bot.py(Phase 2)가 두 키를 모두 세팅하지만, 구버전
+    # 세션이나 다른 호출자를 위해 `effective_language`(response_language의
+    # 하위 호환 alias)로 폴백한다.
+    response_language = (st.session_state.get("response_language")
+                        or st.session_state.get("effective_language", "ko"))
+    question_language = st.session_state.get("question_language") or response_language
 
     try:
-        output = synthesize_answer(user_input, user_language)
+        output = synthesize_answer(user_input, response_language, question_language)
         if output and output.strip():
             return output
         # Empty output is treated as no_results — safe message, not fallback.
         return ITERATION_LIMIT_FALLBACK.get(
-            user_language, ITERATION_LIMIT_FALLBACK["ko"])
+            response_language, ITERATION_LIMIT_FALLBACK["ko"])
     except (UnsafeCypherError, UnsafeQueryError) as exc:
         _logger.warning(
             "graphRAG blocked unsafe query [%s]",
             getattr(exc, "correlation_id", "?"),
         )
         return ITERATION_LIMIT_FALLBACK.get(
-            user_language, ITERATION_LIMIT_FALLBACK["ko"])
+            response_language, ITERATION_LIMIT_FALLBACK["ko"])
     except (ConfigurationError, RetrievalError) as exc:
         _logger.error(
             "graphRAG non-fallback error [%s] type=%s",
             getattr(exc, "correlation_id", "?"), type(exc).__name__,
         )
         return ITERATION_LIMIT_FALLBACK.get(
-            user_language, ITERATION_LIMIT_FALLBACK["ko"])
+            response_language, ITERATION_LIMIT_FALLBACK["ko"])
     except ValueError as exc:
         if "No generation chunks were returned" in str(exc):
             _logger.info(
                 "graphRAG Gemini empty stream — safe message, no fallback")
             return ITERATION_LIMIT_FALLBACK.get(
-                user_language, ITERATION_LIMIT_FALLBACK["ko"])
+                response_language, ITERATION_LIMIT_FALLBACK["ko"])
         # Any other ValueError is unexpected; fall through to policy check.
-        return _react_fallback_or_safe(exc, user_input, user_language)
+        return _react_fallback_or_safe(exc, user_input, response_language)
     except Exception as exc:
-        return _react_fallback_or_safe(exc, user_input, user_language)
+        return _react_fallback_or_safe(exc, user_input, response_language)
 
 
 def _react_fallback_or_safe(exc: BaseException, user_input: str,
-                            user_language: str) -> str:
+                            response_language: str) -> str:
     """Policy: only TransientProviderError triggers the ReAct fallback. Any
     other exception is logged with a correlation id and converted to the
     localized safe message so a coding bug is not hidden behind a fallback."""
@@ -811,18 +835,22 @@ def _react_fallback_or_safe(exc: BaseException, user_input: str,
             "graphRAG transient failure [%s] type=%s — invoking ReAct fallback",
             correlation_id, type(exc).__name__,
         )
-        return _generate_response_react(user_input, user_language)
+        return _generate_response_react(user_input, response_language)
     _logger.error(
         "graphRAG unexpected failure [%s] type=%s — NO fallback (%s)",
         correlation_id, type(exc).__name__, str(exc)[:200],
     )
     return ITERATION_LIMIT_FALLBACK.get(
-        user_language, ITERATION_LIMIT_FALLBACK["ko"])
+        response_language, ITERATION_LIMIT_FALLBACK["ko"])
 
 
-def _generate_response_react(user_input, user_language):
-    """레거시 ReAct agent 경로 (폴백). 파이프라인 실패 시에만 사용."""
-    language_directive = _build_language_directive(user_language)
+def _generate_response_react(user_input, response_language):
+    """레거시 ReAct agent 경로 (폴백). 파이프라인 실패 시에만 사용.
+
+    `user_input`은 이미 question_text(제어 문구 제거본)이며 그대로 tool
+    Action Input에 사용된다 — 번역하지 않는다. `response_language`는 최종
+    'Final Answer:' directive에만 적용된다 (work order §5.2 라우팅 계약)."""
+    language_directive = _build_language_directive(response_language)
 
     try:
         # session_id에 ::graphRAG suffix로 textRAG 이력과 완전 분리
@@ -832,11 +860,11 @@ def _generate_response_react(user_input, user_language):
     except ValueError as e:
         # Gemini가 빈 스트림을 반환한 경우 ("No generation chunks were returned").
         if "No generation chunks were returned" in str(e):
-            return ITERATION_LIMIT_FALLBACK.get(user_language, ITERATION_LIMIT_FALLBACK["ko"])
+            return ITERATION_LIMIT_FALLBACK.get(response_language, ITERATION_LIMIT_FALLBACK["ko"])
         raise
 
     output = response['output']
     # iteration limit placeholder를 세션 언어 친화 안내로 교체
     if ITERATION_LIMIT_PLACEHOLDER in output:
-        return ITERATION_LIMIT_FALLBACK.get(user_language, ITERATION_LIMIT_FALLBACK["ko"])
+        return ITERATION_LIMIT_FALLBACK.get(response_language, ITERATION_LIMIT_FALLBACK["ko"])
     return output

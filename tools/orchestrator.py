@@ -376,12 +376,14 @@ def gather_graphrag_evidence(
     sources_per_entity: Optional[int] = None,
     want_authority: Optional[bool] = None,
     role_ranking_retriever: Optional[Callable] = None,
+    response_language: Optional[str] = None,
 ) -> dict:
     """Collect graph + vector + (optional) external authority evidence.
 
     Returns:
         {
           "question", "language",
+          "question_language", "response_language",
           "graph":    Evidence(kind='graph'),
           "vector":   Evidence(kind='vector'),
           "external": Evidence(kind='external'),
@@ -404,6 +406,23 @@ def gather_graphrag_evidence(
     fetches stay sequential (bounded, provider-friendly — no unbounded
     concurrency).
 
+    Language split (work order
+    CLAUDE_CODE_MIXED_SCRIPT_LANGUAGE_DETECTION_AND_ROUTING.md §3/Phase 3):
+    the positional `language` argument is the QUESTION language — it is
+    forwarded to `vector_retriever` for vector-index selection, exactly as
+    before. `response_language` (new, keyword-only, optional) is the FINAL
+    output language: it is forwarded to the external authority fetcher (its
+    `language` argument, e.g. for a localized authority label) and is what
+    coverage-note consumers should use when rendering
+    `format_evidence_for_prompt()`/`build_citations()` afterward. When
+    `response_language` is omitted, it defaults to `language` — this is a
+    silent-behavior-PRESERVING default: every existing single-language
+    caller (`gather_graphrag_evidence(question, "ko", ...)`) keeps working
+    exactly as before, since question and response language are then the
+    same value throughout, identical to pre-split behavior. The graph
+    retriever never receives a language-driven translation of `question` —
+    only the raw question text, unaffected by this split.
+
     Ranking/aggregation routing (graph-ranking-reliability work order §3
     P0-B/P0-D): when `question` is a detected corpus-wide rank/count
     question naming a registered role (currently just "king" — see
@@ -416,6 +435,9 @@ def gather_graphrag_evidence(
     triggers external lookups, and when an explicit external-source request
     IS present, enrichment is scoped to the ranking winner(s) only — never
     the full candidate cohort."""
+    question_language = language
+    resp_language = response_language if response_language is not None else question_language
+
     graph_retriever = graph_retriever or _default_graph_retriever
     vector_retriever = vector_retriever or _default_vector_retriever
     authority_fetcher = authority_fetcher or _default_authority_fetcher
@@ -435,12 +457,12 @@ def gather_graphrag_evidence(
             return role_ranking_retriever(_role)
 
         graph_ev, graph_status = _safe_retrieve(
-            _ranking_graph_retriever, question, language, history_text, "graph")
+            _ranking_graph_retriever, question, question_language, history_text, "graph")
     else:
         graph_ev, graph_status = _safe_retrieve(
-            graph_retriever, question, language, history_text, "graph")
+            graph_retriever, question, question_language, history_text, "graph")
     vector_ev, vector_status = _safe_retrieve(
-        vector_retriever, question, language, history_text, "vector")
+        vector_retriever, question, question_language, history_text, "vector")
 
     entities = collect_entities(graph_ev, vector_ev)
     persons = [e for e in entities if (e.node_type or "Person") == "Person"]
@@ -457,7 +479,7 @@ def gather_graphrag_evidence(
         persons_for_authority = [e for e in persons if e.node_id in winner_ids]
         places_for_authority: list = []
     else:
-        intent = authority_intent(question, language)
+        intent = authority_intent(question, resp_language)
         persons_for_authority = persons
         places_for_authority = places
 
@@ -494,7 +516,7 @@ def gather_graphrag_evidence(
                     continue    # cap reached — counted, reported, not fetched
             hit = _enrich_entity(
                 entity, node_type, external_ev, seen, authority_fetcher,
-                language, max_sources,
+                resp_language, max_sources,
             )
             if hit:
                 enriched += 1
@@ -516,7 +538,10 @@ def gather_graphrag_evidence(
 
     return {
         "question": question,
-        "language": language,
+        "language": language,               # unchanged: whatever the caller
+                                             # passed positionally (= question_language)
+        "question_language": question_language,
+        "response_language": resp_language,
         "graph": graph_ev,
         "vector": vector_ev,
         "external": external_ev,

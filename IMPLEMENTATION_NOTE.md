@@ -59,6 +59,19 @@ Covers four work orders, applied in sequence:
     a custom `document_prompt` and now reuses graphRAG's deterministic
     Sources-assembly boundary instead of letting the LLM write its own. See
     "Section 9" below.
+11. **Mixed-script language detection and routing**
+    (`CLAUDE_CODE_MIXED_SCRIPT_LANGUAGE_DETECTION_AND_ROUTING.md`) —
+    replaced the character-priority-order `detect_language()`
+    (한글→한자→라틴, first script found wins) with a grammar-signal-scored
+    classifier (new `tools/language_policy.py`) so a sentence's own grammar
+    always outranks an inserted entity name's script (`How is 杜甫
+    critiqued?` is now correctly `en`, not `zh`); split the single
+    `effective_language` state into `question_language` (search/index
+    selection) and `response_language` (final output/citations/errors),
+    with `effective_language` kept as a `response_language` compatibility
+    alias; language-control phrases ("Answer in Korean:", "영어로
+    답변해줘.") are now stripped from the text used for retrieval. See
+    "Section 10" below.
 
 ## Section 6 — All-node source link coverage (work order 6)
 
@@ -1206,3 +1219,268 @@ response, not just a hand-built fixture.
    was not ported to vectorRAG, consistent with the work order's own
    explicit non-goal ("검색된 모든 graph provenance를 본문 사용 여부로
    추가 필터링하는 정책" is out of scope).
+
+## Section 10 — Mixed-script language detection and routing (work order 11)
+
+(`CLAUDE_CODE_MIXED_SCRIPT_LANGUAGE_DETECTION_AND_ROUTING.md`) — the
+existing `bot.py::detect_language()` picked a language by FIRST SCRIPT
+FOUND (한글 → 한자 → 라틴, in that priority order), so a single inserted
+Chinese entity name could outvote an entire English sentence:
+`How is 杜甫 critiqued?` was misclassified `zh`, which then queried the
+Chinese vector index and could steer the whole answer into Chinese. This
+work order replaces that character-priority heuristic with a grammar-signal
+score, and separates "what language to search with" from "what language to
+answer in" — a single question can legitimately need both, once a user
+locks a response language ("Answer in Korean: How is 杜甫 critiqued?").
+
+### New pure module: `tools/language_policy.py`
+
+No streamlit/agent/text_rag/Neo4j/LangChain/LLM import — stdlib only
+(`re`, `unicodedata`, `dataclasses`, `typing`), so it is fully unit-testable
+without triggering `bot.py`'s page-config/auth side effects.
+
+- **`detect_question_language(text)`** — scores each of ko/en/zh as
+  `grammar_matches * GRAMMAR_WEIGHT(5) + min(content_units, CONTENT_CAP(6))`
+  and returns the highest-scoring language. Grammar signals: English
+  question words/copulas/imperatives (`who/what/how/is/are/tell me/...`,
+  word-boundary + case-insensitive); Korean question words/sentence
+  endings (`누구/어떻게/-는가/-나요/...`) plus a hangul-attached PARTICLE
+  check (`[가-힣](은|는|이|가|을|를|에서|에게)(?=[^가-힣]|$)` — requires the
+  particle to be attached to an actual Korean word, so `Fu는` or `(杜甫)는`
+  never fires just because a bracketed/Latin-suffixed name happens to
+  precede it); Chinese question/narrative markers (`如何/评价/什么/谁/...`,
+  both simplified and traditional) plus sentence-final particles
+  (`吗/嗎/呢`). Content signals: Latin word-token count (a run of
+  ASCII + Latin-1 Supplement/Extended-A/B letters with internal
+  apostrophes, so `Ch'ongnim`/`Hŏ` count as ONE token, matching this
+  project's McCune-Reischauer spellings), Hangul syllable count
+  (`[가-힣]`), Han character count (`[㐀-䶿一-鿿]`). Tie-break (§4.5):
+  highest score → most grammar matches → most content units → fixed
+  `ko → zh → en` order on a full tie (implemented by listing candidates in
+  that order and using Python's `max()`, which keeps the FIRST maximal item
+  — deterministic regardless of dict/set iteration order) → `ko` when there
+  is no script signal at all (digits/emoji/punctuation only).
+- **`detect_language_control(text)` / `remove_language_control(text, spans)`**
+  — port the pre-existing `bot.py::EXPLICIT_LOCK_PATTERNS`/
+  `RELEASE_LOCK_PATTERNS` (same trigger set, same first-match-wins
+  semantics) into this module as the single source of truth, extended so a
+  match's span can be removed cleanly: Korean lock patterns now absorb the
+  trailing verb conjugation and sentence terminator
+  (`영어로 답변해줘.` → the WHOLE clause, not just `영어로 답변`), and the
+  `请用<lang>` Chinese forms are tried BEFORE the bare `用<lang>` forms so
+  `请用英文回答。` is captured as one span instead of leaving a dangling
+  `请` behind (the bare-form regex would otherwise match starting at `用`,
+  since `.search()` doesn't require a match at position 0). A generic
+  leading/trailing punctuation+whitespace cleanup handles the remaining
+  cases (e.g. `Answer in Korean: ...` leaves a bare `:` that the English
+  patterns don't need to special-case).
+- **`resolve_languages(prompt, locked_language=None)`** — returns a
+  `LanguageResolution(original_prompt, question_text, question_language,
+  response_language, locked_language, action, control_only, debug_info)`.
+  `action` is `"lock"` when a lock phrase is present (even if a release
+  phrase ALSO matched in the same message — lock wins, per work order
+  §6.3), `"release"` when only a release phrase matched, else `"none"`.
+  `control_only` is true when nothing but the control phrase was left in
+  the text after stripping — bot.py uses this to skip the RAG backend
+  entirely for a pure "change my language setting" message.
+
+**Live-verified against the exact reproduction input**, both at the pure
+function level and through the full `bot.py`-simulated session-state →
+`agent.generate_response()` path (real Neo4j Cypher generation, real
+Gemini call):
+
+```text
+"How is 杜甫 critiqued?"
+  question_text = "How is 杜甫 critiqued?"   (nothing to strip)
+  question_language = en                      (was "zh" before this fix)
+  response_language = en
+  → generated Cypher matched on subject.nameChi CONTAINS '杜甫' (correct —
+    that's the entity lookup, unrelated to response language) and the
+    FINAL ANSWER was written in English, as required.
+```
+
+### Session-state contract (`bot.py`)
+
+Three keys now coexist: `question_language` (vector-index selection),
+`response_language` (LLM directive/Sources/citation order/error text/
+external-authority locale), `locked_language` (the `response_language`
+override once a user says "answer in X"). `effective_language` is kept,
+always equal to `response_language` — every pre-existing reader of
+`effective_language` (fallback tests, other modules not yet migrated)
+keeps working unchanged. The real regex/scoring logic that used to live in
+`bot.py` (`detect_language`, `EXPLICIT_LOCK_PATTERNS`,
+`RELEASE_LOCK_PATTERNS`, `detect_explicit_lock`, `detect_release_request`)
+is now a thin wrapper delegating to `tools.language_policy` — kept for any
+other code that might still reference those names, with a lazy
+(function-body-local) import so `bot.py`'s pre-existing "never import
+`tools.*` at module top level" hardening rule (Phase 2 auth-gated lazy
+init, `tests/test_phase2_auth_init.py`) is not violated even though
+`tools.language_policy` itself has zero heavy side effects.
+
+Control-only turns (e.g. "Answer in English", "자동 언어 감지") get a new
+deterministic, localized confirmation message (`_LOCK_ONLY_CONFIRMATION`/
+`_RELEASE_ONLY_CONFIRMATION` in `bot.py`) and never reach
+`agent.generate_response()`/`text_rag.generate_text_rag_response()` — no
+Sources section, no graph/vector/external call.
+
+### graphRAG propagation (`agent.py`, `tools/orchestrator.py`, `tools/vector.py`)
+
+- `agent.synthesize_answer(user_input, response_language,
+  question_language=None)` — `question_language` is new and OPTIONAL,
+  defaulting to `response_language` when omitted (silent-behavior-preserving
+  for any caller still passing a single language value).
+  `gather_graphrag_evidence` is called with `question_language` positionally
+  (unchanged slot) and the new `response_language=` keyword; retrieval
+  failure messages, evidence formatting, citations, and final assembly all
+  use `response_language`.
+- `agent.generate_response(user_input)` reads BOTH
+  `st.session_state["response_language"]` (falling back to
+  `effective_language`) and `st.session_state["question_language"]`
+  (falling back to the resolved response language), then passes both
+  through — including into the legacy ReAct fallback path, whose
+  `language_directive` uses `response_language` while `Action Input:` still
+  carries the untranslated `user_input` (which is already `question_text`
+  by the time it reaches `agent.py`, since `bot.py` passes
+  `resolution.question_text`, never the raw prompt).
+- `tools.orchestrator.gather_graphrag_evidence()` gained an optional
+  keyword-only `response_language` (default: equal to the positional
+  `language` argument — this is the exact backward-compatibility mechanism:
+  every existing single-language caller, including every retriever lambda
+  signature already exercised by `tests/test_pipeline.py`, is completely
+  unaffected). The positional `language` argument's role is unchanged
+  (question/vector-index language, forwarded to `vector_retriever` exactly
+  as before); the new `response_language` is forwarded to the external
+  authority fetcher's `language` argument and returned in the result dict
+  as both `question_language` and `response_language` (plus the original
+  `language` key, untouched, for any code still reading it). The graph
+  retriever was already language-agnostic (`_default_graph_retriever`
+  ignores its `language` parameter entirely) — no change needed there
+  beyond confirming it stays that way.
+- `tools/vector.py`: `get_poetry_plot()` (the legacy ReAct tool) now selects
+  its retriever via `question_language` (falling back to
+  `effective_language` for old sessions) while `_build_prompt()` uses
+  `response_language` (same fallback chain) — previously both read the same
+  `effective_language` key, which is exactly the bug this phase closes for
+  the legacy path too. `retrieve_sihwa_evidence(query, language=None)`'s
+  docstring now states explicitly that `language` here means
+  QUESTION/INDEX language, not response language; its session-state
+  fallback (only exercised by direct/legacy callers — the orchestrator
+  always passes `language` explicitly) now prefers `question_language` over
+  `effective_language`.
+
+### Independent vectorRAG propagation (`text_rag.py`, `tools/vectorrag_prompt.py`)
+
+The pre-existing `_get_text_retriever_for_lang(lang)` baked
+`prepare_documents_for_prompt(docs, lang)` INTO the cached per-language
+Runnable closure — harmless when question and response language were
+always the same value, but wrong the moment they split: the cached
+retriever would keep preparing documents (and therefore ordering quoted
+text) in whatever language it was FIRST built for, regardless of the
+CURRENT turn's actual response language.
+
+Fix: the cache now holds only `(lambda x: x["input"]) | base_retriever`,
+keyed by `question_language`. `generate_text_rag_response()` appends
+`RunnableLambda(lambda docs: prepare_documents_for_prompt(docs,
+response_language))` FRESH on every call, and passes `response_language`
+into both `_build_prompt()` (now takes it as an explicit parameter instead
+of reading `st.session_state` internally, so it can never drift from what
+the caller already resolved) and `document_prompt_for_lang()`.
+`generate_text_rag_response()` itself gained optional `response_language`/
+`question_language` parameters (mirroring `agent.synthesize_answer`'s
+pattern), defaulting to session-state reads when omitted — `bot.py`'s
+existing single-argument call site (`generate_text_rag_response(message)`)
+is unaffected.
+
+**Live-verified the exact split combination the work order mandates**
+(`question_language=en, response_language=ko`): a real Gemini call against
+the real `EntryTextsEng` vector index produced a Korean-language answer
+(the model translated the retrieved English source text into Korean prose,
+as instructed) with the `## 출처` Sources header appearing exactly once.
+
+### Phase 5 — downstream policy preserved, verified not modified
+
+`rag_config.py`, `tools/synthesis.py`, `tools/answer_renderer.py`, and
+`tools/external_authority.py` were not touched in this work order (`git
+status` confirms only `agent.py`, `bot.py`, `text_rag.py`,
+`tools/orchestrator.py`, `tools/vector.py` were modified, plus the new
+`tools/language_policy.py`) — `INDEX_BY_LANG` is unchanged, no new
+language was added beyond ko/en/zh, the response-language-ordered source
+text priority from work order 10 is untouched, and external-authority
+API/URL/cap selection logic is untouched (only the `language` VALUE now
+reaching it via `response_language` changed, not the logic that consumes
+it).
+
+### Files changed / added (work order 11)
+
+- New: `tools/language_policy.py`, `tests/test_language_policy.py`,
+  `tests/test_language_routing.py`.
+- Modified: `bot.py` (resolve_languages wiring, control-only handling,
+  compat wrappers), `agent.py` (`synthesize_answer`/`generate_response`
+  question/response split), `tools/orchestrator.py`
+  (`gather_graphrag_evidence`'s `response_language` keyword),
+  `tools/vector.py` (`get_poetry_plot`/`_build_prompt`/
+  `retrieve_sihwa_evidence` split), `text_rag.py` (retriever-cache split,
+  `_build_prompt`/`generate_text_rag_response` explicit `response_language`
+  parameter), `tests/test_deterministic_sources.py` +
+  `tests/test_vectorrag_document_prompt.py` (two stale literal-substring
+  assertions updated for the `user_language` → `response_language` rename;
+  no assertion was weakened, only the searched-for identifier name).
+
+### Test totals (work order 11)
+
+551 → started from 487 (post work-order-10 baseline) and grew to
+**551 tests**, all passing on `python -m unittest discover -s tests
+-p "test_*.py"`. No live Neo4j/Gemini/network access required.
+
+### Live smoke test summary
+
+Beyond the pure-function fixture/matrix verification (§4.6/§9.1/§9.2, all
+passing), three full live end-to-end runs were made (real Neo4j, real
+Gemini):
+1. `agent.generate_response("How is 杜甫 critiqued?")` with
+   `question_language=response_language=en` (as `resolve_languages` itself
+   computed) — generated Cypher, English-language final answer, confirming
+   the exact work-order reproduction case is fixed.
+2. `agent.generate_response("How is Du Fu critiqued in Sihwa Ch'ongnim?")`
+   in the prior (work order 10) session already confirmed the
+   English-grammar/named-citation path; re-run here implicitly via the
+   same code paths.
+3. `text_rag.generate_text_rag_response(question, response_language="ko",
+   question_language="en")` — confirmed the EntryTextsEng index was
+   searched while the final answer, quoting order, and Sources header were
+   Korean.
+`streamlit run bot.py --server.headless true` was also started and
+confirmed to boot with HTTP 200 and no import/runtime errors, then
+stopped.
+
+### Remaining limitations / decisions for the maintainer
+
+1. **Grammar-cue lists are a closed, hand-curated set** (work order §4.2's
+   own recommended minimum) — a question using none of these cues and
+   relying purely on script-content fallback (e.g. a terse phrase with no
+   question word) still resolves correctly via the content-count fallback,
+   but a maintainer adding new phrasing patterns to the assistant's
+   supported question styles should extend `_EN_GRAMMAR_WORDS`/
+   `_KO_GRAMMAR_PHRASES`/`_ZH_GRAMMAR_PHRASES` deliberately, the same way
+   this work order did, rather than assuming the content-count fallback
+   alone will keep disambiguating correctly as more mixed-script questions
+   are added.
+2. **NFC normalization is applied to the DETECTION working copy only**;
+   span removal for control-phrase stripping operates on the ORIGINAL
+   (non-normalized) text for simplicity, since real user input is
+   overwhelmingly already NFC-composed in practice. An NFD-typed control
+   phrase (rare) would still be correctly DETECTED (detection normalizes
+   first) but its span might not align perfectly against the original
+   string in a pathological case; this was judged an acceptable, documented
+   simplification given no fixture in the work order exercises NFD control
+   phrases specifically.
+3. **`_generate_response_react`'s tools (`get_poetry_plot`, `cypher_qa_safe`)
+   still read session state independently** rather than receiving
+   `question_language`/`response_language` as explicit call arguments —
+   `get_poetry_plot` was updated to read the correct NEW session keys
+   (`question_language` for retrieval, `response_language` for its prompt),
+   but this is still an implicit session-state read, not a parameter
+   threaded through the ReAct `AgentExecutor`'s tool-calling machinery
+   (which does not support that without a broader refactor of the tool
+   definitions themselves — out of scope for this work order, and the
+   ReAct path is already documented elsewhere as a rarely-used fallback).

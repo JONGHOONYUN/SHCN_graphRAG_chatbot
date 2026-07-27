@@ -1,6 +1,5 @@
 import hmac
 import logging
-import re
 import uuid
 
 import streamlit as st
@@ -21,76 +20,85 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────
-# 응답 언어 정책
-# 기본: 매 질문마다 그 질문의 언어로 자동 응답 (질문 언어 = 응답 언어).
-# 예외: 사용자가 명시적으로 특정 언어로 답하라고 요청하면 그 언어로 락하고
-#       이후 모든 답변은 질문 언어와 무관하게 락 언어로 생성.
-#       락은 사용자가 다시 다른 언어로 락하거나 명시적으로 해제할 때까지 유지.
+# 언어 판별·제어 정책
+# (work order CLAUDE_CODE_MIXED_SCRIPT_LANGUAGE_DETECTION_AND_ROUTING.md)
+#
+# 실제 판별/제어-구문 regex와 grammar-cue 기반 판별 로직은 전부
+# `tools/language_policy.py`(streamlit/Neo4j/LLM을 import하지 않는 순수 모듈)로
+# 이전되었다. 이 파일은 그 결과를 세션 상태에 반영하는 얇은 wrapper만 둔다.
+#
+# 세 가지 언어 상태:
+#   question_language — 언어 제어 문구를 제거한 실제 질문(question_text)의 언어.
+#                        vector index 선택에 사용.
+#   response_language — 이번 턴 최종 출력 언어. LLM directive/Sources/인용
+#                        순서/오류 문구/external locale에 사용.
+#   locked_language    — 사용자가 세션에 고정한 응답 언어(response_language의
+#                        override). 명시적 lock/release 전까지 유지.
+#
+# `effective_language`는 response_language의 하위 호환 alias로 계속 유지한다
+# (기존 agent.py/text_rag.py/fallback 테스트가 이 키를 읽는 동안의 점진적 마이그
+# 레이션 용도) — 새 코드가 vector index 선택에 이 값을 읽는 것은 금지.
+#
+# NOTE: `tools.language_policy`는 streamlit/Neo4j/LLM을 import하지 않는 순수
+# 모듈이라 그 자체로는 backend 초기화를 유발하지 않지만, 위 Phase 2 하드닝
+# 규칙("bot.py는 tools.* 를 top-level에서 import하지 않는다")과의 일관성을
+# 위해 이 모듈도 lazy import로 유지한다 — 실제 사용 지점(입력 처리 블록)에서만
+# import한다.
 # ──────────────────────────────────────────────
+
+
 def detect_language(text: str) -> str:
-    """질문 문자열의 언어 자동 감지. ko / en / zh, 기본 ko."""
-    if re.search(r"[가-힣]", text):
-        return "ko"
-    if re.search(r"[一-鿿]", text):
-        return "zh"
-    if re.search(r"[A-Za-z]", text):
-        return "en"
-    return "ko"
+    """하위 호환 wrapper. 신규 코드는 `tools.language_policy.detect_question_language`
+    를 직접 사용할 것 — 이 함수는 기존 참조가 있을 경우를 대비해서만 남긴다."""
+    from tools.language_policy import detect_question_language
 
-
-# 명시적 언어 락 요청 패턴. 사용자가 "X 언어로 답해줘"라고 명령한 경우만 매치.
-# 일반 문장에 언어 이름이 우연히 들어간 경우(예: "I love English literature")는
-# 매치되지 않도록 동사·전치사와 결합된 형태만 인식.
-EXPLICIT_LOCK_PATTERNS = [
-    # English
-    (re.compile(r"\b(?:answer|respond|reply|talk|speak|write|chat)\s+(?:to me\s+|with me\s+)?(?:in\s+)?english\b", re.IGNORECASE), "en"),
-    (re.compile(r"\b(?:answer|respond|reply|talk|speak|write|chat)\s+(?:to me\s+|with me\s+)?(?:in\s+)?korean\b", re.IGNORECASE), "ko"),
-    (re.compile(r"\b(?:answer|respond|reply|talk|speak|write|chat)\s+(?:to me\s+|with me\s+)?(?:in\s+)?chinese\b", re.IGNORECASE), "zh"),
-    (re.compile(r"\b(?:please\s+)?use\s+english\b", re.IGNORECASE), "en"),
-    (re.compile(r"\b(?:please\s+)?use\s+korean\b", re.IGNORECASE), "ko"),
-    (re.compile(r"\b(?:please\s+)?use\s+chinese\b", re.IGNORECASE), "zh"),
-    (re.compile(r"\b(?:switch|change)\s+to\s+english\b", re.IGNORECASE), "en"),
-    (re.compile(r"\b(?:switch|change)\s+to\s+korean\b", re.IGNORECASE), "ko"),
-    (re.compile(r"\b(?:switch|change)\s+to\s+chinese\b", re.IGNORECASE), "zh"),
-    (re.compile(r"\bin\s+english\s+(?:please|from now on)\b", re.IGNORECASE), "en"),
-    (re.compile(r"\bin\s+korean\s+(?:please|from now on)\b", re.IGNORECASE), "ko"),
-    (re.compile(r"\bin\s+chinese\s+(?:please|from now on)\b", re.IGNORECASE), "zh"),
-    # Korean
-    (re.compile(r"한국어로\s*(?:대답|답변|응답|답|말)"), "ko"),
-    (re.compile(r"영어로\s*(?:대답|답변|응답|답|말)"), "en"),
-    (re.compile(r"중국어로\s*(?:대답|답변|응답|답|말)"), "zh"),
-    (re.compile(r"(?:앞으로|이제부터|계속)\s*한국어로"), "ko"),
-    (re.compile(r"(?:앞으로|이제부터|계속)\s*영어로"), "en"),
-    (re.compile(r"(?:앞으로|이제부터|계속)\s*중국어로"), "zh"),
-    # Chinese
-    (re.compile(r"用中文\s*(?:回答|回复|说|回應|對話)"), "zh"),
-    (re.compile(r"用英(?:语|文)\s*(?:回答|回复|说|回應|對話)"), "en"),
-    (re.compile(r"用韩(?:语|文)\s*(?:回答|回复|说|回應|對話)"), "ko"),
-    (re.compile(r"请用中文"), "zh"),
-    (re.compile(r"请用英(?:语|文)"), "en"),
-    (re.compile(r"请用韩(?:语|文)"), "ko"),
-]
-
-RELEASE_LOCK_PATTERNS = [
-    re.compile(r"\b(?:remove|cancel|stop|clear|reset|disable)\s+(?:the\s+)?(?:language\s+)?lock\b", re.IGNORECASE),
-    re.compile(r"\bfollow\s+(?:my|the)\s+question\s+language\b", re.IGNORECASE),
-    re.compile(r"\bauto[-\s]?detect\s+language\b", re.IGNORECASE),
-    re.compile(r"언어\s*락\s*(?:해제|취소|초기화|리셋)"),
-    re.compile(r"자동\s*(?:언어\s*감지|감지|판별)"),
-    re.compile(r"(?:跟着|跟随|根据)我的语言"),
-]
+    return detect_question_language(text)
 
 
 def detect_explicit_lock(text: str):
-    """명시적 락 요청 시 'ko'|'en'|'zh' 반환, 없으면 None."""
-    for pattern, lang_code in EXPLICIT_LOCK_PATTERNS:
-        if pattern.search(text):
-            return lang_code
-    return None
+    """하위 호환 wrapper. 신규 코드는 `tools.language_policy.detect_language_control`
+    를 직접 사용할 것."""
+    from tools.language_policy import detect_language_control
+
+    return detect_language_control(text).lock_language
 
 
 def detect_release_request(text: str) -> bool:
-    return any(p.search(text) for p in RELEASE_LOCK_PATTERNS)
+    """하위 호환 wrapper. 신규 코드는 `tools.language_policy.detect_language_control`
+    를 직접 사용할 것."""
+    from tools.language_policy import detect_language_control
+
+    return detect_language_control(text).release
+
+
+# ──────────────────────────────────────────────
+# control-only 턴(언어 lock/release만 있고 실제 질문이 없는 입력)에 대한
+# 결정론적 확인 문구 (work order §6.4). RAG backend를 전혀 호출하지 않고,
+# Sources도 붙이지 않는다.
+# ──────────────────────────────────────────────
+_LOCK_ONLY_CONFIRMATION = {
+    "ko": "알겠습니다. 앞으로 한국어로 답변하겠습니다. 다시 자동 감지로 되돌리려면 "
+          "'자동 언어 감지'라고 말씀해 주세요.",
+    "en": "Got it — I will answer in English from now on. Say \"auto-detect "
+          "language\" any time to switch back to matching each question's language.",
+    "zh": "好的，我将从现在开始用中文回答。如需恢复自动语言检测，请说"
+          "“自动检测语言”。",
+}
+_RELEASE_ONLY_CONFIRMATION = {
+    "ko": "언어 고정을 해제했습니다. 이제부터는 질문 언어에 자동으로 맞춰 답변합니다.",
+    "en": "Language lock released — I will automatically match each question's "
+          "language from now on.",
+    "zh": "已解除语言锁定，现在将根据每个问题的语言自动回答。",
+}
+
+
+def _control_only_response(resolution) -> str:
+    """lock-only/release-only 입력에 대한 결정론적 확인 문구.
+    `resolution.action`이 'lock'/'release' 둘 중 하나임을 호출부가 보장한다
+    (control_only=True인 경우에만 호출됨)."""
+    table = (_LOCK_ONLY_CONFIRMATION if resolution.action == "lock"
+             else _RELEASE_ONLY_CONFIRMATION)
+    return table.get(resolution.response_language, table["ko"])
 
 # Page Config
 st.set_page_config("PoetryTalks", page_icon=":speech_balloon:")
@@ -274,23 +282,38 @@ placeholder = (
     else "의미·주제 기반 질문을 입력해보세요 (텍스트 벡터 검색)"
 )
 if prompt := st.chat_input(placeholder):
-    # 1) 명시적 락/해제 요청 처리
-    explicit_lock = detect_explicit_lock(prompt)
-    if explicit_lock:
-        st.session_state["locked_language"] = explicit_lock
-    elif detect_release_request(prompt):
+    # 1) 언어 상태 해석: 제어 문구 탐지·제거 + question/response/locked 언어 분리.
+    #    control phrase가 포함된 원문 그대로를 검색·evidence에 넘기지 않도록,
+    #    이 시점에 question_text(제어 문구 제거본)를 확정한다.
+    from tools.language_policy import resolve_languages
+
+    resolution = resolve_languages(prompt, st.session_state.get("locked_language"))
+
+    if resolution.locked_language:
+        st.session_state["locked_language"] = resolution.locked_language
+    else:
         st.session_state.pop("locked_language", None)
 
-    # 2) 이번 턴 적용 언어 결정
-    st.session_state["effective_language"] = (
-        st.session_state.get("locked_language") or detect_language(prompt)
-    )
+    st.session_state["question_language"] = resolution.question_language
+    st.session_state["response_language"] = resolution.response_language
+    # 하위 호환 alias — response_language와 항상 동일하게 유지.
+    # 신규 코드가 vector index 선택에 이 값을 읽는 것은 금지(question_language 사용).
+    st.session_state["effective_language"] = resolution.response_language
 
-    # 3) 사용자 메시지 저장 + 즉시 표시
+    # 2) 사용자 메시지 저장 + 즉시 표시 — 화면·이력에는 항상 원문(raw prompt)을 표시.
     st.session_state["messages_by_mode"][chatbot_mode].append(
         {"role": "user", "content": prompt}
     )
     write_message("user", prompt, save=False)
 
-    # 4) 모드별 응답 생성
-    handle_submit(prompt, chatbot_mode)
+    # 3) control-only 입력(실제 질문 없이 언어 lock/release만 있는 경우)은
+    #    RAG backend를 호출하지 않고 결정론적 확인 문구만 반환한다.
+    if resolution.control_only:
+        confirmation = _control_only_response(resolution)
+        st.session_state["messages_by_mode"][chatbot_mode].append(
+            {"role": "assistant", "content": confirmation}
+        )
+        write_message("assistant", confirmation, save=False)
+    else:
+        # 4) 모드별 응답 생성 — 검색·평가에는 제어 문구가 제거된 question_text를 사용.
+        handle_submit(resolution.question_text, chatbot_mode)

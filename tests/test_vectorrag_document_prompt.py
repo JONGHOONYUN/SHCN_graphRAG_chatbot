@@ -202,7 +202,7 @@ class TestTextRagSourceContract(unittest.TestCase):
         self.assertIn("entry_name_eng: node.nameEng", self.src)
 
     def test_document_prompt_passed_to_stuff_chain(self):
-        self.assertIn("document_prompt=document_prompt_for_lang(user_language)", self.src)
+        self.assertIn("document_prompt=document_prompt_for_lang(response_language)", self.src)
 
     def test_model_instructed_not_to_write_sources(self):
         self.assertIn("Sources", self.src)
@@ -210,8 +210,8 @@ class TestTextRagSourceContract(unittest.TestCase):
 
     def test_context_normalized_via_docs_to_evidence_and_shared_assembly(self):
         self.assertIn("docs_to_evidence(result.get(\"context\")", self.src)
-        self.assertIn("build_citations(evidence_dict, user_language)", self.src)
-        self.assertIn("assemble_final_answer(body, citations, user_language", self.src)
+        self.assertIn("build_citations(evidence_dict, response_language)", self.src)
+        self.assertIn("assemble_final_answer(body, citations, response_language", self.src)
 
     def test_protected_identifiers_unchanged(self):
         # These names/suffixes must survive untouched (work order §9 /

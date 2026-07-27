@@ -82,11 +82,20 @@ RETURN
 """
 
 
-# 언어별 retriever lazy 캐시
+# 언어별 retriever lazy 캐시 — 캐시 key와 index 선택은 항상
+# question_language(검색 언어)다. 응답 언어(response_language)는 이 캐시된
+# 객체와 무관하게 매 호출 시점에 별도로 적용된다 (work order
+# CLAUDE_CODE_MIXED_SCRIPT_LANGUAGE_DETECTION_AND_ROUTING.md §4 Phase 4
+# item 2) — question_language != response_language인 턴에서 인용 순서가
+# "검색에 쓰인 언어"로 고정되어 버리는 문제를 피하기 위해, 문서 준비
+# (`prepare_documents_for_prompt`)를 더 이상 이 캐시된 lambda 안에 굽지 않는다.
 _retrievers: dict = {}
 
 
 def _get_text_retriever_for_lang(lang: str):
+    """`lang` (= question_language)에 대응하는, 캐시된 "입력 문자열 추출 →
+    벡터 retriever" 파이프라인만 반환한다. 문서 metadata 준비는 의도적으로
+    포함하지 않는다 — 그건 response_language에 좌우되는 별도 단계다."""
     cfg = index_config_for(lang)
     if lang not in _retrievers:
         neo4jvector = Neo4jVector.from_existing_index(
@@ -100,16 +109,11 @@ def _get_text_retriever_for_lang(lang: str):
         )
         base_retriever = neo4jvector.as_retriever(search_kwargs={"k": TOP_K})
         # `create_retrieval_chain` only auto-extracts `x["input"]` for a bare
-        # `BaseRetriever`; this cached object is a composite Runnable (to
-        # additionally prepare each Document's prompt-ready metadata via
-        # `tools.vectorrag_prompt.prepare_documents_for_prompt`), so the
-        # extraction step is included explicitly here — see
-        # `generate_text_rag_response`.
-        _retrievers[lang] = (
-            (lambda x: x["input"])
-            | base_retriever
-            | RunnableLambda(lambda docs: prepare_documents_for_prompt(docs, lang))
-        )
+        # `BaseRetriever`; this cached object is already a composite
+        # Runnable (kept that way so a further step can be appended at call
+        # time without re-wrapping), so the extraction step is included
+        # here explicitly — see `generate_text_rag_response`.
+        _retrievers[lang] = (lambda x: x["input"]) | base_retriever
     return _retrievers[lang]
 
 
@@ -123,8 +127,13 @@ FALLBACK_HINT = {
 }
 
 
-def _build_prompt():
-    """호출 시점의 effective_language를 반영한 ChatPromptTemplate 생성.
+def _build_prompt(response_language: str):
+    """`response_language`(이번 턴 최종 출력 언어)를 반영한 ChatPromptTemplate
+    생성. work order
+    CLAUDE_CODE_MIXED_SCRIPT_LANGUAGE_DETECTION_AND_ROUTING.md §5.2 라우팅
+    계약에 따라 검색 index 언어(question_language)와는 독립적으로 전달받는다
+    — 세션 상태를 직접 읽지 않아 호출부(`generate_text_rag_response`)가
+    이미 확정한 값과 어긋날 일이 없다.
 
     work order CLAUDE_CODE_LANGUAGE_AWARE_QUOTES_AND_NAMED_SOURCES.md §4
     Phase 4: the model writes the answer BODY only — Sources is assembled
@@ -137,9 +146,8 @@ def _build_prompt():
     whose three parallel-language texts are PRE-ORDERED into this session's
     response-language priority (work order §3.1) — the model must not
     reorder them back."""
-    user_language = st.session_state.get("effective_language", "ko")
-    label = _LANGUAGE_LABEL.get(user_language, _LANGUAGE_LABEL["ko"])
-    fallback = FALLBACK_HINT.get(user_language, FALLBACK_HINT["ko"])
+    label = _LANGUAGE_LABEL.get(response_language, _LANGUAGE_LABEL["ko"])
+    fallback = FALLBACK_HINT.get(response_language, FALLBACK_HINT["ko"])
 
     system_msg = (
         f"이번 답변은 반드시 {label}로 작성하세요. "
@@ -183,9 +191,22 @@ def _get_memory(session_id):
     return Neo4jChatMessageHistory(session_id=session_id, graph=graph)
 
 
-def generate_text_rag_response(user_input: str) -> str:
+def generate_text_rag_response(user_input: str,
+                               response_language: str = None,
+                               question_language: str = None) -> str:
     """textRAG 모드의 사용자 응답 생성 엔트리포인트.
     bot.py에서 mode=='textRAG'일 때 호출된다.
+
+    work order CLAUDE_CODE_MIXED_SCRIPT_LANGUAGE_DETECTION_AND_ROUTING.md
+    §4 Phase 4: `question_language`(검색 index 선택)와 `response_language`
+    (최종 출력/인용 순서/Sources 언어)를 분리한다. 둘 다 생략하면 세션 상태
+    (`question_language`/`response_language`, 없으면 `effective_language`
+    하위 호환 alias)에서 읽는다 — 기존 `bot.py`가 `generate_text_rag_response(
+    message)`처럼 인자 없이 호출하는 방식을 그대로 지원하는 하위 호환 기본값.
+    `question_language`가 생략되고 세션에도 없으면 `response_language`와
+    같다고 가정한다(분리 이전과 동일한 단일 언어 동작).
+
+    `user_input`은 이미 언어 제어 문구가 제거된 question_text여야 한다.
 
     work order CLAUDE_CODE_LANGUAGE_AWARE_QUOTES_AND_NAMED_SOURCES.md §4
     Phase 4: the LLM writes ONLY the answer body (`_build_prompt` rule 3).
@@ -194,11 +215,23 @@ def generate_text_rag_response(user_input: str) -> str:
     assembly boundary graphRAG uses (`build_citations()` +
     `assemble_final_answer()`), so Sources is built by code exactly once,
     regardless of anything the model wrote in a Sources-shaped section."""
-    user_language = st.session_state.get("effective_language", "ko")
+    if response_language is None:
+        response_language = (st.session_state.get("response_language")
+                             or st.session_state.get("effective_language", "ko"))
+    if question_language is None:
+        question_language = st.session_state.get("question_language") or response_language
 
-    retriever = _get_text_retriever_for_lang(user_language)
+    # 캐시된 base retriever는 question_language(검색 index)로 선택하고,
+    # 문서 metadata 준비(`prepare_documents_for_prompt`)는 response_language로
+    # 매 호출마다 새로 적용한다 — 캐시된 lambda 안에 굽지 않는다(work order
+    # §4 Phase 4 item 2).
+    base_retriever = _get_text_retriever_for_lang(question_language)
+    retriever = base_retriever | RunnableLambda(
+        lambda docs: prepare_documents_for_prompt(docs, response_language))
+
     doc_chain = create_stuff_documents_chain(
-        llm, _build_prompt(), document_prompt=document_prompt_for_lang(user_language))
+        llm, _build_prompt(response_language),
+        document_prompt=document_prompt_for_lang(response_language))
     retrieval_chain = create_retrieval_chain(retriever, doc_chain)
 
     # 이력 유지가 필요하면 RunnableWithMessageHistory로 감싼다.
@@ -222,17 +255,17 @@ def generate_text_rag_response(user_input: str) -> str:
     except ValueError as e:
         # Gemini 빈 스트림 응답 등 — graphRAG와 동일하게 graceful 처리
         if "No generation chunks were returned" in str(e):
-            return FALLBACK_HINT.get(user_language, FALLBACK_HINT["ko"])
+            return FALLBACK_HINT.get(response_language, FALLBACK_HINT["ko"])
         raise
 
     body = result.get("answer") or ""
     if not body.strip():
-        return FALLBACK_HINT.get(user_language, FALLBACK_HINT["ko"])
+        return FALLBACK_HINT.get(response_language, FALLBACK_HINT["ko"])
 
     evidence = docs_to_evidence(result.get("context") or [])
     evidence_dict = {"graph": None, "vector": evidence, "external": None}
-    citations = build_citations(evidence_dict, user_language)
+    citations = build_citations(evidence_dict, response_language)
     node_refs = [r.to_dict() for r in collect_node_references(evidence)]
     link_targets = [e.to_dict() for e in evidence.entities] + node_refs
 
-    return assemble_final_answer(body, citations, user_language, entities=link_targets)
+    return assemble_final_answer(body, citations, response_language, entities=link_targets)
