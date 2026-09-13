@@ -121,8 +121,11 @@ class TestBaseUrlSingleSource(unittest.TestCase):
         self.assertEqual(POETRYTALKS_BASE_URL, "https://poetrytalks.org/")
 
     def test_vector_and_cypher_import_the_constant(self):
+        # The URL-constructing code moved into the retrieval layer
+        # (large-module modularization work order Phases 4.1 / 5.1); the
+        # single-source assertions below are unchanged.
         vector_src = _read("tools/vector.py")
-        cypher_src = _read("tools/cypher.py")
+        cypher_src = _read("chatbot/retrieval/graph_prompt.py")
         self.assertIn("from tools.evidence import POETRYTALKS_BASE_URL", vector_src)
         self.assertIn("POETRYTALKS_BASE_URL", cypher_src)
 

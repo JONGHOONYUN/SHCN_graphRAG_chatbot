@@ -191,27 +191,38 @@ class TestVectorRagDeterministicAssembly(unittest.TestCase):
 
 
 class TestTextRagSourceContract(unittest.TestCase):
-    """Static checks on text_rag.py's actual source (never imported — see
-    module docstring) confirming Phase 4's wiring is really in place."""
+    """Static checks on the textRAG path's actual source (never imported —
+    see module docstring) confirming Phase 4's wiring is really in place.
+
+    The retrieval_query projection and the prompt/chain/assembly wiring moved
+    out of `text_rag.py` into `chatbot/retrieval/vector_query.py` and
+    `chatbot/application/vectorrag_pipeline.py` (large-module modularization
+    work order Phase 5.1/5.3); `text_rag.py` remains the entry point and
+    composition root. The assertions below are unchanged — only the file
+    that owns each piece did."""
 
     def setUp(self):
         self.src = _read("text_rag.py")
+        self.query_src = _read("chatbot/retrieval/vector_query.py")
+        self.pipeline_src = _read("chatbot/application/vectorrag_pipeline.py")
 
     def test_entry_name_fields_added_to_retrieval_query(self):
-        self.assertIn("entry_name_kor: node.nameKor", self.src)
-        self.assertIn("entry_name_eng: node.nameEng", self.src)
+        self.assertIn("entry_name_kor: node.nameKor", self.query_src)
+        self.assertIn("entry_name_eng: node.nameEng", self.query_src)
 
     def test_document_prompt_passed_to_stuff_chain(self):
-        self.assertIn("document_prompt=document_prompt_for_lang(response_language)", self.src)
+        self.assertIn("document_prompt=document_prompt_for_lang(response_language)",
+                      self.pipeline_src)
 
     def test_model_instructed_not_to_write_sources(self):
-        self.assertIn("Sources", self.src)
-        self.assertIn("직접 작성하지 마세요", self.src)
+        self.assertIn("Sources", self.pipeline_src)
+        self.assertIn("직접 작성하지 마세요", self.pipeline_src)
 
     def test_context_normalized_via_docs_to_evidence_and_shared_assembly(self):
-        self.assertIn("docs_to_evidence(result.get(\"context\")", self.src)
-        self.assertIn("build_citations(evidence_dict, response_language)", self.src)
-        self.assertIn("assemble_final_answer(body, citations, response_language", self.src)
+        self.assertIn("docs_to_evidence(result.get(\"context\")", self.pipeline_src)
+        self.assertIn("build_citations(evidence_dict, response_language)", self.pipeline_src)
+        self.assertIn("assemble_final_answer(body, citations, response_language",
+                      self.pipeline_src)
 
     def test_protected_identifiers_unchanged(self):
         # These names/suffixes must survive untouched (work order §9 /

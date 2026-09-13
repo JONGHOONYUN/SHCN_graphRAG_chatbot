@@ -263,6 +263,11 @@ class TestAgentSourceCarriesLanguageSplit(unittest.TestCase):
 
     def setUp(self):
         self.src = _read("agent.py")
+        # The pipeline body moved to `chatbot/application/graphrag_pipeline.py`
+        # (large-module modularization work order Phase 8.2); `agent.py` keeps
+        # the public entry point, the session-state reads, and the
+        # backward-compatible language default.
+        self.pipeline_src = _read("chatbot/application/graphrag_pipeline.py")
 
     def test_synthesize_answer_accepts_question_language_with_backward_compat_default(self):
         self.assertIn(
@@ -277,7 +282,7 @@ class TestAgentSourceCarriesLanguageSplit(unittest.TestCase):
             "evidence = gather_graphrag_evidence(\n"
             "        user_input, question_language, history_text=history_text or None,\n"
             "        response_language=response_language)",
-            self.src,
+            self.pipeline_src,
         )
 
     def test_generate_response_reads_both_session_keys_with_fallback(self):

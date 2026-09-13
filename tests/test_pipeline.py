@@ -879,7 +879,11 @@ class TestGraphAndPrompts(unittest.TestCase):
     def test_cypher_template_has_no_unintended_variables(self):
         from langchain_core.prompts import PromptTemplate
 
-        template = _extract_module_string("tools/cypher.py", "CYPHER_GENERATION_TEMPLATE")
+        # Prompt text owner moved to the retrieval layer (large-module
+        # modularization work order Phase 4.1); the brace-escaping contract
+        # asserted below is unchanged.
+        template = _extract_module_string(
+            "chatbot/retrieval/graph_prompt.py", "CYPHER_GENERATION_TEMPLATE")
         self.assertIsNotNone(template)
         pt = PromptTemplate.from_template(template)
         self.assertEqual(set(pt.input_variables), {"schema", "question"})
@@ -935,10 +939,13 @@ class TestConversationHistory(unittest.TestCase):
         self.assertIn("not evidence", rules)
         self.assertIn("clarification", rules)
         self.assertIn("pretraining", rules)
-        # agent.py wires the rules + history into the synthesis prompt
-        agent_src = _read("agent.py")
-        self.assertIn("HISTORY_RULES", agent_src)
-        self.assertIn("{chat_history}", agent_src)
+        # The synthesis prompt wires the rules + history together. Its text
+        # moved from `agent.py` to `chatbot/synthesis/prompt.py` (large-module
+        # modularization work order Phase 8.2); agent.py now only binds that
+        # prompt to this process's LLM.
+        prompt_src = _read("chatbot/synthesis/prompt.py")
+        self.assertIn("HISTORY_RULES", prompt_src)
+        self.assertIn("{chat_history}", prompt_src)
 
     def test_history_passed_to_graph_retriever_only(self):
         received = {}
@@ -960,11 +967,15 @@ class TestConversationHistory(unittest.TestCase):
         self.assertEqual(received["vector"], "called")
 
     def test_graphrag_history_namespace_isolated(self):
+        # agent.py owns the `::graphRAG` history handle (composition root);
+        # the normal-path write moved with the pipeline body to
+        # chatbot/application/graphrag_pipeline.py (Phase 8.2).
         agent_src = _read("agent.py")
         self.assertIn("::graphRAG", agent_src)
         self.assertNotIn("::textRAG", agent_src)          # never mixed
-        self.assertIn("add_user_message", agent_src)       # normal-path owner
-        self.assertIn("add_ai_message", agent_src)
+        pipeline_src = _read("chatbot/application/graphrag_pipeline.py")
+        self.assertIn("add_user_message", pipeline_src)    # normal-path owner
+        self.assertIn("add_ai_message", pipeline_src)
         text_src = _read("text_rag.py")
         self.assertIn("::textRAG", text_src)
         self.assertNotIn("::graphRAG", text_src)

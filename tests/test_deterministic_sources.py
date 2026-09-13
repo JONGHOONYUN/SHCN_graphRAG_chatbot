@@ -230,7 +230,12 @@ class TestDeterministicAssembly(unittest.TestCase):
         self.assertEqual(final, "본문.")
 
     def test_agent_owns_assembly_and_saves_assembled_output(self):
-        src = open("agent.py", encoding="utf-8").read()
+        # The graphRAG pipeline body moved from `agent.py` to
+        # `chatbot/application/graphrag_pipeline.py` (large-module
+        # modularization work order Phase 8.2); `agent.py` remains the
+        # composition root. The ordering assertions below are unchanged.
+        src = open("chatbot/application/graphrag_pipeline.py",
+                   encoding="utf-8").read()
         self.assertIn("assemble_final_answer(", src)
         # the assembled output (not the raw LLM body) goes to history
         self.assertLess(src.index("assemble_final_answer("),

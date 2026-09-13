@@ -72,12 +72,16 @@ class TestSystemRulesForbidStrippingUrls(unittest.TestCase):
 
 
 class TestAgentHumanMessageDemandsVerbatimReproduction(unittest.TestCase):
-    """Regression-guard the agent.py synthesis_prompt human message so a
-    future refactor can't quietly loosen the reproduction instruction."""
+    """Regression-guard the synthesis prompt's human message so a future
+    refactor can't quietly loosen the reproduction instruction.
+
+    The prompt text moved from `agent.py` to `chatbot/synthesis/prompt.py`
+    (large-module modularization work order Phase 8.2); the assertion below
+    is unchanged."""
 
     def test_message_uses_strong_verb(self):
         import re
-        src = open("agent.py", encoding="utf-8").read()
+        src = open("chatbot/synthesis/prompt.py", encoding="utf-8").read()
         # The frame must include an imperative telling the model to copy
         # the pre-built citations bullet-for-bullet.
         self.assertRegex(

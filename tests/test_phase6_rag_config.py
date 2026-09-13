@@ -73,14 +73,17 @@ class TestNoDuplicateInTextRagPy(unittest.TestCase):
 
 
 class TestTextRagRetrievalMetadataContract(unittest.TestCase):
-    """textRAG must project the public domain ID, not an export/runtime id."""
+    """textRAG must project the public domain ID, not an export/runtime id.
+
+    The retrieval_query builder moved from `text_rag.py` to
+    `chatbot/retrieval/vector_query.py` (large-module modularization work
+    order Phase 5.1); the assertions below are unchanged."""
 
     @staticmethod
     def _builder_source():
-        src = Path("text_rag.py").read_text(encoding="utf-8")
+        src = Path("chatbot/retrieval/vector_query.py").read_text(encoding="utf-8")
         start = src.index("def _build_light_retrieval_query")
-        end = src.index("def _get_text_retriever_for_lang", start)
-        return src[start:end]
+        return src[start:]
 
     def test_entry_and_work_use_uppercase_domain_id(self):
         builder = self._builder_source()

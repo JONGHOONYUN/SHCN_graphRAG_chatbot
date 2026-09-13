@@ -186,12 +186,16 @@ class TestAnswerRendererLinksMrNames(unittest.TestCase):
 
 class TestVectorProjectionSourceHasNoDisplayNameRr(unittest.TestCase):
     """work order §5.5 item 6: no `p.nameRR` / `creator_rr` / display
-    `nameRR` projection remains in tools/vector.py's retrieval query, and
+    `nameRR` projection remains in the vector retrieval query, and
     nameMR was added where it was previously missing (places/topics/
-    forms_types/critical_terms/era/work)."""
+    forms_types/critical_terms/era/work).
+
+    The projection moved from `tools/vector.py` to
+    `chatbot/retrieval/vector_query.py` (large-module modularization work
+    order Phase 5.1); the assertions below are unchanged."""
 
     def setUp(self):
-        self.src = _read(os.path.join("tools", "vector.py"))
+        self.src = _read(os.path.join("chatbot", "retrieval", "vector_query.py"))
 
     def test_no_creator_rr_projection(self):
         self.assertNotIn("creator_rr", self.src)
@@ -210,12 +214,17 @@ class TestVectorProjectionSourceHasNoDisplayNameRr(unittest.TestCase):
 
 
 class TestCypherPromptMrGuidance(unittest.TestCase):
-    """work order §5.5 item 6: tools/cypher.py's prompt no longer claims
+    """work order §5.5 item 6: the Cypher-generation prompt no longer claims
     nameRR "does not exist", and documents MR-first priority + standardized
-    person_name_mr/place_name_mr aliases."""
+    person_name_mr/place_name_mr aliases.
+
+    The prompt text moved from `tools/cypher.py` to
+    `chatbot/retrieval/graph_prompt.py` (large-module modularization work
+    order Phase 4.1); the assertions below are unchanged — only the file
+    that owns the prompt did."""
 
     def setUp(self):
-        self.src = _read(os.path.join("tools", "cypher.py"))
+        self.src = _read(os.path.join("chatbot", "retrieval", "graph_prompt.py"))
 
     def test_no_longer_claims_name_rr_does_not_exist(self):
         self.assertNotIn("nameRR does not exist in the data", self.src)
