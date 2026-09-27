@@ -35,12 +35,17 @@ from rag_config import INDEX_BY_LANG as INDEX_BY_LANG  # re-export
 from rag_config import index_config_for  # noqa: F401
 
 from chatbot.legacy import react_vector_tool as _react_vector_tool
+from chatbot.observability import events as _obs_events
+from chatbot.observability.callbacks import with_llm_purpose
 from chatbot.legacy.react_vector_tool import instructions  # noqa: F401
 from chatbot.retrieval import vector_retriever as _vector_retriever
 from chatbot.retrieval.vector_query import _build_retrieval_query  # noqa: F401
 from chatbot.retrieval.vector_retriever import (  # noqa: F401
     _graphrag_retrievers as _retrievers,   # legacy name for the same cache
 )
+
+# Same model object; only the observability purpose label is added.
+_legacy_answer_llm = with_llm_purpose(llm, _obs_events.LLM_LEGACY_VECTOR_ANSWER)
 
 
 def _get_retriever_for_lang(lang: str):
@@ -75,7 +80,8 @@ def get_poetry_plot(input):
                         or st.session_state.get("effective_language", "ko"))
     retriever = _get_retriever_for_lang(question_language)
     return _react_vector_tool.get_poetry_plot(
-        input, retriever=retriever, llm=llm, response_language=response_language)
+        input, retriever=retriever, llm=_legacy_answer_llm,
+        response_language=response_language)
 
 
 def retrieve_sihwa_evidence(query: str, language: Optional[str] = None) -> Evidence:

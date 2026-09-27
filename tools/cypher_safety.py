@@ -33,6 +33,9 @@ import time
 import uuid
 from typing import Any, Optional
 
+from chatbot.observability import events as _obs_events
+from chatbot.observability import telemetry as _telemetry
+
 logger = logging.getLogger(__name__)
 
 # ── Bounded read-only retry for transient Bolt/transport failures ───────────
@@ -94,6 +97,7 @@ def _read_with_retry(fn, correlation_id: str):
     attempt = 0
     while True:
         attempt += 1
+        _telemetry.note_attempt()
         try:
             return fn()
         except READ_RETRY_EXCEPTIONS as e:
@@ -387,6 +391,40 @@ def _ensure_limit(query: str, max_rows: int) -> str:
     return f"{body}\nLIMIT {max_rows}"
 
 
+# ── Observed execution (shared by both proxy variants) ───────────────────────
+# One `neo4j.query.completed` event per `.query()` call at THIS boundary — the
+# single place every read-only graph query passes through. The operation label
+# comes from the caller's context (`telemetry.neo4j_operation`); the query text
+# is never inspected or recorded. Validation policy, retry policy, return value
+# and raised exceptions are exactly those of the original `.query()` body.
+def _observed_query(query: str, max_rows: int, execute):
+    operation, origin = _telemetry.current_neo4j_operation()
+    with _telemetry.span(_obs_events.NEO4J_QUERY, count_attempts=True,
+                         operation=operation, query_origin=origin) as span:
+        try:
+            safe_query = validate_read_only_cypher(query, max_rows)
+        except UnsafeCypherError as e:
+            logger.warning(
+                "blocked unsafe cypher [%s] reason_code=%s: %s",
+                e.correlation_id, e.reason_code, e.reason,
+            )
+            span.set(status=_obs_events.STATUS_SKIPPED,
+                     safety_result=_obs_events.SAFETY_REJECTED,
+                     attempt_count=0, row_count=None,
+                     correlation_id=e.correlation_id)
+            raise
+        span.set(safety_result=_obs_events.SAFETY_PASSED)
+        correlation_id = uuid.uuid4().hex[:8]
+        rows = _read_with_retry(lambda: execute(safe_query), correlation_id)
+        if isinstance(rows, list):
+            span.set(row_count=len(rows),
+                     status=_obs_events.STATUS_SUCCESS if rows
+                     else _obs_events.STATUS_EMPTY)
+        else:
+            span.set(row_count=None)
+        return rows
+
+
 # ── SafeNeo4jGraph proxy ─────────────────────────────────────────────────────
 # Two variants are provided:
 #
@@ -416,20 +454,13 @@ class SafeNeo4jGraph:
         self._max_rows = max_rows
 
     def query(self, query: str, params: Optional[dict] = None):
-        try:
-            safe_query = validate_read_only_cypher(query, self._max_rows)
-        except UnsafeCypherError as e:
-            logger.warning(
-                "blocked unsafe cypher [%s] reason_code=%s: %s",
-                e.correlation_id, e.reason_code, e.reason,
-            )
-            raise
-        correlation_id = uuid.uuid4().hex[:8]
         if params is None:
-            return _read_with_retry(
-                lambda: self._inner.query(safe_query), correlation_id)
-        return _read_with_retry(
-            lambda: self._inner.query(safe_query, params=params), correlation_id)
+            return _observed_query(
+                query, self._max_rows,
+                lambda safe_query: self._inner.query(safe_query))
+        return _observed_query(
+            query, self._max_rows,
+            lambda safe_query: self._inner.query(safe_query, params=params))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -453,22 +484,14 @@ try:
             object.__setattr__(self, "_max_rows", max_rows)
 
         def query(self, query: str, params: Optional[dict] = None):  # type: ignore[override]
-            try:
-                safe_query = validate_read_only_cypher(
-                    query, object.__getattribute__(self, "_max_rows"))
-            except UnsafeCypherError as e:
-                logger.warning(
-                    "blocked unsafe cypher [%s] reason_code=%s: %s",
-                    e.correlation_id, e.reason_code, e.reason,
-                )
-                raise
-            correlation_id = uuid.uuid4().hex[:8]
+            max_rows = object.__getattribute__(self, "_max_rows")
             sup = super()
             if params is None:
-                return _read_with_retry(
-                    lambda: sup.query(safe_query), correlation_id)
-            return _read_with_retry(
-                lambda: sup.query(safe_query, params=params), correlation_id)
+                return _observed_query(
+                    query, max_rows, lambda safe_query: sup.query(safe_query))
+            return _observed_query(
+                query, max_rows,
+                lambda safe_query: sup.query(safe_query, params=params))
 
     _HAVE_NEO4J = True
 

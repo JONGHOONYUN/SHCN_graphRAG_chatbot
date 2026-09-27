@@ -25,6 +25,8 @@ from typing import Optional
 from neo4j.exceptions import CypherSyntaxError, ClientError
 
 from chatbot.domain.evidence_models import Evidence
+from chatbot.observability import events as obs_events
+from chatbot.observability import telemetry
 from chatbot.retrieval.graph_prompt import _SHAPE_RETRY_HINT, _SYNTAX_RETRY_HINT
 from chatbot.retrieval.graph_rows import graph_rows_to_evidence
 from tools.cypher_safety import RECOVERABLE_REASON_CODES, UnsafeCypherError  # noqa: F401
@@ -56,9 +58,27 @@ def _status_evidence(outcome: str, exc: Exception) -> Evidence:
     code = uuid.uuid4().hex[:8]
     logger.warning("graph retrieval failed [%s]: %s: %s",
                    code, type(exc).__name__, exc)
+    # Link the enclosing retrieval span to this log line (class name + code
+    # only — the exception message stays in the server log).
+    telemetry.annotate(error_type=type(exc).__name__, correlation_id=code)
     ev = Evidence(kind="graph")
     ev.claims.append({"type": "status", "outcome": outcome})
     return ev
+
+
+def _note_rejection(exc: UnsafeCypherError) -> None:
+    telemetry.annotate(error_type=type(exc).__name__,
+                       correlation_id=getattr(exc, "correlation_id", None))
+
+
+def _invoke_generated(chain, payload: dict):
+    """One generated-Cypher attempt. Counts the attempt on the enclosing
+    retrieval span and labels the Neo4j call(s) the chain makes; the call
+    itself — and every exception it raises — is unchanged."""
+    telemetry.note_attempt()
+    with telemetry.neo4j_operation(obs_events.NEO4J_GENERATED_GRAPH_QUERY,
+                                   obs_events.ORIGIN_GENERATED):
+        return chain.invoke(payload)
 
 
 def _invalid_query_evidence() -> Evidence:
@@ -124,18 +144,19 @@ def retrieve_graph_evidence(question: str,
         )
 
     try:
-        result = chain.invoke({"query": query})
+        result = _invoke_generated(chain, {"query": query})
     except CypherSyntaxError as e:
         # 흔한 원인: 로마자 이름의 아포스트로피(Ch'wisŏn)를 SQL식 ''로
         # 이스케이프한 잘못된 Cypher. 힌트를 덧붙여 1회 재생성 시도.
         logger.info("Cypher syntax error [recoverable] — retrying once with "
                    "escaping hint: %s", e)
         try:
-            result = chain.invoke({"query": query + _SYNTAX_RETRY_HINT})
+            result = _invoke_generated(chain, {"query": query + _SYNTAX_RETRY_HINT})
         except UnsafeCypherError as e2:
             logger.warning(
                 "graph retrieval rejected unsafe cypher on retry [%s] "
                 "reason_code=%s", e2.correlation_id, e2.reason_code)
+            _note_rejection(e2)
             return _invalid_query_evidence()
         except Exception as e2:
             return _status_evidence("temporarily_unavailable", e2)
@@ -146,12 +167,13 @@ def retrieve_graph_evidence(question: str,
                 "— retrying once with a generalized shape hint (original "
                 "query never re-sent)", e.correlation_id, e.reason_code)
             try:
-                result = chain.invoke({"query": query + _SHAPE_RETRY_HINT})
+                result = _invoke_generated(chain, {"query": query + _SHAPE_RETRY_HINT})
             except UnsafeCypherError as e2:
                 logger.warning(
                     "graph retrieval rejected unsafe cypher on retry [%s] "
                     "reason_code=%s — giving up, no further retry",
                     e2.correlation_id, e2.reason_code)
+                _note_rejection(e2)
                 return _invalid_query_evidence()
             except CypherSyntaxError as e2:
                 return _status_evidence("temporarily_unavailable", e2)
@@ -165,6 +187,7 @@ def retrieve_graph_evidence(question: str,
                 "(non-recoverable — not retried): %s",
                 e.correlation_id, e.reason_code, e.reason,
             )
+            _note_rejection(e)
             return _invalid_query_evidence()
     except ClientError as e:
         return _status_evidence("temporarily_unavailable", e)
@@ -208,7 +231,10 @@ def retrieve_role_ranking_evidence(role: str,
 
     cypher, params = build_role_ranking_query(role, limit=limit)
     try:
-        rows = graph.query(cypher, params=params)
+        telemetry.note_attempt()
+        with telemetry.neo4j_operation(obs_events.NEO4J_DETERMINISTIC_LOOKUP,
+                                       obs_events.ORIGIN_DETERMINISTIC):
+            rows = graph.query(cypher, params=params)
     except UnsafeCypherError as e:
         # A rejection here means the TEMPLATE itself is malformed — not a
         # runtime input problem, since params never enter the query string.
@@ -216,6 +242,7 @@ def retrieve_role_ranking_evidence(role: str,
             "role ranking template rejected by safety validator [%s] "
             "reason_code=%s — this indicates a bug in the template, not "
             "user input", e.correlation_id, e.reason_code)
+        _note_rejection(e)
         return _invalid_query_evidence()
     except ClientError as e:
         return _status_evidence("temporarily_unavailable", e)

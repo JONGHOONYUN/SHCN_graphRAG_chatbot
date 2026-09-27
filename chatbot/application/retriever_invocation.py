@@ -19,6 +19,7 @@ import uuid
 from typing import Callable, Optional
 
 from chatbot.domain.evidence_models import Evidence
+from chatbot.observability import telemetry
 
 logger = logging.getLogger("tools.orchestrator")
 
@@ -78,6 +79,8 @@ def _safe_retrieve(fn: Callable, question: str, language: str,
         code = uuid.uuid4().hex[:8]
         logger.warning(
             "%s retriever signature incompatible [%s]", kind, code)
+        # Detail for the orchestrator's retrieval span — no event of our own.
+        telemetry.annotate(error_type="TypeError", correlation_id=code)
         return Evidence(kind=kind), {"source": kind,
                                      "outcome": "temporarily_unavailable"}
     try:
@@ -86,6 +89,7 @@ def _safe_retrieve(fn: Callable, question: str, language: str,
         code = uuid.uuid4().hex[:8]
         logger.warning("%s retrieval failed [%s]: %s: %s",
                        kind, code, type(e).__name__, e)
+        telemetry.annotate(error_type=type(e).__name__, correlation_id=code)
         return Evidence(kind=kind), {"source": kind,
                                      "outcome": "temporarily_unavailable"}
     ev = ev or Evidence(kind=kind)

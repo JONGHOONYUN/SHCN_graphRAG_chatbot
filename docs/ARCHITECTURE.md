@@ -44,6 +44,12 @@ legacy                 chatbot/legacy/
   react_prompt · react_agent · react_vector_tool · graph_qa
   └ 정상 파이프라인은 이 계층을 import하지 않는다. 호출은 오직 agent.py의
     최상위 오류 정책 분기에서만.
+
+observability          chatbot/observability/   (모든 계층이 사용할 수 있는 횡단 계층)
+  events · sinks · context · emitter · spans · telemetry · usage · callbacks
+  └ callbacks.py를 제외하면 표준 라이브러리만 쓴다. 다른 chatbot 계층을
+    import하지 않으며, 계측 호출은 절대 예외를 전파하지 않는다.
+    자세한 내용은 docs/OBSERVABILITY.md.
 ```
 
 ### 금지된 방향 (테스트로 강제됨 — `tests/test_modularization_contracts.py`)

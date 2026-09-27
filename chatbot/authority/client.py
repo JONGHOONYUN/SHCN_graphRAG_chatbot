@@ -16,6 +16,8 @@ from typing import Optional
 import requests
 
 from chatbot.authority.registry import DEFAULT_TIMEOUT_SEC
+from chatbot.observability import events as obs
+from chatbot.observability import telemetry
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # reject oversized payloads unparsed
 USER_AGENT = "SihwaGraphRAG/0.2 (academic research chatbot; https://poetrytalks.org)"
@@ -25,16 +27,31 @@ _JSON_CONTENT_TYPES = ("application/json", "application/ld+json", "text/json")
 def _fetch(url: str, timeout: int = DEFAULT_TIMEOUT_SEC) -> Optional[dict]:
     """GET + JSON parse. Returns None on ANY failure (timeout, non-200, wrong
     content-type, oversized body, invalid JSON). Never raises, never logs the
-    response body."""
-    try:
-        resp = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
-        if resp.status_code != 200:
+    response body.
+
+    Observability: one `authority.http.completed` with the status code/class
+    and response SIZE only — never the URL, identifier, or body."""
+    with telemetry.span(obs.AUTHORITY_HTTP, attempt_count=1) as span:
+        try:
+            resp = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
+            code = resp.status_code
+            span.set(http_status_code=code,
+                     http_status_class=obs.http_status_class(code))
+            if resp.status_code != 200:
+                span.set(status=obs.STATUS_ERROR)
+                return None
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if not any(t in ctype for t in _JSON_CONTENT_TYPES):
+                span.set(status=obs.STATUS_ERROR)
+                return None
+            size = len(resp.content)
+            span.set(response_bytes=size if isinstance(size, int) else None)
+            if size > MAX_RESPONSE_BYTES:
+                span.set(status=obs.STATUS_ERROR)
+                return None
+            data = resp.json()
+            span.set(status=obs.STATUS_SUCCESS)
+            return data
+        except (requests.RequestException, ValueError) as exc:
+            span.set(status=obs.STATUS_ERROR, error_type=type(exc).__name__)
             return None
-        ctype = (resp.headers.get("content-type") or "").lower()
-        if not any(t in ctype for t in _JSON_CONTENT_TYPES):
-            return None
-        if len(resp.content) > MAX_RESPONSE_BYTES:
-            return None
-        return resp.json()
-    except (requests.RequestException, ValueError):
-        return None

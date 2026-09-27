@@ -31,7 +31,41 @@ from chatbot.application.retrieval_policy import (
 from chatbot.application.retriever_invocation import _safe_retrieve
 from chatbot.domain.evidence_merge import collect_entities
 from chatbot.domain.evidence_models import Evidence
+from chatbot.observability import events as obs
+from chatbot.observability import telemetry
 from tools.graph_intent import detect_role_cue, is_graph_aggregation_intent
+
+
+# ── Observability: one span per retriever, owned HERE (the adapter only
+# annotates). Status/result are derived from what the retriever returned —
+# the returned values themselves are never altered.
+_STATUS_BY_OUTCOME = {
+    "ok": obs.STATUS_SUCCESS,
+    "no_results": obs.STATUS_EMPTY,
+    "temporarily_unavailable": obs.STATUS_ERROR,
+    "invalid_query": obs.STATUS_ERROR,
+}
+
+
+def _retrieval_result(evidence: Evidence, status: dict) -> dict:
+    outcome = (status or {}).get("outcome")
+    return {
+        "status": _STATUS_BY_OUTCOME.get(outcome, obs.STATUS_ERROR),
+        "result_count": len(evidence.documents or []),
+    }
+
+
+def _authority_result(external_ev: Evidence, intent: dict) -> dict:
+    claims = [c for c in external_ev.claims
+              if isinstance(c, dict) and c.get("type") != "coverage"]
+    usable = [c for c in claims if c.get("status") in ("ok", "link_only")]
+    if not (intent.get("Person") or intent.get("Place")) or not claims:
+        status = obs.STATUS_SKIPPED
+    elif usable:
+        status = obs.STATUS_SUCCESS
+    else:
+        status = obs.STATUS_ERROR
+    return {"status": status, "result_count": len(usable)}
 
 
 # ──────────────────────────────────────────────
@@ -156,17 +190,25 @@ def gather_graphrag_evidence(
 
     ranking_role = detect_role_cue(question) if is_graph_aggregation_intent(question) else None
 
-    if ranking_role:
-        def _ranking_graph_retriever(q, lang, hist=None, _role=ranking_role):
-            return role_ranking_retriever(_role)
+    graph_retriever_name = (obs.RETRIEVER_ROLE_RANKING if ranking_role
+                            else obs.RETRIEVER_GRAPH)
+    with telemetry.span(obs.RETRIEVAL_GRAPH, retriever=graph_retriever_name,
+                        count_attempts=True) as graph_span:
+        if ranking_role:
+            def _ranking_graph_retriever(q, lang, hist=None, _role=ranking_role):
+                return role_ranking_retriever(_role)
 
-        graph_ev, graph_status = _safe_retrieve(
-            _ranking_graph_retriever, question, question_language, history_text, "graph")
-    else:
-        graph_ev, graph_status = _safe_retrieve(
-            graph_retriever, question, question_language, history_text, "graph")
-    vector_ev, vector_status = _safe_retrieve(
-        vector_retriever, question, question_language, history_text, "vector")
+            graph_ev, graph_status = _safe_retrieve(
+                _ranking_graph_retriever, question, question_language, history_text, "graph")
+        else:
+            graph_ev, graph_status = _safe_retrieve(
+                graph_retriever, question, question_language, history_text, "graph")
+        graph_span.set(**_retrieval_result(graph_ev, graph_status))
+    with telemetry.span(obs.RETRIEVAL_VECTOR, retriever=obs.RETRIEVER_VECTOR,
+                        count_attempts=True) as vector_span:
+        vector_ev, vector_status = _safe_retrieve(
+            vector_retriever, question, question_language, history_text, "vector")
+        vector_span.set(**_retrieval_result(vector_ev, vector_status))
 
     entities = collect_entities(graph_ev, vector_ev)
     persons = [e for e in entities if (e.node_type or "Person") == "Person"]
@@ -202,43 +244,47 @@ def gather_graphrag_evidence(
     attempted = False
     coverage: dict = {}
 
-    for node_type, group, cap in (
-        ("Person", persons_for_authority, person_cap),
-        ("Place", places_for_authority, place_cap),
-    ):
-        if not intent.get(node_type):
-            continue
-        eligible = enriched = skipped = 0
-        for entity in group:
-            if not entity.has_authority_id():
-                continue        # never look up from a name alone
-            fetch_eligible = _has_valid_fetchable_id(entity, node_type)
-            if fetch_eligible:
-                eligible += 1
-                if enriched >= cap:
-                    skipped += 1
-                    continue    # cap reached — counted, reported, not fetched
-            hit = _enrich_entity(
-                entity, node_type, external_ev, seen, authority_fetcher,
-                resp_language, max_sources,
-            )
-            if hit:
-                enriched += 1
-                attempted = True
-        if eligible or enriched:
-            coverage[node_type] = {
-                "eligible_entity_count": eligible,
-                "enriched_entity_count": enriched,
-                "skipped_due_to_cap_count": skipped,
-            }
-            if skipped > 0:
-                # Structured, user-safe coverage note (rendered by synthesis).
-                external_ev.claims.append({
-                    "type": "coverage", "node_type": node_type,
+    with telemetry.span(obs.RETRIEVAL_AUTHORITY,
+                        retriever=obs.RETRIEVER_AUTHORITY,
+                        attempt_count=None) as authority_span:
+        for node_type, group, cap in (
+            ("Person", persons_for_authority, person_cap),
+            ("Place", places_for_authority, place_cap),
+        ):
+            if not intent.get(node_type):
+                continue
+            eligible = enriched = skipped = 0
+            for entity in group:
+                if not entity.has_authority_id():
+                    continue        # never look up from a name alone
+                fetch_eligible = _has_valid_fetchable_id(entity, node_type)
+                if fetch_eligible:
+                    eligible += 1
+                    if enriched >= cap:
+                        skipped += 1
+                        continue    # cap reached — counted, reported, not fetched
+                hit = _enrich_entity(
+                    entity, node_type, external_ev, seen, authority_fetcher,
+                    resp_language, max_sources,
+                )
+                if hit:
+                    enriched += 1
+                    attempted = True
+            if eligible or enriched:
+                coverage[node_type] = {
                     "eligible_entity_count": eligible,
                     "enriched_entity_count": enriched,
                     "skipped_due_to_cap_count": skipped,
-                })
+                }
+                if skipped > 0:
+                    # Structured, user-safe coverage note (rendered by synthesis).
+                    external_ev.claims.append({
+                        "type": "coverage", "node_type": node_type,
+                        "eligible_entity_count": eligible,
+                        "enriched_entity_count": enriched,
+                        "skipped_due_to_cap_count": skipped,
+                    })
+        authority_span.set(**_authority_result(external_ev, intent))
 
     return {
         "question": question,

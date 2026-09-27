@@ -32,6 +32,8 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
 from chatbot.domain.evidence_merge import collect_node_references
+from chatbot.observability import events as obs
+from chatbot.observability import telemetry
 from chatbot.retrieval.vector_documents import docs_to_evidence
 from chatbot.synthesis.citations import build_citations
 from tools.answer_renderer import assemble_final_answer
@@ -110,6 +112,22 @@ def _build_prompt(response_language: str):
     )
 
 
+def _observed_retriever(base_retriever):
+    """Wrap the cached retriever so each invocation is one
+    `retrieval.vector.completed` span. Input, output and exceptions are passed
+    through untouched; the document list is only measured with `len()`."""
+    def _retrieve(inputs):
+        with telemetry.span(obs.RETRIEVAL_VECTOR, retriever=obs.RETRIEVER_VECTOR,
+                            count_attempts=True) as span:
+            telemetry.note_attempt()
+            docs = base_retriever.invoke(inputs)
+            count = len(docs) if isinstance(docs, list) else None
+            span.set(result_count=count,
+                     status=obs.STATUS_SUCCESS if count else obs.STATUS_EMPTY)
+            return docs
+    return RunnableLambda(_retrieve)
+
+
 def run_vectorrag_pipeline(user_input: str,
                            response_language: str,
                            *,
@@ -117,6 +135,21 @@ def run_vectorrag_pipeline(user_input: str,
                            llm,
                            memory_factory,
                            session_id: str) -> str:
+    """textRAG 한 턴 (관측 wrapper). 요청 문맥이 없으면(테스트·CLI) 이 호출
+    동안만 root 문맥을 열고, 전체를 `pipeline.vectorrag.completed` 하나로 묶는다.
+    본체와 반환값은 `_run_vectorrag`가 그대로 소유한다."""
+    with telemetry.request_scope(mode=obs.MODE_VECTORRAG,
+                                 response_language=response_language):
+        with telemetry.span(obs.PIPELINE_VECTORRAG) as pipeline_span:
+            return _run_vectorrag(
+                user_input, response_language,
+                base_retriever=base_retriever, llm=llm,
+                memory_factory=memory_factory, session_id=session_id,
+                pipeline_span=pipeline_span)
+
+
+def _run_vectorrag(user_input: str, response_language: str, *, base_retriever,
+                   llm, memory_factory, session_id: str, pipeline_span) -> str:
     """textRAG 한 턴: 검색 → 답변 본문 1회 생성 → 결정론적 Sources 조립.
 
     `base_retriever`는 question_language로 선택된 캐시된 retriever이고,
@@ -135,7 +168,7 @@ def run_vectorrag_pipeline(user_input: str,
     # 문서 metadata 준비(`prepare_documents_for_prompt`)는 response_language로
     # 매 호출마다 새로 적용한다 — 캐시된 lambda 안에 굽지 않는다(work order
     # §4 Phase 4 item 2).
-    retriever = base_retriever | RunnableLambda(
+    retriever = _observed_retriever(base_retriever) | RunnableLambda(
         lambda docs: prepare_documents_for_prompt(docs, response_language))
 
     doc_chain = create_stuff_documents_chain(
@@ -161,12 +194,22 @@ def run_vectorrag_pipeline(user_input: str,
     except ValueError as e:
         # Gemini 빈 스트림 응답 등 — graphRAG와 동일하게 graceful 처리
         if "No generation chunks were returned" in str(e):
-            return FALLBACK_HINT.get(response_language, FALLBACK_HINT["ko"])
+            hint = FALLBACK_HINT.get(response_language, FALLBACK_HINT["ko"])
+            telemetry.set_outcome(obs.OUTCOME_ERROR)
+            telemetry.set_answer_stats(answer_chars=len(hint), citation_count=0)
+            pipeline_span.set(status=obs.STATUS_ERROR, error_type=type(e).__name__,
+                              outcome=obs.OUTCOME_ERROR, answer_chars=len(hint),
+                              citation_count=0)
+            return hint
         raise
 
     body = result.get("answer") or ""
     if not body.strip():
-        return FALLBACK_HINT.get(response_language, FALLBACK_HINT["ko"])
+        hint = FALLBACK_HINT.get(response_language, FALLBACK_HINT["ko"])
+        telemetry.set_answer_stats(answer_chars=len(hint), citation_count=0)
+        pipeline_span.set(status=obs.STATUS_EMPTY, outcome=obs.OUTCOME_SUCCESS,
+                          answer_chars=len(hint), citation_count=0)
+        return hint
 
     evidence = docs_to_evidence(result.get("context") or [])
     evidence_dict = {"graph": None, "vector": evidence, "external": None}
@@ -174,4 +217,13 @@ def run_vectorrag_pipeline(user_input: str,
     node_refs = [r.to_dict() for r in collect_node_references(evidence)]
     link_targets = [e.to_dict() for e in evidence.entities] + node_refs
 
-    return assemble_final_answer(body, citations, response_language, entities=link_targets)
+    with telemetry.span(obs.ANSWER_RENDER) as render_span:
+        output = assemble_final_answer(body, citations, response_language, entities=link_targets)
+        render_span.set(answer_chars=len(output) if isinstance(output, str) else None)
+    answer_chars = len(output) if isinstance(output, str) else None
+    telemetry.set_answer_stats(answer_chars=answer_chars,
+                               citation_count=len(citations))
+    pipeline_span.set(outcome=obs.OUTCOME_SUCCESS,
+                      evidence_vector_count=len(evidence.documents),
+                      answer_chars=answer_chars, citation_count=len(citations))
+    return output

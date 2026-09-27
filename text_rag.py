@@ -42,6 +42,9 @@ from tools.evidence import POETRYTALKS_BASE_URL  # noqa: F401  (single source)
 from rag_config import index_config_for  # noqa: F401
 
 from chatbot.application import vectorrag_pipeline as _pipeline
+from chatbot.observability import events as _obs
+from chatbot.observability import telemetry as _telemetry
+from chatbot.observability.callbacks import with_llm_purpose
 from chatbot.application.vectorrag_pipeline import FALLBACK_HINT  # noqa: F401
 from chatbot.retrieval import vector_retriever as _vector_retriever
 from chatbot.retrieval.vector_query import _build_light_retrieval_query  # noqa: F401
@@ -49,6 +52,10 @@ from chatbot.retrieval.vector_retriever import TOP_K  # noqa: F401
 from chatbot.retrieval.vector_retriever import (  # noqa: F401
     _textrag_retrievers as _retrievers,   # legacy name for the same cache
 )
+
+
+# Same model object; only the observability purpose label is added.
+_answer_llm = with_llm_purpose(llm, _obs.LLM_TEXT_RAG_ANSWER)
 
 
 def _get_text_retriever_for_lang(lang: str):
@@ -91,15 +98,21 @@ def generate_text_rag_response(user_input: str,
     if question_language is None:
         question_language = st.session_state.get("question_language") or response_language
 
-    base_retriever = _get_text_retriever_for_lang(question_language)
+    # 관측: bot.py가 연 요청 문맥이 있으면 그대로 쓰고(같은 request_id), 없으면
+    # 여기서 root 문맥을 연다. 반환값·예외는 그대로 통과한다.
+    with _telemetry.request_scope(mode=_obs.MODE_VECTORRAG,
+                                  route=_obs.ROUTE_VECTORRAG,
+                                  question_language=question_language,
+                                  response_language=response_language):
+        base_retriever = _get_text_retriever_for_lang(question_language)
 
-    # session_id에 ::textRAG suffix로 graphRAG와 완전 분리
-    session_id = f"{get_session_id()}::textRAG"
+        # session_id에 ::textRAG suffix로 graphRAG와 완전 분리
+        session_id = f"{get_session_id()}::textRAG"
 
-    return _pipeline.run_vectorrag_pipeline(
-        user_input, response_language,
-        base_retriever=base_retriever,
-        llm=llm,
-        memory_factory=_get_memory,
-        session_id=session_id,
-    )
+        return _pipeline.run_vectorrag_pipeline(
+            user_input, response_language,
+            base_retriever=base_retriever,
+            llm=_answer_llm,
+            memory_factory=_get_memory,
+            session_id=session_id,
+        )

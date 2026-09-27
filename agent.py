@@ -28,6 +28,9 @@ from utils import get_session_id
 
 from chatbot.application import graphrag_pipeline as _pipeline
 from chatbot.legacy import react_agent as _react
+from chatbot.observability import events as _obs
+from chatbot.observability import telemetry as _telemetry
+from chatbot.observability.callbacks import with_llm_purpose
 from chatbot.legacy.react_prompt import (  # noqa: F401  (public compatibility)
     ITERATION_LIMIT_FALLBACK,
     ITERATION_LIMIT_PLACEHOLDER,
@@ -35,6 +38,7 @@ from chatbot.legacy.react_prompt import (  # noqa: F401  (public compatibility)
 from chatbot.synthesis.prompt import (  # noqa: F401  (public compatibility)
     LANGUAGE_LABEL,
     _build_language_directive,
+    build_synthesis_chain,
     build_synthesis_prompt,
 )
 
@@ -63,12 +67,18 @@ chat_prompt = _react.build_chat_prompt()
 
 poetry_chat = chat_prompt | llm | StrOutputParser()
 
+# 관측 목적 라벨만 붙인 같은 LLM 객체 (모델·설정 불변). purpose는 leaf LLM에만
+# 묶는다 — chain에 묶으면 하위 LLM의 목적을 덮어쓴다.
+_general_chat_llm = with_llm_purpose(llm, _obs.LLM_GENERAL_CHAT)
+_react_llm = with_llm_purpose(llm, _obs.LLM_REACT_ITERATION)
+
 
 def general_chat(input_text: str) -> str:
     """General Chat tool (레거시 ReAct 전용). 세션의 응답 언어를 읽어 넘기고,
     실제 동적 prompt/chain 구성은 chatbot/legacy/react_agent.py가 소유한다."""
     user_language = st.session_state.get("effective_language", "ko")
-    return _react.run_general_chat(input_text, llm=llm, user_language=user_language)
+    return _react.run_general_chat(input_text, llm=_general_chat_llm,
+                                   user_language=user_language)
 
 
 # 1. tools 정의 — 구현 콜러블은 여기서 주입하고, 라우팅 설명은 레거시 계층 소유.
@@ -86,7 +96,7 @@ def get_memory(session_id):
 
 # 2~4. agent_prompt / agent / executor / 이력 래퍼 구성
 agent_prompt = _react.build_agent_prompt()
-agent = _react.build_agent(llm=llm, tools=tools)
+agent = _react.build_agent(llm=_react_llm, tools=tools)
 agent_executor = _react.build_agent_executor(agent=agent, tools=tools)
 
 chat_agent = _react.build_chat_agent(agent_executor, get_memory)
@@ -99,7 +109,7 @@ chat_agent = _react.build_chat_agent(agent_executor, get_memory)
 # ──────────────────────────────────────────────
 synthesis_prompt = build_synthesis_prompt()
 
-synthesis_chain = synthesis_prompt | llm | StrOutputParser()
+synthesis_chain = build_synthesis_chain(llm, synthesis_prompt)
 
 
 def _graphrag_history(session_id: str):
@@ -173,6 +183,19 @@ def generate_response(user_input):
                         or st.session_state.get("effective_language", "ko"))
     question_language = st.session_state.get("question_language") or response_language
 
+    # 관측: bot.py가 이미 요청 문맥을 열었으면 그대로 쓰고(같은 request_id),
+    # CLI처럼 없으면 여기서 root 문맥을 연다. 반환값·예외는 그대로 통과한다.
+    with _telemetry.request_scope(mode=_obs.MODE_GRAPHRAG,
+                                  route=_obs.ROUTE_GRAPHRAG,
+                                  question_language=question_language,
+                                  response_language=response_language):
+        return _generate_response_policy(
+            user_input, response_language, question_language)
+
+
+def _generate_response_policy(user_input, response_language, question_language):
+    """The Phase 3 fallback policy body of `generate_response` (unchanged).
+    Observability only records the outcome of each branch."""
     try:
         output = synthesize_answer(user_input, response_language, question_language)
         if output and output.strip():
@@ -185,6 +208,7 @@ def generate_response(user_input):
             "graphRAG blocked unsafe query [%s]",
             getattr(exc, "correlation_id", "?"),
         )
+        _telemetry.set_outcome(_obs.OUTCOME_ERROR)
         return ITERATION_LIMIT_FALLBACK.get(
             response_language, ITERATION_LIMIT_FALLBACK["ko"])
     except (ConfigurationError, RetrievalError) as exc:
@@ -192,12 +216,14 @@ def generate_response(user_input):
             "graphRAG non-fallback error [%s] type=%s",
             getattr(exc, "correlation_id", "?"), type(exc).__name__,
         )
+        _telemetry.set_outcome(_obs.OUTCOME_ERROR)
         return ITERATION_LIMIT_FALLBACK.get(
             response_language, ITERATION_LIMIT_FALLBACK["ko"])
     except ValueError as exc:
         if "No generation chunks were returned" in str(exc):
             _logger.info(
                 "graphRAG Gemini empty stream — safe message, no fallback")
+            _telemetry.set_outcome(_obs.OUTCOME_ERROR)
             return ITERATION_LIMIT_FALLBACK.get(
                 response_language, ITERATION_LIMIT_FALLBACK["ko"])
         # Any other ValueError is unexpected; fall through to policy check.
@@ -217,11 +243,19 @@ def _react_fallback_or_safe(exc: BaseException, user_input: str,
             "graphRAG transient failure [%s] type=%s — invoking ReAct fallback",
             correlation_id, type(exc).__name__,
         )
-        return _generate_response_react(user_input, response_language)
+        # 같은 request_id 안에서 route만 react_fallback으로 바뀐다. 원래 예외의
+        # correlation_id는 그대로 fallback 이벤트에 연결된다(대체하지 않음).
+        _telemetry.mark_fallback()
+        _telemetry.update_request(route=_obs.ROUTE_REACT_FALLBACK)
+        with _telemetry.span(_obs.FALLBACK,
+                             trigger_error_type=type(exc).__name__,
+                             correlation_id=correlation_id):
+            return _generate_response_react(user_input, response_language)
     _logger.error(
         "graphRAG unexpected failure [%s] type=%s — NO fallback (%s)",
         correlation_id, type(exc).__name__, str(exc)[:200],
     )
+    _telemetry.set_outcome(_obs.OUTCOME_ERROR)
     return ITERATION_LIMIT_FALLBACK.get(
         response_language, ITERATION_LIMIT_FALLBACK["ko"])
 

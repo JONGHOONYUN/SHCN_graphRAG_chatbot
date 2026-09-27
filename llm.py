@@ -28,6 +28,8 @@ import streamlit as st
 from langchain_core.embeddings import Embeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+from chatbot.observability import events as _obs
+from chatbot.observability import telemetry as _telemetry
 from errors import ConfigurationError, ModelResponseError, TransientProviderError
 
 logger = logging.getLogger(__name__)
@@ -127,13 +129,23 @@ class GoogleEmbeddings(Embeddings):
     def embed_query(self, text: str) -> List[float]:
         """Embed a single query. Returns a list[float] of length
         `expected_dim` (or whatever the model returned on first successful
-        response)."""
-        response_json = self._post_with_retry(
-            self.embed_url,
-            {"model": self.model, "content": {"parts": [{"text": text}]}},
-        )
-        vector = self._extract_single_vector(response_json)
-        self._check_dimension([vector])
+        response).
+
+        Observability: one `embedding.completed` (purpose=vector_query) with
+        input COUNT/length, vector DIMENSION and attempts — never the text or
+        the vector values."""
+        with _telemetry.span(_obs.EMBEDDING, purpose=_obs.EMBEDDING_VECTOR_QUERY,
+                             model=self.model, input_count=1,
+                             input_chars=len(text) if isinstance(text, str) else None,
+                             count_attempts=True) as span:
+            _telemetry.count_embedding_call()
+            response_json = self._post_with_retry(
+                self.embed_url,
+                {"model": self.model, "content": {"parts": [{"text": text}]}},
+            )
+            vector = self._extract_single_vector(response_json)
+            self._check_dimension([vector])
+            span.set(dimension=len(vector))
         return vector
 
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
@@ -148,9 +160,17 @@ class GoogleEmbeddings(Embeddings):
                 for t in texts
             ]
         }
-        response_json = self._post_with_retry(self.batch_url, payload)
-        vectors = self._extract_batch_vectors(response_json, len(texts))
-        self._check_dimension(vectors)
+        with _telemetry.span(_obs.EMBEDDING,
+                             purpose=_obs.EMBEDDING_DOCUMENT_INDEXING,
+                             model=self.model, input_count=len(texts),
+                             input_chars=sum(len(t) for t in texts
+                                             if isinstance(t, str)),
+                             count_attempts=True) as span:
+            _telemetry.count_embedding_call()
+            response_json = self._post_with_retry(self.batch_url, payload)
+            vectors = self._extract_batch_vectors(response_json, len(texts))
+            self._check_dimension(vectors)
+            span.set(dimension=len(vectors[0]) if vectors else None)
         return vectors
 
     # ── HTTP + retry ───────────────────────────────────────────────────────
@@ -164,6 +184,7 @@ class GoogleEmbeddings(Embeddings):
         """
         last_status: Optional[int] = None
         for attempt in range(_MAX_RETRIES):
+            _telemetry.note_attempt()
             try:
                 response = self._session.post(
                     url,

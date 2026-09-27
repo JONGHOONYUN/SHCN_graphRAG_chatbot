@@ -18,8 +18,11 @@ Moved verbatim from agent.py (modularization work order Phase 8.2).
 
 from __future__ import annotations
 
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
+from chatbot.observability import events as _obs_events
+from chatbot.observability.callbacks import with_llm_purpose
 from chatbot.synthesis.history_format import HISTORY_RULES
 from chatbot.synthesis.source_policy import SYNTHESIS_SYSTEM_RULES
 
@@ -81,3 +84,14 @@ def build_synthesis_prompt() -> ChatPromptTemplate:
             ),
         ]
     )
+
+
+def build_synthesis_chain(llm, prompt: ChatPromptTemplate = None):
+    """`prompt | llm | StrOutputParser()` — the final-synthesis chain.
+
+    The LLM is labelled `final_synthesis` for observability; model and prompt
+    are exactly what the caller passes (composition root owns the client)."""
+    prompt = prompt if prompt is not None else build_synthesis_prompt()
+    return (prompt
+            | with_llm_purpose(llm, _obs_events.LLM_FINAL_SYNTHESIS)
+            | StrOutputParser())

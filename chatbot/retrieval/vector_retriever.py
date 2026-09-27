@@ -21,6 +21,8 @@ from __future__ import annotations
 from langchain_neo4j import Neo4jVector
 
 from chatbot.domain.evidence_models import Evidence
+from chatbot.observability import events as obs
+from chatbot.observability import telemetry
 from chatbot.retrieval.vector_documents import docs_to_evidence
 from chatbot.retrieval.vector_query import (
     _build_light_retrieval_query,
@@ -38,9 +40,38 @@ _graphrag_retrievers: dict = {}
 _textrag_retrievers: dict = {}
 
 
+class TimedVectorQueryMixin:
+    """Times the Neo4j similarity query SEPARATELY from query embedding.
+
+    `Neo4jVector.similarity_search` embeds the query (timed by the embedding
+    client) and then calls the public `similarity_search_with_score_by_vector`,
+    which runs the Cypher vector query and maps rows to Documents. Overriding
+    that public method — never a private one — yields one
+    `neo4j.query.completed` (operation=vector_query) per search. Arguments,
+    return value and exceptions pass through unchanged; the result list is
+    only measured with `len()`."""
+
+    def similarity_search_with_score_by_vector(self, *args, **kwargs):
+        with telemetry.span(obs.NEO4J_QUERY, operation=obs.NEO4J_VECTOR_QUERY,
+                            query_origin=obs.ORIGIN_FRAMEWORK,
+                            safety_result=obs.SAFETY_NOT_APPLICABLE,
+                            attempt_count=None) as span:
+            results = super().similarity_search_with_score_by_vector(*args, **kwargs)
+            count = len(results) if isinstance(results, list) else None
+            span.set(row_count=count,
+                     status=obs.STATUS_SUCCESS if count else obs.STATUS_EMPTY)
+            return results
+
+
+class InstrumentedNeo4jVector(TimedVectorQueryMixin, Neo4jVector):
+    """`Neo4jVector` with the timed similarity query. Construction
+    (`from_existing_index` → `cls(...)`) and every other behaviour are the
+    parent's."""
+
+
 def _new_vector_store(lang: str, retrieval_query: str, *, embeddings, graph):
     cfg = index_config_for(lang)
-    return Neo4jVector.from_existing_index(
+    return InstrumentedNeo4jVector.from_existing_index(
         embeddings,
         graph=graph,
         index_name=cfg["index_name"],
@@ -90,5 +121,6 @@ def retrieve_sihwa_evidence(query: str, *, retriever) -> Evidence:
     (with authority IDs where present), and provenance. Does NOT call
     create_stuff_documents_chain and does NOT produce a final answer — the
     single final synthesis boundary owns all user-facing prose."""
+    telemetry.note_attempt()     # one retriever invocation by our code
     docs = retriever.invoke(query)
     return docs_to_evidence(docs)

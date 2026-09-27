@@ -19,8 +19,6 @@ Neo4j graph를 안전 wrapper로 감싸 체인을 만들고, 그 체인을 위 �
 
 from llm import llm
 from graph import graph
-# 자연어에서 Cypher로 변환하는 체인
-from langchain_neo4j import GraphCypherQAChain
 # 프롬프트 템플릿 클래스
 from langchain_core.prompts import PromptTemplate
 
@@ -32,6 +30,7 @@ from tools.cypher_safety import safe_graph, UnsafeCypherError  # noqa: F401
 
 from chatbot.legacy import graph_qa as _legacy_graph_qa
 from chatbot.retrieval import graph_query as _graph_query
+from chatbot.retrieval.graph_chain import build_graph_cypher_chain
 from chatbot.retrieval.graph_prompt import (  # noqa: F401
     CYPHER_GENERATION_TEMPLATE,
     _SHAPE_RETRY_HINT,
@@ -59,25 +58,18 @@ _safe_graph = safe_graph(graph)
 # 프롬프트 객체 생성 — 문자열 템플릿을 LangChain 프롬프트 템플릿 객체로 변환
 cypher_prompt = PromptTemplate.from_template(CYPHER_GENERATION_TEMPLATE)
 
-cypher_qa = GraphCypherQAChain.from_llm(
-    llm,
-    graph=_safe_graph,
-    verbose=True,
-    cypher_prompt=cypher_prompt,
-    allow_dangerous_requests=True
-)
+# 두 체인 모두 같은 `llm`을 내부 Cypher 생성·Graph QA 양쪽에 쓴다 (기존과
+# 동일). builder는 두 내부 LLM에 관측 목적(cypher_generation / graph_qa)만 다르게
+# 붙인다 — 모델·prompt·flag는 바뀌지 않고 Graph QA 호출도 그대로 일어난다.
+cypher_qa = build_graph_cypher_chain(
+    llm, graph=_safe_graph, cypher_prompt=cypher_prompt)
 
 # 구조화된 그래프 근거 수집용 체인.
 # return_intermediate_steps=True로 생성된 Cypher와 raw graph rows(context)를
 # 노출받아, LLM이 쓴 prose 대신 구조화된 rows를 evidence로 변환한다.
-cypher_qa_structured = GraphCypherQAChain.from_llm(
-    llm,
-    graph=_safe_graph,
-    verbose=True,
-    cypher_prompt=cypher_prompt,
-    allow_dangerous_requests=True,
-    return_intermediate_steps=True,
-)
+cypher_qa_structured = build_graph_cypher_chain(
+    llm, graph=_safe_graph, cypher_prompt=cypher_prompt,
+    return_intermediate_steps=True)
 
 
 def cypher_qa_safe(question: str) -> str:

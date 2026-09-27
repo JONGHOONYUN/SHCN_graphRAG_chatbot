@@ -26,6 +26,14 @@ from chatbot.authority.registry import (
     link_only_reference,
     resolve_source,
 )
+from chatbot.observability import events as obs
+from chatbot.observability import telemetry
+
+
+def _skipped() -> None:
+    """No HTTP request was (or could be) made for this lookup."""
+    telemetry.annotate(status=obs.STATUS_SKIPPED, http_fetched=False,
+                       attempt_count=0)
 
 
 def _effective_language(explicit: Optional[str] = None) -> str:
@@ -66,13 +74,25 @@ def fetch_authority(
       * Successes cached by source|node_type|normalized_id; failures not cached.
 
     `fetcher` injects a fake HTTP layer for tests: callable url -> dict|None.
+
+    Observability: one `retrieval.authority_source.completed` per call with the
+    registry key, node type, cache hit/miss and whether HTTP was used — never
+    the identifier, URL, or payload.
     """
+    with telemetry.span(obs.RETRIEVAL_AUTHORITY_SOURCE, node_type=node_type,
+                        count_attempts=True):
+        return _fetch_authority(source, ext_id, node_type=node_type,
+                                language=language, fetcher=fetcher)
+
+
+def _fetch_authority(source, ext_id, *, node_type, language, fetcher) -> dict:
     raw_source = (source or "").strip().lower()
     ext_id = (ext_id or "").strip()
     language = _effective_language(language)
     cfg = resolve_source(raw_source, node_type)
 
     if cfg is None:
+        _skipped()
         return {
             "source": raw_source, "id": ext_id, "node_type": node_type,
             "fetchable": False, "status": "error",
@@ -80,6 +100,7 @@ def fetch_authority(
             "supported_sources": list(FETCHABLE_SOURCES),
         }
 
+    telemetry.annotate(source=cfg.key)
     base = {
         "source": cfg.id_key, "key": cfg.key, "label": cfg.label,
         "id": ext_id, "node_type": node_type, "capability": cfg.capability,
@@ -87,28 +108,34 @@ def fetch_authority(
     }
 
     if cfg.capability == CAPABILITY_UNSUPPORTED:
+        _skipped()
         return {**base, "status": "unsupported",
                 "note": cfg.note or "source not supported; no data fetched and no link built"}
 
     if cfg.node_types and node_type not in cfg.node_types:
+        _skipped()
         return {**base, "status": "error",
                 "error": f"source '{cfg.key}' does not apply to node type '{node_type}'"}
 
     if not ext_id:
+        _skipped()
         return {**base, "status": "error", "error": "empty id"}
 
     # Validate BEFORE constructing any URL — an invalid id must not cause a request.
     if not cfg.validate_id(ext_id):
+        _skipped()
         return {**base, "status": "error",
                 "error": f"invalid id format for source '{cfg.key}'"}
 
     if cfg.capability == CAPABILITY_LINK_ONLY:
+        _skipped()
         ref = link_only_reference(cfg.key, ext_id, node_type)
         return {**base, "status": "link_only", "url": ref["url"] if ref else None,
                 "note": "link-only source: no data fetched; cite as a reference link only"}
 
     request_id = cfg.request_id(ext_id)
     if not request_id:
+        _skipped()
         return {**base, "status": "error",
                 "error": f"id transform failed for source '{cfg.key}'"}
 
@@ -119,13 +146,18 @@ def fetch_authority(
     cache_key = f"{cfg.key}|{node_type}|{ext_id}"
     cached = _cache_get(cache_key)
     if cached is not None:
+        telemetry.annotate(status=obs.STATUS_SUCCESS, cache_hit=True,
+                           http_fetched=False, attempt_count=0)
         return cached
+    telemetry.annotate(cache_hit=False, http_fetched=True)
 
     do_fetch = fetcher if fetcher is not None else (
         lambda u: _fetch(u, timeout=cfg.timeout_sec)
     )
+    telemetry.note_attempt()
     raw = do_fetch(url)
     if raw is None:
+        telemetry.annotate(status=obs.STATUS_ERROR)
         # Not cached — retryable next turn.
         return {**base, "status": "unavailable", "url": url,
                 "hint": "fetch failed/timeout/invalid payload; use graph-only info and note the gap."}
@@ -135,11 +167,13 @@ def fetch_authority(
     if cfg.response_validator is not None:
         validation_error = cfg.response_validator(raw, request_id)
         if validation_error:
+            telemetry.annotate(status=obs.STATUS_ERROR)
             return {**base, "status": "error", "url": url,
                     "error": validation_error}
 
     parsed = cfg.parser(raw, request_id, language)
     if isinstance(parsed, dict) and parsed.get("error"):
+        telemetry.annotate(status=obs.STATUS_EMPTY)
         return {**base, "status": "unavailable", "url": url,
                 "hint": f"authority returned no usable record ({parsed['error']})"}
 
@@ -152,6 +186,7 @@ def fetch_authority(
         "data": parsed,
     }
     _cache_set(cache_key, result, cfg.cache_ttl_sec)
+    telemetry.annotate(status=obs.STATUS_SUCCESS)
     return result
 
 

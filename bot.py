@@ -4,6 +4,7 @@ import uuid
 
 import streamlit as st
 
+from chatbot.observability import telemetry
 from mode_labels import mode_display_label
 from utils import write_message
 
@@ -246,20 +247,30 @@ def handle_submit(message: str, mode: str):
     localized safe message. Correlation id is logged server-side so operators
     can correlate without exposing raw exception text to the user."""
     with st.spinner("Thinking..."):
-        try:
-            if mode == "graphRAG":
-                from agent import generate_response
-                response = generate_response(message)
-            else:
-                from text_rag import generate_text_rag_response
-                response = generate_text_rag_response(message)
-        except Exception as exc:
-            correlation_id = uuid.uuid4().hex[:8]
-            logger.exception(
-                "handle_submit failed [%s] mode=%s type=%s",
-                correlation_id, mode, type(exc).__name__,
-            )
-            response = f"{_init_failure_message()} [ref: {correlation_id}]"
+        # Observability root: one request_id per backend dispatch (kept through
+        # any ReAct fallback). Only language CODES are read from the session —
+        # never the message, answer, or session state. UI and error handling
+        # are unchanged; request_id is not shown to the user.
+        with telemetry.request_scope(
+                mode=mode,
+                question_language=st.session_state.get("question_language"),
+                response_language=st.session_state.get("response_language")):
+            try:
+                if mode == "graphRAG":
+                    from agent import generate_response
+                    response = generate_response(message)
+                else:
+                    from text_rag import generate_text_rag_response
+                    response = generate_text_rag_response(message)
+            except Exception as exc:
+                correlation_id = uuid.uuid4().hex[:8]
+                logger.exception(
+                    "handle_submit failed [%s] mode=%s type=%s",
+                    correlation_id, mode, type(exc).__name__,
+                )
+                telemetry.record_request_error(exc, correlation_id=correlation_id)
+                response = f"{_init_failure_message()} [ref: {correlation_id}]"
+            telemetry.set_answer_stats(answer_chars=len(response))
         st.session_state["messages_by_mode"][mode].append(
             {"role": "assistant", "content": response}
         )
