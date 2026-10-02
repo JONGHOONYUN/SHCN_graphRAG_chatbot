@@ -1,4 +1,4 @@
-# 관측성 (Phase 1)
+# 관측성 (Phase 1 계측 / Phase 2 Graph QA 제거 적용)
 
 시화총림 챗봇의 요청 단위 관측 이벤트를 설명한다. 대상 독자는 이 이벤트로
 지연시간·LLM 비용·검색 품질을 분석하거나, 다음 단계(Phase 2: Graph QA LLM 호출
@@ -17,8 +17,10 @@ Phase 1은 **측정 단계**다. 챗봇의 답변·검색·오류·폴백 동작
 - Neo4j · embedding · 외부 HTTP 호출의 지연과 시도 횟수
 - 최종 합성 실행 여부, 폴백 여부, 답변 길이, 인용 수
 
-이번 범위가 **아닌** 것: 외부 모니터링 서비스·대시보드, 새 SDK(OpenTelemetry·
-Prometheus·Sentry 등), 호출 최적화. Graph QA 호출은 그대로 발생하며, 측정만 한다.
+Phase 1에서는 호출 최적화 없이 계측만 추가했다. 이후 Phase 2에서 정상 구조화
+GraphRAG의 Graph QA를 제거했다. 현재 정상 생성형 경로는 보통 Cypher 생성 1회와
+최종 합성 1회이며, ReAct의 자연어 graph tool은 Graph QA를 계속 사용한다.
+외부 모니터링 서비스·대시보드와 새 SDK(OpenTelemetry·Prometheus·Sentry 등)는 없다.
 
 ## 2. 켜고 끄기, sink 설정
 
@@ -171,7 +173,7 @@ operation은 호출자가 라벨링하며, query 문자열을 보고 추론하�
 | 값 | 호출 위치 |
 |---|---|
 | `cypher_generation` | GraphCypherQAChain 내부 Cypher 생성 LLM |
-| `graph_qa` | GraphCypherQAChain 내부 그래프 답변(prose) 생성 LLM |
+| `graph_qa` | 레거시/ReAct GraphCypherQAChain의 자연어 답변 LLM. 정상 구조화 경로에서는 0회 |
 | `final_synthesis` | graphRAG 최종 evidence 합성 |
 | `text_rag_answer` | vectorRAG 답변 생성 |
 | `react_iteration` | ReAct 폴백의 매 reasoning 호출 |
@@ -184,7 +186,8 @@ operation은 호출자가 라벨링하며, query 문자열을 보고 추론하�
 `with_llm_purpose(llm, purpose)`로 `metadata={"llm_purpose": ...}`를 묶고, callback은
 그 제한된 값만 읽는다. GraphCypherQAChain은 공개 파라미터 `cypher_llm`/`qa_llm`을
 따로 받으므로(`chatbot/retrieval/graph_chain.py`), 두 내부 LLM을 private API 없이
-구분한다. 두 파라미터에는 같은 모델 객체가 들어가므로 동작은 이전과 같다.
+구분한다. 두 파라미터에는 같은 모델 객체가 들어간다. 정상 구조화 체인은
+`return_direct=True`로 QA를 건너뛰며, 행은 `result`에서 추출한다.
 
 purpose는 chain이 아니라 leaf LLM에만 묶어야 한다. LangChain은 부모 config의
 metadata가 자식 바인딩을 덮어쓰므로, chain에 purpose를 붙이면 하위 LLM의 목적이
@@ -294,7 +297,8 @@ python tests/observability_baseline.py --jsonl   # 모든 이벤트
 ```
 
 실제 API 키·인터넷·Neo4j 없이, 자동 테스트와 같은 test double로 실제 코드 경로를
-실행한다. 출력 토큰 수는 fixture에 적어 둔 값이며 실제 사용량이 아니다.
+실행한다. 출력 토큰 수는 fixture에 적어 둔 값이며 실제 사용량이 아니다. Phase 2 적용 후
+정상 GraphRAG의 기대값은 Cypher 생성 1회, Graph QA 0회, 최종 합성 1회다.
 
 ## 11. Phase 2(Graph QA 호출 제거) 전후 비교 방법
 
@@ -317,7 +321,35 @@ success/empty/error 비율과 지연 분포, 결과 수 분포, Neo4j operation�
 authority cache hit 비율, 폴백 비율과 성공률.
 
 Graph QA 호출은 `retrieval.graph.completed` span 안에서 일어나므로, 제거하면
-`retrieval.graph` 지연이 `graph_qa` LLM 지연만큼 줄어드는지 직접 확인할 수 있다.
+그 구간의 감소를 관찰할 수 있다. 실제 외부 서비스 지연은 변동하므로 절감 시간이
+정확히 이전 Graph QA 지연과 같다고 가정하지 않는다. 단계별 span은 중첩되므로
+모두 더해서 전체 요청 시간으로 계산하지 않는다.
+
+실제 API/Neo4j 비교 자동화 도구:
+
+```powershell
+# before는 Graph QA 제거 전 소스에서 실행한다. after는 변경 후 소스에서 실행한다.
+# 각 실행은 실제 API 토큰을 사용하며 기존 결과 폴더를 덮어쓰지 않는다.
+python -B scripts/graph_qa_benchmark.py --stage before --output artifacts/graph_qa_RUN/before
+python -B scripts/graph_qa_benchmark.py --stage after --output artifacts/graph_qa_RUN/after
+python -B scripts/graph_qa_report.py --before artifacts/graph_qa_RUN/before --after artifacts/graph_qa_RUN/after --output artifacts/graph_qa_RUN/comparison
+```
+
+고정 질문 4개를 기본 2회씩 실행한다. 실제 `agent.generate_response`를 사용하되
+대화 이력은 요청마다 새 메모리에 격리한다. 초기 클라이언트·벡터 인덱스 준비는
+측정 밖이며 전거 캐시는 요청마다 비운다. 따라서 수치는 백엔드의 비교용 지연이고
+브라우저 렌더링이나 운영 Neo4j 대화 이력 I/O 시간은 포함하지 않는다.
+
+- `manifest.json`: 질문, 모델, 버전, 비교 조건, 소스 해시
+- `events.jsonl`: Phase 1 원본 관측 이벤트 (질문·답변 원문 없음)
+- `runs.jsonl`: 질문 번호별 수치와 검색된 노드 ID 등 평가 정보
+- `answers.jsonl`: 고정 시험 질문의 실제 답변. 의미·인용 검토용 별도 로컬 자료
+- `comparison/comparison.md`, `comparison.json`: 전후 집계와 질문별 비교
+
+원본 로그·평가 자료는 `artifacts/graph_qa_*/`에 보관하고 Git에서 제외한다.
+질문·설정·소스 통제값이 다르거나 실행이 불완전하면 비교 도구는 중지한다.
+표본이 적으면 p95가 최대값과 같을 수 있으므로 운영 성능 보장으로 해석하지 않는다.
+ID/인용 링크 일치는 구조적 비교이며, 답변의 사실 정확성을 자동 보증하지 않는다.
 
 ## 12. 알려진 제약
 

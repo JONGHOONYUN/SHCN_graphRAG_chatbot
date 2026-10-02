@@ -60,16 +60,16 @@ cypher_prompt = PromptTemplate.from_template(CYPHER_GENERATION_TEMPLATE)
 
 # 두 체인 모두 같은 `llm`을 내부 Cypher 생성·Graph QA 양쪽에 쓴다 (기존과
 # 동일). builder는 두 내부 LLM에 관측 목적(cypher_generation / graph_qa)만 다르게
-# 붙인다 — 모델·prompt·flag는 바뀌지 않고 Graph QA 호출도 그대로 일어난다.
+# 붙인다. 자연어 답변을 쓰는 레거시 체인의 Graph QA는 유지한다.
 cypher_qa = build_graph_cypher_chain(
     llm, graph=_safe_graph, cypher_prompt=cypher_prompt)
 
 # 구조화된 그래프 근거 수집용 체인.
-# return_intermediate_steps=True로 생성된 Cypher와 raw graph rows(context)를
-# 노출받아, LLM이 쓴 prose 대신 구조화된 rows를 evidence로 변환한다.
+# return_direct=True로 Graph QA를 생략하고 result에서 raw rows를 받는다.
+# intermediate_steps에는 생성 Cypher만 남으므로 추출기는 두 반환 형식을 지원한다.
 cypher_qa_structured = build_graph_cypher_chain(
     llm, graph=_safe_graph, cypher_prompt=cypher_prompt,
-    return_intermediate_steps=True)
+    return_intermediate_steps=True, return_direct=True)
 
 
 def cypher_qa_safe(question: str) -> str:

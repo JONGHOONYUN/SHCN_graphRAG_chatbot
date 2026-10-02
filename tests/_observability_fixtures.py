@@ -124,14 +124,14 @@ class SafeGraphStore(GraphStore):
         return None
 
 
-def structured_graph_chain(llm, source: RowSource):
+def structured_graph_chain(llm, source: RowSource, *, direct=True):
     from chatbot.retrieval.graph_chain import build_graph_cypher_chain
     from chatbot.retrieval.graph_prompt import CYPHER_GENERATION_TEMPLATE
 
     return build_graph_cypher_chain(
         llm, graph=SafeGraphStore(source),
         cypher_prompt=PromptTemplate.from_template(CYPHER_GENERATION_TEMPLATE),
-        return_intermediate_steps=True, verbose=False)
+        return_intermediate_steps=True, return_direct=direct, verbose=False)
 
 
 # ── GoogleEmbeddings (real retry client) with a fake HTTP session ───────────
@@ -216,7 +216,7 @@ class History(InMemoryChatMessageHistory):
 def run_graphrag(question="허초희는 누구인가?", *, sink=None, llm=None,
                  graph_source=None, vector_rows=None, graph_retriever=None,
                  vector_retriever=None, authority_fetcher=None, history=None,
-                 open_root=True):
+                 open_root=True, direct=True):
     """Drive `graphrag_pipeline.synthesize_answer` through the real
     orchestrator with injected retrievers. Returns (output, sink, parts)."""
     from chatbot.application import graphrag_pipeline
@@ -226,12 +226,14 @@ def run_graphrag(question="허초희는 누구인가?", *, sink=None, llm=None,
     from tools.orchestrator import gather_graphrag_evidence
 
     sink = sink if sink is not None else MemorySink()
-    llm = llm or scripted_llm((GRAPHRAG_CYPHER, usage(120, 20)),
-                              ("graph qa prose", usage(300, 40)),
-                              ("최종 답변 [P553](https://poetrytalks.org/P553).",
-                               usage(900, 80)))
+    if llm is None:
+        replies = [(GRAPHRAG_CYPHER, usage(120, 20))]
+        if not direct:
+            replies.append(("graph qa prose", usage(300, 40)))
+        replies.append(("최종 답변 [P553](https://poetrytalks.org/P553).", usage(900, 80)))
+        llm = scripted_llm(*replies)
     graph_source = graph_source or RowSource(GRAPH_ROWS)
-    chain = structured_graph_chain(llm, graph_source)
+    chain = structured_graph_chain(llm, graph_source, direct=direct)
     embeddings, _session = fake_embeddings()
     store = vector_store(embeddings, vector_rows)
     retriever = store.as_retriever()

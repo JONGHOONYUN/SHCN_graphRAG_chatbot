@@ -7,7 +7,7 @@ both pipelines, agent.py's fallback policy) with only the outermost I/O
 replaced by deterministic doubles. No real API, internet, or Neo4j.
 
 Baseline scenarios (§14):
-    normal GraphRAG                   cypher_generation 1 · graph_qa 1 · final_synthesis 1
+    normal GraphRAG                   cypher_generation 1 · graph_qa 0 · final_synthesis 1
     graph empty + vector success      statuses separated, synthesis still runs
     all retrieval failed              short_circuit, final_synthesis 0
     normal VectorRAG                  embedding · vector query · text_rag_answer separated
@@ -54,20 +54,20 @@ class TestGraphRagBaseline(unittest.TestCase):
         self.output, self.sink, self.parts = fx.run_graphrag()
         self.done = _one(self.sink, ev.REQUEST_COMPLETED)
 
-    def test_three_llm_purposes_are_separated(self):
+    def test_two_llm_purposes_and_absent_graph_qa(self):
         self.assertEqual(dict(fx.purposes(self.sink)),
-                         {"cypher_generation": 1, "graph_qa": 1, "final_synthesis": 1})
+                         {"cypher_generation": 1, "final_synthesis": 1})
         by_purpose = self.done["llm_calls_by_purpose"]
         self.assertEqual((by_purpose["cypher_generation"], by_purpose["graph_qa"],
-                          by_purpose["final_synthesis"]), (1, 1, 1))
+                          by_purpose["final_synthesis"]), (1, 0, 1))
         self.assertEqual(self.done["llm_call_count"], len(self.sink.of(ev.LLM)))
 
     def test_request_token_totals_are_the_sum_of_reported_usage(self):
         llm_events = self.sink.of(ev.LLM)
         self.assertEqual(self.done["input_tokens"],
                          sum(e["input_tokens"] for e in llm_events))
-        self.assertEqual(self.done["total_tokens"], 1460)
-        self.assertEqual(self.done["usage_available_call_count"], 3)
+        self.assertEqual(self.done["total_tokens"], 1120)
+        self.assertEqual(self.done["usage_available_call_count"], 2)
 
     def test_pipeline_and_retrieval_events(self):
         pipeline = _one(self.sink, ev.PIPELINE_GRAPHRAG)
@@ -148,7 +148,7 @@ class TestGraphRagBaseline(unittest.TestCase):
     def test_pipeline_opens_its_own_root_when_called_directly(self):
         _, sink, _ = fx.run_graphrag(open_root=False)
         self.assertEqual(len(sink.of(ev.REQUEST_STARTED)), 1)
-        self.assertEqual(_one(sink, ev.REQUEST_COMPLETED)["llm_call_count"], 3)
+        self.assertEqual(_one(sink, ev.REQUEST_COMPLETED)["llm_call_count"], 2)
 
 
 class TestGraphRagEdgeScenarios(unittest.TestCase):
@@ -161,7 +161,7 @@ class TestGraphRagEdgeScenarios(unittest.TestCase):
                               operation="generated_graph_query")["status"], "empty")
         self.assertTrue(_one(sink, ev.SYNTHESIS)["synthesis_executed"])
         self.assertEqual(dict(fx.purposes(sink)),
-                         {"cypher_generation": 1, "graph_qa": 1, "final_synthesis": 1})
+                         {"cypher_generation": 1, "final_synthesis": 1})
         self.assertEqual(_one(sink, ev.REQUEST_COMPLETED)["outcome"], "success")
         self.assertTrue(output)
 
@@ -193,14 +193,13 @@ class TestGraphRagEdgeScenarios(unittest.TestCase):
         self.assertEqual(parts.history.messages, [])
 
     def test_provider_usage_absent(self):
-        llm = fx.scripted_llm((fx.GRAPHRAG_CYPHER, None), ("qa", None),
-                              ("답변", None))
+        llm = fx.scripted_llm((fx.GRAPHRAG_CYPHER, None), ("답변", None))
         _, sink, _ = fx.run_graphrag(llm=llm)
         for event in sink.of(ev.LLM):
             self.assertFalse(event["usage_available"])
             self.assertIsNone(event["total_tokens"])
         done = _one(sink, ev.REQUEST_COMPLETED)
-        self.assertEqual(done["llm_call_count"], 3)
+        self.assertEqual(done["llm_call_count"], 2)
         self.assertEqual(done["usage_available_call_count"], 0)
         self.assertIsNone(done["input_tokens"])
 
@@ -504,6 +503,10 @@ _AGENT_DRIVER = textwrap.dedent(r'''
         "legacy_vector": purpose(tools.vector._legacy_answer_llm),
         "text_rag": purpose(text_rag._answer_llm),
     }}}}
+    report["return_direct"] = {{
+        "structured": tools.cypher.cypher_qa_structured.return_direct,
+        "legacy": tools.cypher.cypher_qa.return_direct,
+    }}
     agent.chat_agent = react_agent.build_chat_agent(
         agent.agent_executor, lambda sid: InMemoryChatMessageHistory())
 
@@ -568,6 +571,9 @@ class TestAgentWiringAndFallback(unittest.TestCase):
             "synthesis": "final_synthesis", "react": "react_iteration",
             "general_chat": "general_chat", "legacy_vector": "legacy_vector_answer",
             "text_rag": "text_rag_answer"})
+
+    def test_only_structured_production_chain_bypasses_graph_qa(self):
+        self.assertEqual(self.report["return_direct"], {"structured": True, "legacy": False})
 
     def test_transient_error_falls_back_with_the_same_request_id(self):
         scenario = self.report["transient"]

@@ -7,7 +7,7 @@
     -> total retrieval failure short circuit   (LLM 호출 없음)
     -> format evidence            (블록·예산)
     -> final synthesis LLM        (합성 단계의 유일한 LLM 호출 — 검색 단계의
-                                   Cypher 생성·Graph QA 호출은 별도로 계측됨)
+                                   Cypher 생성 호출은 별도로 계측됨)
     -> deterministic citation assembly
     -> successful final answer persistence     (성공 시 정확히 1회)
 

@@ -75,7 +75,7 @@ bounded history load            load_bounded_history()          — 실패해도
   -> gather evidence            tools.orchestrator              — graph → vector → authority
   -> total failure short circuit                                — LLM 호출 0회
   -> format evidence            synthesis.evidence_format       — 블록·예산
-  -> final synthesis LLM        주입된 synthesis_chain          — 이 경로의 유일한 LLM 호출
+  -> final synthesis LLM        주입된 synthesis_chain          — 합성 단계에서 1회
   -> deterministic citations    synthesis.citations
   -> final answer assembly      tools.answer_renderer
   -> history persistence                                        — 성공 시 정확히 1회
@@ -84,6 +84,12 @@ bounded history load            load_bounded_history()          — 실패해도
 textRAG는 `chatbot/application/vectorrag_pipeline.py`가 같은 결정론적 조립
 경계(`build_citations` → `assemble_final_answer`)를 공유하되, 대화 이력
 namespace(`::textRAG`)는 공유하지 않는다.
+
+정상 생성형 graphRAG의 검색 단계에는 Cypher 생성 LLM이 별도로 1회 있다.
+Phase 2에서 구조화 `GraphCypherQAChain`에 `return_direct=True`를 적용하여
+중간 Graph QA 호출을 제거했다. `result`의 raw rows와 `intermediate_steps`의
+생성 Cypher를 evidence로 변환하므로, 일반적인 정상 경로의 LLM 호출 합계는 2회다.
+결정적 순위 경로는 Cypher 생성도 없으며, ReAct용 자연어 체인은 QA를 유지한다.
 
 ---
 

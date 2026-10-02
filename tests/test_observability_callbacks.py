@@ -97,7 +97,7 @@ class TestModelLifecycle(unittest.TestCase):
         source = fx.RowSource(fx.GRAPH_ROWS)
         llm = fx.scripted_llm((fx.GRAPHRAG_CYPHER, fx.usage(10, 5)),
                               ("qa prose", fx.usage(20, 4)))
-        chain = fx.structured_graph_chain(llm, source)
+        chain = fx.structured_graph_chain(llm, source, direct=False)
         result, sink = _run(lambda: chain.invoke({"query": "누가?"}))
         self.assertEqual(result["intermediate_steps"][1]["context"], fx.GRAPH_ROWS)
         self.assertEqual(result["result"], "qa prose")   # Graph QA still generated
@@ -115,7 +115,7 @@ class TestModelLifecycle(unittest.TestCase):
                          "cypher_generation")
         self.assertEqual(qa_llm.config["metadata"][PURPOSE_METADATA_KEY], "graph_qa")
         self.assertTrue(chain.return_intermediate_steps)
-        self.assertFalse(chain.return_direct)          # Graph QA is not bypassed
+        self.assertTrue(chain.return_direct)           # structured retrieval skips QA
 
     def test_model_error_recorded_and_propagated(self):
         chain = _chain(with_llm_purpose(_FailingChat(), "general_chat"))

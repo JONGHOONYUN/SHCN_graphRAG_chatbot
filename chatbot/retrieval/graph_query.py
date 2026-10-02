@@ -89,11 +89,15 @@ def _invalid_query_evidence() -> Evidence:
 
 
 def _extract_intermediate(result: dict):
-    """Pull (cypher, rows) out of a GraphCypherQAChain(return_intermediate_steps)
-    result. The intermediate_steps shape is a list of dicts such as
-    [{'query': '<cypher>'}, {'context': [ {..row..}, ... ]}]."""
+    """Read Cypher and rows from direct retrieval or older QA-chain results.
+
+    With return_direct=True, rows live in result['result']; intermediate_steps
+    contains the query but no context. Older callers still expose context in
+    intermediate_steps. An explicit empty context must remain empty, and prose
+    must never be mistaken for a list of rows.
+    """
     cypher = None
-    rows = []
+    rows = None
     for step in result.get("intermediate_steps") or []:
         if not isinstance(step, dict):
             continue
@@ -101,6 +105,9 @@ def _extract_intermediate(result: dict):
             cypher = step["query"]
         if "context" in step and isinstance(step["context"], list):
             rows = step["context"]
+    if rows is None:
+        direct_rows = result.get("result")
+        rows = direct_rows if isinstance(direct_rows, list) else []
     return cypher, rows
 
 
@@ -112,7 +119,7 @@ def retrieve_graph_evidence(question: str,
     provenance).
 
     `chain` is the structured GraphCypherQAChain
-    (`return_intermediate_steps=True`), injected by the composition root
+    (`return_intermediate_steps=True`, `return_direct=True`), injected by the composition root
     (tools/cypher.py) so this module never constructs an LLM/Neo4j client.
 
     `history_text` is a BOUNDED serialization of recent conversation, used only

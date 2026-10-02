@@ -87,7 +87,7 @@ def main(argv) -> int:
     rows, all_events = [], []
 
     _, sink, _ = fx.run_graphrag()
-    rows.append(_summary("정상 GraphRAG", sink, "cypher 1 · graph_qa 1 · synthesis 1"))
+    rows.append(_summary("정상 GraphRAG", sink, "cypher 1 · graph_qa 0 · synthesis 1"))
     all_events += sink.events
 
     _, sink, _ = fx.run_graphrag(graph_source=fx.RowSource([]))
@@ -116,7 +116,7 @@ def main(argv) -> int:
                          "동일 request_id · fallback_success", note))
     all_events += sink.events
 
-    llm = fx.scripted_llm((fx.GRAPHRAG_CYPHER, None), ("qa", None), ("답변", None))
+    llm = fx.scripted_llm((fx.GRAPHRAG_CYPHER, None), ("답변", None))
     _, sink, _ = fx.run_graphrag(llm=llm)
     rows.append(_summary("provider usage 없음", sink, "token null · usage unavailable",
                          "usage_available_calls=%d" %

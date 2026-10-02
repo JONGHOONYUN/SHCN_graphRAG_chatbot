@@ -69,18 +69,25 @@ class TestNoRawContentInEvents(unittest.TestCase):
         history.add_ai_message(M["history"])
 
         # 1) full GraphRAG run with markers everywhere
-        llm = fx.scripted_llm((cypher, fx.usage(1, 1)), (M["graph_qa"], None),
+        llm = fx.scripted_llm((cypher, fx.usage(1, 1)),
                               (M["answer"], fx.usage(2, 2)))
         out, _, _ = fx.run_graphrag(question=M["question"], sink=cls.sink, llm=llm,
                                     graph_source=fx.RowSource(rows),
                                     vector_rows=vector_rows, history=history)
         cls.outputs.append(out)
 
+        # Graph QA is now only used by the legacy prose path. Keep its marker
+        # coverage as well as the normal direct-retrieval pipeline coverage.
+        legacy = fx.structured_graph_chain(
+            fx.scripted_llm((cypher, fx.usage(1, 1)), (M["graph_qa"], None)),
+            fx.RowSource(rows), direct=False)
+        with telemetry.use_sink(cls.sink), telemetry.request_scope(mode="graphRAG"):
+            cls.legacy_result = legacy.invoke({"query": M["question"]})["result"]
+
         # 2) failing graph source whose exception message carries a marker
         with patch("tools.cypher_safety.time.sleep"):
             fx.run_graphrag(question=M["question"], sink=cls.sink,
-                            llm=fx.scripted_llm((cypher, None), ("qa", None),
-                                                (M["answer"], None)),
+                            llm=fx.scripted_llm((cypher, None), (M["answer"], None)),
                             graph_source=fx.RowSource(error=RuntimeError(M["exception"])))
 
         # 3) VectorRAG run
@@ -115,6 +122,7 @@ class TestNoRawContentInEvents(unittest.TestCase):
         the markers — only the telemetry must not."""
         self.assertIn(M["answer"], self.outputs[0])
         self.assertIn(M["answer"], self.outputs[1])
+        self.assertEqual(self.legacy_result, M["graph_qa"])
         self.assertIn(M["external_body"], json.dumps(self.authority_result))
         self.assertGreater(len(self.sink.events), 40)
 
